@@ -12,7 +12,7 @@ It's currently just for personal use. So forgive me that I haven't used argument
 However, no worries, it's just a simple code **merely for singlet depth estimation** (for now). That is, **no** PoseNet, training and evaluation yet. 
 Anyways, Take one minute you will know what's going on in there.
 
-`simple_run.py`: as the name suggests, it's a simple run. Just change the vidoe path.
+`simple_run.py`: as the name suggests, it's a simple run. Just change the vidoe & weights path, and of course put the weight (linke below) in the corresponding order..
 
 `depth_esitmator_demo.py`: complete demo, where the model is encapsuled in Classes.
 
