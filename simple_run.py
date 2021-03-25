@@ -201,45 +201,45 @@ def postprocess(disp, depth_npy_path=None):
 
     return scaled_disp
 
+""" archive """
+# def draw_box(image, bboxes, img_h=416, img_w=128):
+#     bbox_thick = int(0.5 * (img_h + img_w) / 500)
+#     for bbox in bboxes:
+#         l, t, w, h = bbox
+#         c1, c2 = (int(l), int(t)), (int(w+l), int(h+t))
+#         cv.rectangle(image, c1, c2, (100,200,100), bbox_thick)
 
-def draw_box(image, bboxes, img_h=416, img_w=128):
-    bbox_thick = int(0.5 * (img_h + img_w) / 500)
-    for bbox in bboxes:
-        l, t, w, h = bbox
-        c1, c2 = (int(l), int(t)), (int(w+l), int(h+t))
-        cv.rectangle(image, c1, c2, (100,200,100), bbox_thick)
 
+# def calc_depth_within_bbox(mtx, bboxes, image, scaled_size, show_depth=True):
+#     def get_median_range(mtx):
+#         SCALING = 10
+#         """distance matrix for one patch"""
+#         ranging = [.4, .6]
+#         depth_all = np.sort(mtx.numpy().flatten())
+#         val_idx = [int(ranging[0] * len(depth_all)), int(ranging[1] * len(depth_all))]
+#         depth_valid = depth_all[val_idx[0]:val_idx[1]]
+#         # print(depth_valid)
+#         return np.mean(depth_valid) * SCALING
 
-def calc_depth_within_bbox(mtx, bboxes, image, scaled_size, show_depth=True):
-    def get_median_range(mtx):
-        SCALING = 10
-        """distance matrix for one patch"""
-        ranging = [.4, .6]
-        depth_all = np.sort(mtx.numpy().flatten())
-        val_idx = [int(ranging[0] * len(depth_all)), int(ranging[1] * len(depth_all))]
-        depth_valid = depth_all[val_idx[0]:val_idx[1]]
-        # print(depth_valid)
-        return np.mean(depth_valid) * SCALING
+#     scaling=(1,1)
+#     image = cv.resize(image, scaled_size, cv.INTER_AREA)
+#     print("scaling", scaling)
+#     # plt.imshow(depth_map), plt.show()
+#     for bbox in bboxes:
+#         xl, yl, w, h = bbox[0]*scaling[0], bbox[1]*scaling[1], bbox[2]*scaling[0], bbox[3]*scaling[1]
+#         xl, yl, xr, yr = int(xl), int(yl), int(xl + w), int(yl + h)
+#         mtx_patch = mtx[yl:yr, xl:xr]
+#         mean_depth = get_median_range(mtx_patch)
 
-    scaling=(1,1)
-    image = cv.resize(image, scaled_size, cv.INTER_AREA)
-    print("scaling", scaling)
-    # plt.imshow(depth_map), plt.show()
-    for bbox in bboxes:
-        xl, yl, w, h = bbox[0]*scaling[0], bbox[1]*scaling[1], bbox[2]*scaling[0], bbox[3]*scaling[1]
-        xl, yl, xr, yr = int(xl), int(yl), int(xl + w), int(yl + h)
-        mtx_patch = mtx[yl:yr, xl:xr]
-        mean_depth = get_median_range(mtx_patch)
-
-        if show_depth:
-            msg = '%.2f' % mean_depth
-            bbox_thick = int(0.5 * np.sum(mtx.shape) / 500)
-            t_size = cv.getTextSize(msg, 0, fontScale=.5, thickness=bbox_thick // 2)[0]
-            c3 = (xl + t_size[0], yl - t_size[1] - 3)
-            cv.rectangle(image, (xl, yl), (np.float32(c3[0]), np.float32(c3[1])), (50, 200, 50), -1)  # filled
-            cv.putText(image, msg, (xl, np.float32(yl - 2)), cv.FONT_HERSHEY_SIMPLEX,
-                       0.5, (0, 0, 0), bbox_thick // 2, lineType=cv.LINE_AA)
-    return image
+#         if show_depth:
+#             msg = '%.2f' % mean_depth
+#             bbox_thick = int(0.5 * np.sum(mtx.shape) / 500)
+#             t_size = cv.getTextSize(msg, 0, fontScale=.5, thickness=bbox_thick // 2)[0]
+#             c3 = (xl + t_size[0], yl - t_size[1] - 3)
+#             cv.rectangle(image, (xl, yl), (np.float32(c3[0]), np.float32(c3[1])), (50, 200, 50), -1)  # filled
+#             cv.putText(image, msg, (xl, np.float32(yl - 2)), cv.FONT_HERSHEY_SIMPLEX,
+#                        0.5, (0, 0, 0), bbox_thick // 2, lineType=cv.LINE_AA)
+#     return image
 
 if __name__ == '__main__':
     test()
