@@ -7,7 +7,7 @@ tensorflow==2.3.1
 (for gpu) cudatoolkit=10.1,  cudnn=7.6.5
 ```
 
-#### Note
+### Note
 Forgive me that I haven't used argument-parsing, so you need to take one minute to change some path. No worries, it's just a simple code merely for singlet depth estimation (for now). That is, **no** PoseNet, training and evaluation yet. Take one minute you will know what's going on in there.
 
 `simple_run`: as the name suggests, it's a simple run. Just change the vidoe path.
@@ -18,6 +18,7 @@ The `depth_decoder_creater.py` and `encoder_creator.py` is used to
 - Useful part: build the Model in TF2.x the same way as the official *monodepth2* implemented in Pytroch.
 - Neglectable part: weights loading. Weights were extracted from the official torch model in `numpy.ndarray` form, then directly loaded to the TF model layer-/parameter-wise. It's trivial. But I will upload the converted `SavedModel` directly, so no worries.
 
+The [model(640x192)](https://drive.google.com/drive/folders/1yBIYsphJInPIjGtL3NjMzHhjVk6ExoRC?usp=sharing) is trained on KITTI-Odometry dataset.
 
 ### TODO
 - [X] implement the encoder-decoder model in TF2.x, just for singlet depth estimation. 
@@ -25,3 +26,7 @@ The `depth_decoder_creater.py` and `encoder_creator.py` is used to
 - [ ] PoseNet decoder
 - [ ] training code
 - [ ] evluation code
+
+### Credits
+- the Official repo: https://github.com/nianticlabs/monodepth2
+- a TF1.x version implementation (complete with training and evaluation): https://github.com/FangGet/tf-monodepth2
