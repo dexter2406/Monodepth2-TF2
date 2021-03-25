@@ -7,7 +7,18 @@ tensorflow==2.3.1
 (for gpu) cudatoolkit=10.1,  cudnn=7.6.5
 ```
 
+### Performance
+I'm using a normal GTX1060-MaxQ GPU. The FPS for single-image depth estimation:
+- using `tf.saved_model.load` (I think it's serving mode)
+  - encoder: ~2ms (500 FPS)
+  - decoder: ~2ms
+  - overall: >200 FPS 
+- using `tf.keras.models.load_model` with `model.predict()`:
+  - overall : ~100 FPS (details forgot...)
+
+
 ### Note
+
 It's currently just for personal use. So forgive me that I haven't used argument-parsing, you need to change some path settings when you run the demo.
 
 However, no worries, it's just a simple code **merely for singlet depth estimation** (for now). That is, **no** PoseNet, training and evaluation yet. 
