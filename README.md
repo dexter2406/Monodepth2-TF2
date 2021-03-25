@@ -8,11 +8,13 @@ tensorflow==2.3.1
 ```
 
 ### Note
-Forgive me that I haven't used argument-parsing, so you need to take one minute to change some path. No worries, it's just a simple code merely for singlet depth estimation (for now). That is, **no** PoseNet, training and evaluation yet. Take one minute you will know what's going on in there.
+It's currently just for personal use. So forgive me that I haven't used argument-parsing, you need to change some path settings when you run the demo.
+However, no worries, it's just a simple code **merely for singlet depth estimation** (for now). That is, **no** PoseNet, training and evaluation yet. 
+Anyways, Take one minute you will know what's going on in there.
 
-`simple_run`: as the name suggests, it's a simple run. Just change the vidoe path.
+`simple_run.py`: as the name suggests, it's a simple run. Just change the vidoe path.
 
-`depth_esitmator_demo`: complete demo, where the model is encapsuled in Classes.
+`depth_esitmator_demo.py`: complete demo, where the model is encapsuled in Classes.
 
 The `depth_decoder_creater.py` and `encoder_creator.py` is used to 
 - Useful part: build the Model in TF2.x the same way as the official *monodepth2* implemented in Pytroch.
