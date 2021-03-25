@@ -21,7 +21,7 @@ The `depth_decoder_creater.py` and `encoder_creator.py` is used to
 
 ### TODO
 - [X] implement the encoder-decoder model in TF2.x, just for singlet depth estimation. 
-- [] multi-image-input version of the encoder
-- [] PoseNet decoder
-- [] training code
-- [] evluation code
+- [ ] multi-image-input version of the encoder
+- [ ] PoseNet decoder
+- [ ] training code
+- [ ] evluation code
