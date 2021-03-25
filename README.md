@@ -9,6 +9,7 @@ tensorflow==2.3.1
 
 ### Note
 It's currently just for personal use. So forgive me that I haven't used argument-parsing, you need to change some path settings when you run the demo.
+
 However, no worries, it's just a simple code **merely for singlet depth estimation** (for now). That is, **no** PoseNet, training and evaluation yet. 
 Anyways, Take one minute you will know what's going on in there.
 
