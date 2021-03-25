@@ -3,7 +3,7 @@ It's a monodepth2 model implemented in TF2.x, original paper《Digging into Self
 
 ### Dependencies
 ```
-tensorflow==2.3.1 (
+tensorflow==2.3.1
 (for gpu) cudatoolkit=10.1,  cudnn=7.6.5
 ```
 
