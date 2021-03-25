@@ -20,7 +20,7 @@ The `depth_decoder_creater.py` and `encoder_creator.py` is used to
 - Useful part: build the Model in TF2.x the same way as the official *monodepth2* implemented in Pytroch.
 - Neglectable part: weights loading. Weights were extracted from the official torch model in `numpy.ndarray` form, then directly loaded to the TF model layer-/parameter-wise. It's trivial. But I will upload the converted `SavedModel` directly, so no worries.
 
-The [model(640x192)](https://drive.google.com/drive/folders/1yBIYsphJInPIjGtL3NjMzHhjVk6ExoRC?usp=sharing) is trained on KITTI-Odometry dataset.
+The [resnet18-encoder](https://drive.google.com/drive/folders/1yBIYsphJInPIjGtL3NjMzHhjVk6ExoRC?usp=sharing) and [depth-decoder](https://drive.google.com/drive/folders/19LdqNfcLJDneNu79TtUupDPael3vo0VM?usp=sharing) is trained on KITTI-Odometry dataset, size (640x192).
 
 ### TODO
 - [X] implement the encoder-decoder model in TF2.x, just for singlet depth estimation. 
