@@ -12,8 +12,70 @@ import time
 from collections import defaultdict
 
 # tf.keras.backend.set_floatx('float16')
-CMAP_DEFAULT = 'plasma'
-SCALING = 10  # 10
+
+def get_models():
+    dec_name = "models/depth_decoder_singlet" # depth_decoder_singlet
+    # decoder = tf.keras.models.load_model(dec_name)
+    dec_imported = tf.saved_model.load(dec_name)
+    decoder = dec_imported.signatures['serving_default']
+    print("decoder loaded")
+
+    # encoder = tf.keras.models.load_model("encoder_res18_singlet")
+    enc_imported = tf.saved_model.load("models/encoder_res18_singlet")
+    encoder = enc_imported.signatures['serving_default']
+    print("encoder loaded")
+    return enc_imported, dec_imported
+
+
+def test():
+    enc_imported, dec_imported = get_models()
+    encoder = enc_imported.signatures['serving_default']
+    decoder = dec_imported.signatures['serving_default']
+    # return encoder, decoder
+    vid_path = [r"D:\MA\motion_ds\SeattleStreet_1.mp4",
+                r"D:\MA\Struct2Depth\KITTI_odom_02\seq2.avi"]
+    cap = cv.VideoCapture(vid_path[1])
+    fourcc = cv.VideoWriter_fourcc(*'XVID')
+    orig_w, orig_h = int(cap.get(3)), int(cap.get(4))
+    scaled_size = (640,192)
+    writer = cv.VideoWriter('depth_monodepth2.avi', fourcc, 12, (1240, 372))
+    df_b = open("bboxes.txt", 'rb')
+
+    timers = defaultdict(lambda : 1e-4)
+    while cap.isOpened():
+        ret, image = cap.read()
+        if type(image) is None:
+            exit("wrong video")
+        t0 = time.time()
+        # t1 = time.time()
+        input_data, (_, _) = prepare_image(image, batch_dim=True, as_tensor=True, channel_first=False)
+        # timers['prepare'] = time.time() - t1
+
+        t1 = time.time()
+        feature_raw = encoder(input_data)
+        timers['encoder'] = time.time() - t1
+
+        t1 = time.time()
+        features = process_enc_outputs(feature_raw, enc_model='pb', dec_model='pb')
+        timers['feature process'] = time.time() - t1
+
+        t1 = time.time()
+        disp_raw = decoder(**features)
+        for k, v in disp_raw.items():
+            disp = v
+        timers['decoder'] = time.time() - t1
+
+        # scaled_disp = postprocess(disp) # get depth values
+
+        t1 = time.time()
+        colormapped_im = visualize(disp, original_width=orig_w, original_height=orig_h)
+        timers['visualize'] = time.time() - t1
+        timers['overall'] = time.time() - t0
+        print_runtime(timers, image=None)
+        cv.imshow('', colormapped_im)
+        # writer.write(colormapped_im)
+        if cv.waitKey(1) & 0xFF==27:
+            break
 
 
 def prepare_image(image=None, feed_width=640, feed_height=192, batch_dim=True, as_tensor=True,
@@ -115,70 +177,6 @@ def process_enc_outputs(features_raw, enc_model='pb', dec_model='pb'):
 
     return features
 
-
-def get_models():
-    dec_name = "models/depth_decoder_singlet" # depth_decoder_singlet
-    # decoder = tf.keras.models.load_model(dec_name)
-    dec_imported = tf.saved_model.load(dec_name)
-    decoder = dec_imported.signatures['serving_default']
-    print("decoder loaded")
-
-    # encoder = tf.keras.models.load_model("encoder_res18_singlet")
-    enc_imported = tf.saved_model.load("models/encoder_res18_singlet")
-    encoder = enc_imported.signatures['serving_default']
-    print("encoder loaded")
-    return enc_imported, dec_imported
-
-
-def test():
-    enc_imported, dec_imported = get_models()
-    encoder = enc_imported.signatures['serving_default']
-    decoder = dec_imported.signatures['serving_default']
-    # return encoder, decoder
-    vid_path = [r"D:\MA\motion_ds\SeattleStreet_1.mp4",
-                r"D:\MA\Struct2Depth\KITTI_odom_02\seq2.avi"]
-    cap = cv.VideoCapture(vid_path[1])
-    fourcc = cv.VideoWriter_fourcc(*'XVID')
-    orig_w, orig_h = int(cap.get(3)), int(cap.get(4))
-    scaled_size = (640,192)
-    writer = cv.VideoWriter('depth_monodepth2.avi', fourcc, 12, (1240, 372))
-    df_b = open("bboxes.txt", 'rb')
-
-    timers = defaultdict(lambda : 1e-4)
-    while cap.isOpened():
-        ret, image = cap.read()
-        if type(image) is None:
-            exit("wrong video")
-        t0 = time.time()
-        # t1 = time.time()
-        input_data, (_, _) = prepare_image(image, batch_dim=True, as_tensor=True, channel_first=False)
-        # timers['prepare'] = time.time() - t1
-
-        t1 = time.time()
-        feature_raw = encoder(input_data)
-        timers['encoder'] = time.time() - t1
-
-        t1 = time.time()
-        features = process_enc_outputs(feature_raw, enc_model='pb', dec_model='pb')
-        timers['feature process'] = time.time() - t1
-
-        t1 = time.time()
-        disp_raw = decoder(**features)
-        for k, v in disp_raw.items():
-            disp = v
-        timers['decoder'] = time.time() - t1
-
-        # scaled_disp = postprocess(disp) # get depth values
-
-        t1 = time.time()
-        colormapped_im = visualize(disp, original_width=orig_w, original_height=orig_h)
-        timers['visualize'] = time.time() - t1
-        timers['overall'] = time.time() - t0
-        print_runtime(timers, image=None)
-        cv.imshow('', colormapped_im)
-        # writer.write(colormapped_im)
-        if cv.waitKey(1) & 0xFF==27:
-            break
 
 def postprocess(disp, depth_npy_path=None):
     import os
