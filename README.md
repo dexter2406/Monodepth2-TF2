@@ -19,9 +19,9 @@ I'm using a normal GTX1060-MaxQ GPU. The FPS for single-image depth estimation:
 
 ### Note
 
-It's currently just for personal use. So forgive me that I haven't used argument-parsing, you need to change some path settings when you run the demo.
+It's currently just for personal use, but please feel free to contact me if you need anything. 
 
-However, no worries, it's just a simple code **merely for singlet depth estimation** (for now). That is, **no** PoseNet, training and evaluation yet. 
+Forgive me that I haven't used argument-parsing, so you can't run with one command. You need to change some path settings when you run the demo. However, no worries, it's just a simple code **merely for singlet depth estimation** (for now). That is, **no** PoseNet, training and evaluation yet. 
 Anyways, Take one minute you will know what's going on in there.
 
 `depth_esitmator_demo.py`: a short demo, where the model is encapsuled in Classes. Just change the vidoe & weights path, and of course put the weight (linke below) in the corresponding order..
