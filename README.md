@@ -43,6 +43,7 @@ The models (official weights, trained on KITTI-Odometry dataset, size (640x192).
 - [X] Pose encoder: multi-image-input version of the encoder
 - [X] Pose decoder
 - [ ] training code
+- [ ] test code
 - [ ] evluation code
 
 ### Credits
