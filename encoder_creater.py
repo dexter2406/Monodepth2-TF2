@@ -45,7 +45,7 @@ class ResNet18_new(tf.keras.Model):
     def __init__(self, block_list, initial_filters=64, padding_mode='constant'):
         super(ResNet18_new, self).__init__()
         padding = 'valid' if padding_mode != 'same' else 'same'
-        padding_options = {'reflect': {'mode': 'CONSTANT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]},
+        padding_options = {'reflect': {'mode': 'REFLECT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]},
                            'constant': {'mode': 'CONSTANT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]}}
         self.pad_3 = padding_options[padding_mode]
 
@@ -84,8 +84,8 @@ class ResNet18_new(tf.keras.Model):
         x = self.a1(x)
         outputs.append(x)
         x = self.pool1(x)
-        x = self.layer1(x, training=training)
 
+        x = self.layer1(x, training=training)
         outputs.append(x)
         x = self.layer2(x, training=training)
         outputs.append(x)
@@ -159,7 +159,7 @@ def check_weights(enc_weights):
 
 def load_ext_weights_enc(model=None):
     import numpy as np
-    path = r'D:\MA\Recources\monodepth2-torch\models\enc_weights_enumerate.pkl'
+    path = r'D:\MA\Recources\monodepth2-torch\models\pose_enc_weights_enum.pkl'
     enc_weights = np.load(path, allow_pickle=True)
     weight_ind = 0
     for i, layer in enumerate(model.layers):
@@ -194,20 +194,76 @@ def load_ext_weights_enc(model=None):
     assert weight_ind == len(enc_weights)
     # model_test.save("models/res18_encoder.h5", include_optimizer=False)
 
-# inputs = tf.keras.layers.Input(shape=(192,640,3))
-encoder = ResNet18_new([2,2,2,2])
-# outs = encoder.call(inputs=inputs, training=True)
-encoder.build(input_shape=(None, 192, 640, 3))
-load_ext_weights_enc(model=encoder)
 
-input_arr = tf.random.uniform(shape=(1, 192, 640,3))
-outputs = encoder.predict(input_arr)
-print(outputs[4].shape)
-#
-encoder.summary()
-tf.keras.models.save_model(encoder, "res18_encoder_reflect")
-print("saved")
-encoder_reload = tf.keras.models.load_model("res18_encoder_reflect")
-print("reloaded")
-encoder_reload.summary()
+def set_weights_enc():
+    # inputs = tf.keras.layers.Input(shape=(192,640,3))
+    pose_encoder = ResNet18_new([2, 2, 2, 2])
+    # outs = encoder.call(inputs=inputs, training=True)
+    pose_encoder.build(input_shape=(None, 192, 640, 3))
+    load_ext_weights_enc(model=pose_encoder)
 
+    input_arr = tf.random.uniform(shape=(1, 192, 640, 3))
+    outputs = pose_encoder.predict(input_arr)
+    print(outputs[4].shape)
+    #
+    pose_encoder.summary()
+    tf.keras.models.save_model(pose_encoder, "pose_encoder_one_input")
+    print("saved")
+
+
+def check_model(model_path=None, keras=False, pb=False):
+    if model_path is None:
+        print("please specify name")
+        return
+
+    if keras:
+        encoder_reload = tf.keras.models.load_model(model_path)
+        print("reloaded")
+        encoder_reload.summary()
+    elif pb:
+        encoder_reload = tf.saved_model.load(model_path)
+        infer = encoder_reload.signatures['serving_default']
+        print("reloaded")
+        dummy_in = tf.random.uniform(shape=(1, 192, 640, 3))
+        res = infer(dummy_in)
+        for k, v in res.items():
+            print(k,"\t", v.numpy().shape)
+    return encoder_reload
+
+
+def load_weights_multi_image(model_multi=None, num_input=2):
+    """Load weigths from one-input resnet18 to pair-wise input mode"""
+    model_single = check_model("models/pose_encoder_one_input", keras=True, pb=False)
+    conv0_weights_no_bias = []
+
+    for layer in model_single.layers:
+        if layer.name == 'conv0':
+            weights = layer.get_weights()
+            weights_double = tf.concat([weights[0], weights[0]], axis=2) / num_input
+            print(weights_double.shape)
+            conv0_weights_no_bias.append(weights_double)
+
+    for layer in model_multi.layers:
+        if layer.name == 'conv0':
+            layer.set_weights(conv0_weights_no_bias)
+
+
+def build_pose_encoder_pair_input(verbose=False):
+    """Create Multi-input resnet18 for PoseEncoder"""
+    pose_encoder = ResNet18_new([2,2,2,2])
+    dummy_in = tf.concat([tf.random.uniform(shape=(1, 192, 640, 3)),
+                          tf.random.uniform(shape=(1, 192, 640, 3))], axis=3)
+    pose_encoder.predict(dummy_in)
+    if verbose:
+        pose_encoder.summary()
+    load_weights_multi_image(pose_encoder)
+    print("Weigths for  pair-input encoder has done.")
+    return pose_encoder
+
+
+if __name__ == '__main__':
+    # set_weights_enc()
+    # check_model("models/pose_encoder_one_input", keras=True, pb=False)
+    pose_encoder = build_pose_encoder_pair_input(verbose=False)
+    pose_encoder.summary()
+    # tf.keras.models.save_model(pose_encoder, "models/pose_encoder")
