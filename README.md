@@ -40,7 +40,7 @@ The models (official weights, trained on KITTI-Odometry dataset, size (640x192).
 
 ### TODO
 - [X] implement the encoder-decoder model in TF2.x, just for singlet depth estimation. 
-- [ ] Pose encoder: multi-image-input version of the encoder
+- [X] Pose encoder: multi-image-input version of the encoder
 - [X] Pose decoder
 - [ ] training code
 - [ ] evluation code
