@@ -11,7 +11,92 @@ import zipfile
 from six.moves import urllib
 import pickle
 import numpy as np
+import tensorflow as tf
 
+
+def concat_pose_params(pred_pose_raw, curr2prev=False, curr2next=False):
+    """Combine pose angles and translations, from raw dictionary"""
+    if curr2prev and curr2next:
+        raise NotImplementedError
+    if not curr2prev and not curr2next:
+        print("concat poses for both frames")
+        return tf.concat([pred_pose_raw['angles'], pred_pose_raw['translations']], axis=2)
+    else:
+        seq_choice = 0 if curr2prev else 1
+        concated = tf.concat([pred_pose_raw['angles'][:, seq_choice, :],
+                              pred_pose_raw['translations'][:, seq_choice, :]], axis=1)
+        return tf.expand_dims(concated, axis=1)
+
+
+def disp_to_depth(disp, min_depth, max_depth):
+    """Convert network's sigmoid output into depth prediction
+    The formula for this conversion is given in the 'additional considerations'
+    section of the paper.
+    """
+    min_disp = 1 / max_depth
+    max_disp = 1 / min_depth
+    scaled_disp = min_disp + (max_disp - min_disp) * disp
+    depth = 1 / scaled_disp
+    return scaled_disp, depth
+
+
+def process_enc_outputs(features_raw, enc_model='pb', dec_model='pb'):
+    """convert featrues from encoder to proper form for decoder input
+    encoder/decoder model type: 'pb' or 'keras'
+    Note:
+        - For outputs: keras gives LIST; saved_model (.pb) gives DICTIONARY
+        - For inputs: for multiple inputs, keras takes TUPLE; saved_model takes DICTIONARY,or keyword-specific arguments
+    Examples:
+    1) enc_pb -> decoder_pb: 'dict' -> 'dict'
+    2) enc_keras -> decoder_keras 'list' -> 'tuple'
+    """
+    model_types = ['pb', 'keras']
+    if enc_model not in model_types and dec_model not in model_types:
+        raise NotImplementedError
+
+    if enc_model == model_types[0]:
+        if dec_model == model_types[0]:
+            features = {}
+            for i in range(1, 6):
+                features['input_%d' % i] = (features_raw['output_%d' % i])
+        elif dec_model == model_types[1]:
+            features = []
+            for i in range(1, 6):
+                features.append(features_raw['output_%d' % i])
+                features = tuple(features)
+
+    elif enc_model == model_types[1]:
+        if dec_model == model_types[0]:
+            features = {}
+            for i in range(1, 6):
+                print('input_%d : ' % i, features_raw[i-1].shape)
+                features['input_%d' % i] = features_raw[i-1]
+        elif dec_model == model_types[1]:
+            features = tuple(features_raw)
+
+    else:
+        raise NotImplementedError
+
+    return features
+
+
+def get_median_range(mtx):
+    max_val = 30
+    SCALING = 10
+    """distance matrix for one patch"""
+    ranging = [.4, .6]
+    depth_all = np.sort(mtx.flatten())
+    val_idx = [int(ranging[0] * len(depth_all)), int(ranging[1] * len(depth_all))]
+    depth_valid = depth_all[val_idx[0]: val_idx[1]]
+    # print(depth_valid)
+    # todo: disp converted to real depth values, maybe see Struct2Depth?
+    # depth_valid = max_val - np.mean(depth_valid) * SCALING
+    # depth_valid_mean = np.mean(depth_valid)
+    print("depth_all shape", depth_all.shape)
+    print("depth_valid shape", depth_valid.shape)
+    depth_valid_mean = sum(depth_valid) / depth_valid.size
+    print("random value:", depth_valid[1000])
+    return depth_valid, depth_valid_mean
 
 def to_numpy(tensor):
     return tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
@@ -126,7 +211,6 @@ def check_weights(weights_data):
         for i in range(2):
             print(type(weights[0]), weights[0].shape)
             print(type(weights[1]), weights[1].shape)
-
 
 def extract_weights(encoder):
 
