@@ -1,5 +1,39 @@
 import tensorflow as tf
 import numpy as np
+import matplotlib
+
+def build_models(models_dict, check_outputs=False, show_summary=False):
+    for k, m in models_dict.items():
+        print(k)
+        if "depth_enc" == k:
+            inputs = tf.random.uniform(shape=(1, 192, 640, 3))
+            outputs = m(inputs)
+        elif "depth_dec" == k:
+            shapes = [(1, 96, 320, 64), (1, 48, 160, 64), (1, 24, 80, 128), (1, 12, 40, 256), (1, 6, 20, 512)]
+            inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
+            outputs = m(inputs)
+        elif "pose_enc" == k:
+            shape = (1, 192, 640, 3)
+            inputs = tf.concat([tf.random.uniform(shape=shape),
+                                tf.random.uniform(shape=shape)], axis=3)
+            outputs = m(inputs)
+        elif "pose_dec" == k:
+            shapes = [(1, 96, 320, 64), (1, 48, 160, 64), (1, 24, 80, 128), (1, 12, 40, 256), (1, 6, 20, 512)]
+            inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
+            outputs = m(inputs)
+        else:
+            raise NotImplementedError
+
+        if check_outputs:
+            print(type(outputs))
+            if isinstance(outputs, dict):
+                for k, v in outputs.items():
+                    print(k, "\t", v.shape)
+            else:
+                for elem in outputs:
+                    print(elem.shape)
+        if show_summary:
+            m.summary()
 
 
 def SSIM(x, y):
@@ -61,6 +95,51 @@ def projective_inverse_warp(img, depth, pose, intrinsics, invert=False, euler=Fa
     return output_img
 
 
+def compute_depth_errors(gt, pred):
+    """Computation of error metrics between predicted and ground truth depths
+    """
+    thresh = np.max((gt / pred), (pred / gt))
+    a1 = (thresh < 1.25     ).float().mean()
+    a2 = (thresh < 1.25 ** 2).float().mean()
+    a3 = (thresh < 1.25 ** 3).float().mean()
+
+    rmse = (gt - pred) ** 2
+    rmse = tf.math.sqrt(rmse.mean())
+
+    rmse_log = (tf.math.log(gt) - tf.math.log(pred)) ** 2
+    rmse_log = tf.math.sqrt(rmse_log.mean())
+
+    abs_rel = np.mean(tf.abs(gt - pred) / gt)
+
+    sq_rel = np.mean((gt - pred) ** 2 / gt)
+
+    return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
+
+
+def colorize(value, vmin=None, vmax=None, cmap=None):
+    # normalize
+    vmin = tf.reduce_min(value) if vmin is None else vmin
+    vmax = tf.reduce_max(value) if vmax is None else vmax
+    value = (value - vmin) / (vmax - vmin)  # vmin..vmax
+    # squeeze last dim if it exists
+    value = tf.compat.v1.squeeze(value)
+    # quantize
+    indices = tf.compat.v1.to_int32(tf.compat.v1.round(value * 255))
+    # gather
+    cm = matplotlib.cm.get_cmap(cmap if cmap is not None else 'gray')
+    colors = tf.constant(cm.colors, dtype=tf.float32)
+    value = tf.gather(colors, indices)
+    return value
+
+def normalize_image(x):
+    """Rescale image pixels to span range [0, 1]
+    """
+    ma = tf.reduce_max(x)
+    mi = tf.reduce_min(x)
+    d = ma - mi if ma != mi else 1e5
+    return (x - mi) / d
+
+
 def pose_axis_angle_vec2mat(vec, invert=False):
     """
     Convert axis angle and translation into 4x4 matrix
@@ -78,7 +157,7 @@ def pose_axis_angle_vec2mat(vec, invert=False):
     R = rotfromAxisAngle(axisvec)
 
     if invert:
-        R = tf.compat.v1.transpose(R, [0, 2, 1])
+        R = tf.transpose(R, [0, 2, 1])
         translation *= -1
     t = getTransMatrix(translation)
 
@@ -119,7 +198,7 @@ def rotfromAxisAngle(vec):
     :param vec: [B, 1, 3]
     :return:
     """
-    angle = tf.compat.v1.norm(vec, ord=2, axis=2, keepdims=True)
+    angle = tf.norm(vec, ord=2, axis=2, keepdims=True)
     axis = vec / (angle + 1e-7)
 
     ca = tf.math.cos(angle)
@@ -178,11 +257,13 @@ def bilinear_sampler(imgs, coords):
         return tf.reshape(x, [-1])
 
     with tf.name_scope('grid_sampling'):
-        coords_x, coords_y = tf.compat.v1.split(coords, [1, 1], axis=3)
+        coords_x, coords_y = tf.split(coords, [1, 1], axis=3)
         inp_size = imgs.get_shape()
         coord_size = coords.get_shape()
-        out_size = list(coords.numpy().shape)
-        out_size[3] = imgs.numpy().shape[3]
+        # out_size = list(coords.numpy().shape)
+        # out_size[3] = imgs.numpy().shape[3]
+        out_size = list(coords.shape)
+        out_size[3] = imgs.shape[3]
 
         coords_x = tf.cast(coords_x, 'float32')
         coords_y = tf.cast(coords_y, 'float32')
@@ -190,17 +271,17 @@ def bilinear_sampler(imgs, coords):
         # edit at 05/26 by Frank
         # use border pixel [0.5, max-0.5] for out of bounder reprojection
         # pixels
-        y_max = tf.cast(tf.compat.v1.shape(imgs)[1] - 1, 'float32')
-        x_max = tf.cast(tf.compat.v1.shape(imgs)[2] - 1, 'float32')
+        y_max = tf.cast(tf.shape(imgs)[1] - 1, 'float32')
+        x_max = tf.cast(tf.shape(imgs)[2] - 1, 'float32')
         zero = tf.zeros([1], dtype='float32')
-        eps = tf.compat.v1.constant([0.5], tf.float32)
+        eps = tf.constant([0.5], tf.float32)
 
         coords_x = tf.clip_by_value(coords_x, eps, x_max - eps)
         coords_y = tf.clip_by_value(coords_y, eps, y_max - eps)
 
-        x0 = tf.compat.v1.floor(coords_x)
+        x0 = tf.floor(coords_x)
         x1 = x0 + 1
-        y0 = tf.compat.v1.floor(coords_y)
+        y0 = tf.floor(coords_y)
         y1 = y0 + 1
 
         x0_safe = tf.clip_by_value(x0, zero, x_max)
@@ -209,10 +290,10 @@ def bilinear_sampler(imgs, coords):
         y1_safe = tf.clip_by_value(y1, zero, y_max)
 
         ## bilinear interp weights, with points outside the grid having weight 0
-        # wt_x0 = (x1 - coords_x) * tf.cast(tf.compat.v1.equal(x0, x0_safe), 'float32')
-        # wt_x1 = (coords_x - x0) * tf.cast(tf.compat.v1.equal(x1, x1_safe), 'float32')
-        # wt_y0 = (y1 - coords_y) * tf.cast(tf.compat.v1.equal(y0, y0_safe), 'float32')
-        # wt_y1 = (coords_y - y0) * tf.cast(tf.compat.v1.equal(y1, y1_safe), 'float32')
+        # wt_x0 = (x1 - coords_x) * tf.cast(tf.equal(x0, x0_safe), 'float32')
+        # wt_x1 = (coords_x - x0) * tf.cast(tf.equal(x1, x1_safe), 'float32')
+        # wt_y0 = (y1 - coords_y) * tf.cast(tf.equal(y0, y0_safe), 'float32')
+        # wt_y1 = (coords_y - y0) * tf.cast(tf.equal(y1, y1_safe), 'float32')
 
         wt_x0 = x1_safe - coords_x  # 1
         wt_x1 = coords_x - x0_safe  # 0
@@ -237,10 +318,10 @@ def bilinear_sampler(imgs, coords):
         ## sample from imgs
         imgs_flat = tf.reshape(imgs, tf.stack([-1, inp_size[3]]))
         imgs_flat = tf.cast(imgs_flat, 'float32')
-        im00 = tf.reshape(tf.compat.v1.gather(imgs_flat, tf.cast(idx00, 'int32')), out_size)
-        im01 = tf.reshape(tf.compat.v1.gather(imgs_flat, tf.cast(idx01, 'int32')), out_size)
-        im10 = tf.reshape(tf.compat.v1.gather(imgs_flat, tf.cast(idx10, 'int32')), out_size)
-        im11 = tf.reshape(tf.compat.v1.gather(imgs_flat, tf.cast(idx11, 'int32')), out_size)
+        im00 = tf.reshape(tf.gather(imgs_flat, tf.cast(idx00, 'int32')), out_size)
+        im01 = tf.reshape(tf.gather(imgs_flat, tf.cast(idx01, 'int32')), out_size)
+        im10 = tf.reshape(tf.gather(imgs_flat, tf.cast(idx10, 'int32')), out_size)
+        im11 = tf.reshape(tf.gather(imgs_flat, tf.cast(idx11, 'int32')), out_size)
 
         w00 = wt_x0 * wt_y0
         w01 = wt_x0 * wt_y1
@@ -268,8 +349,8 @@ def pose_vec2mat(vec):
     ry = tf.slice(vec, [0, 4], [-1, 1])
     rz = tf.slice(vec, [0, 5], [-1, 1])
     rot_mat = euler2mat(rz, ry, rx)
-    rot_mat = tf.compat.v1.squeeze(rot_mat, axis=[1])
-    filler = tf.compat.v1.constant([0.0, 0.0, 0.0, 1.0], shape=[1, 1, 4])
+    rot_mat = tf.squeeze(rot_mat, axis=[1])
+    filler = tf.constant([0.0, 0.0, 0.0, 1.0], shape=[1, 1, 4])
     filler = tf.tile(filler, [batch_size, 1, 1])
     transform_mat = tf.concat([rot_mat, translation], axis=2)
     transform_mat = tf.concat([transform_mat, filler], axis=1)
@@ -321,7 +402,7 @@ def cam2pixel(cam_coords, proj):
     y_n = y_u / (z_u + 1e-10)
     pixel_coords = tf.concat([x_n, y_n], axis=1)
     pixel_coords = tf.reshape(pixel_coords, [batch, 2, height, width])
-    return tf.compat.v1.transpose(pixel_coords, perm=[0, 2, 3, 1])
+    return tf.transpose(pixel_coords, perm=[0, 2, 3, 1])
 
 
 def meshgrid(batch, height, width, is_homogeneous=True):
@@ -361,7 +442,7 @@ def euler2mat(z, y, x):
     Returns:
         Rotation matrix corresponding to the euler angles -- size = [B, N, 3, 3]
     """
-    B = tf.compat.v1.shape(z)[0]
+    B = tf.shape(z)[0]
     N = 1
     z = tf.clip_by_value(z, -np.pi, np.pi)
     y = tf.clip_by_value(y, -np.pi, np.pi)
