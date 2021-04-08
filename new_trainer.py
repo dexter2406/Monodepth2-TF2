@@ -3,11 +3,15 @@ from models.depth_decoder_creater import DepthDecoder_full
 from models.encoder_creater import ResNet18_new
 from models.posenet_decoder_creator import PoseDecoder
 from utils import process_enc_outputs, disp_to_depth, concat_pose_params
-from src.trainer_helper import SSIM, projective_inverse_warp, build_models, compute_depth_errors, colorize, normalize_image
-from src.dataset_loader import build_dataset
+from src.trainer_helper import *
+from src.dataset_loader import DataLoader
 import numpy as np
 from src.DataPprocessor import DataProcessor
 import datetime
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import pickle
+
 
 config = tf.compat.v1.ConfigProto()
 config.gpu_options.allow_growth = True
@@ -22,12 +26,18 @@ class Trainer:
         self.height = 192
         self.width = 640
         self.frame_idx = [0, -1, 1]
+        self.num_frames_per_batch = len(self.frame_idx)
         self.preprocess = True
         self.auto_mask = False
         self.ssim_ratio = 0.85
         self.smoothness_ratio = 1e-3
         self.min_depth = 0.1
         self.max_depth = 100
+
+        self.num_epochs = 2
+        self.batch_size = 4
+        self.data_loader = DataLoader(self.num_epochs, self.batch_size)
+        self.shape_scale0 = [self.batch_size, self.height, self.width, 3]
 
         self.tgt_image = None
         self.tgt_image_net = None
@@ -44,9 +54,6 @@ class Trainer:
         self.smooth_losses = 0.
         self.total_loss = 0.
         self.losses = {}
-
-        self.num_epochs = 10
-        self.batch_size = 2
 
         self.batch_processor = DataProcessor()
         lr = 1e-3   # todo: learning rate scheduler
@@ -110,7 +117,6 @@ class Trainer:
         self.total_loss = 0.
 
     def compute_losses(self, input_imgs, outputs):
-        print("compute_losses ...")
         tgt_image = input_imgs[('color', 0, 0)]
         self.reset_loss()
 
@@ -122,6 +128,7 @@ class Trainer:
             for i, f_i in enumerate(self.frame_idx[1:]):
                 proj_image = outputs[('color', f_i, scale)]
                 assert proj_image.shape[2] == tgt_image.shape[2] == 640
+
                 proj_error = tf.math.abs(proj_image - tgt_image)
                 reproject_losses.append(self.compute_reproject_loss(proj_image, tgt_image))
                 if i == 0:
@@ -212,39 +219,135 @@ class Trainer:
         self.total_loss /= self.num_scales
         self.losses['loss/total'] = self.total_loss
         return self.total_loss
+    #
+    # def generate_images_pred_orig(self, input_imgs, input_K_mulscale, outputs, pred_poses):
+    #     """Generate warped/reprojected images for a minibatch
+    #     produced images are saved in 'outputs' dir
+    #     """
+    #     print("generate_images_pred...")
+    #     for scale in range(self.num_scales):
+    #         for i, f_i in enumerate(self.frame_idx[1:]):
+    #             # Calculate reprojected image.
+    #             # When f_i==-1, since pose is current->previous, inverse order,
+    #             # so intrinsics K also needs to be inverted before warping
+    #             do_invert = True if f_i == -1 else False
+    #             print("\tinput_K_mulscale: ", input_K_mulscale.shape)
+    #             curr_proj_image = projective_inverse_warp(input_imgs[('color', f_i, self.src_scale)],
+    #                                                       tf.squeeze(outputs[('depth', scale)], axis=3),
+    #                                                       pred_poses[:, i, :],
+    #                                                       intrinsics=input_K_mulscale[:, self.src_scale, :, :],
+    #                                                       invert=do_invert)
+    #             print("\tprojected image shape :", curr_proj_image.shape, " at scale %d"%scale, " f_id %d"%f_i)
+    #
+    #             outputs[('color', f_i, scale)] = curr_proj_image
+    #
+    #             # not in use for now
+    #             if self.auto_mask:
+    #                 outputs[("color_identity", f_i, scale)] = input_imgs[("color", f_i, self.src_scale)]
+    #
+    #     # -----------------
+    #     # Visualize for debugging
+    #     # -----------------
+    #     fig = plt.figure(figsize=(3, 2))
+    #     fig.add_subplot(3, 2, 1)
+    #     plt.imshow(input_imgs[('color', 0, 0)][0])
+    #     fig.add_subplot(3, 2, 3)
+    #     plt.imshow(input_imgs[('color', -1, 0)][0])
+    #     fig.add_subplot(3, 2, 4)
+    #     plt.imshow(outputs[('color', -1, 0)][0])
+    #     fig.add_subplot(3, 2, 5)
+    #     plt.imshow(input_imgs[('color', 1, 0)][0])
+    #     fig.add_subplot(3, 2, 6)
+    #     plt.imshow(outputs[('color', 1, 0)][0])
+    #     plt.show()
+    #     del fig
+    #     yes = input("store result?: ")
+    #     if yes=='y':
+    #         print("saving the results...")
+    #         inputs_tf = {}
+    #         outputs_tf = {}
+    #         for k, v in input_imgs.items():
+    #             inputs_tf[k] = v.numpy()
+    #         for k, v in outputs.items():
+    #             outputs_tf[k] = v.numpy()
+    #         export_list = [inputs_tf, outputs_tf]
+    #         with open("inverse_warp.pkl", 'wb') as df:
+    #             pickle.dump(export_list, df)
+    #         with open("pose_res.ple", 'wb') as df:
+    #             poses = tf.expand_dims(pred_poses, 2)
+    #             pickle.dump(poses, df)
+    #         exit("!")
+    #         del export_list
+    #     return outputs
 
-    def generate_images_pred(self, input_imgs, input_K_mulscale, outputs, pred_poses):
-        """Generate warped/reprojected images for a minibatch
-        produced images are saved in 'outputs' dir
+    def generate_images_pred(self, input_imgs, input_Ks, outputs, debug=False):
+        """Generate the warped (reprojected) color images for a minibatch.
+        Generated images are saved into the `outputs` dictionary.
         """
-        print("generate_images_pred...")
-        for scale in range(self.num_scales):
-            for f_i in self.frame_idx[1:]:
-                # Calculate reprojected image.
-                # When f_i==-1, since pose is current->previous, inverse order,
-                # so intrinsics K also needs to be inverted before warping
-                do_invert = True if f_i == -1 else False
-                print("\tinput_K_mulscale: ", input_K_mulscale.shape)
-                curr_proj_image = projective_inverse_warp(input_imgs[('color', f_i, self.src_scale)],
-                                                          tf.squeeze(outputs[('depth', scale)], axis=3),
-                                                          pred_poses[:, f_i, :],
-                                                          intrinsics=input_K_mulscale[:, self.src_scale, :, :],
-                                                          invert=do_invert)
-                print("\tprojected image shape :", curr_proj_image.shape, " at scale %d"%scale, " f_id %d"%f_i)
-                outputs[('color', f_i, scale)] = curr_proj_image
-                # not in use for now
-                if self.auto_mask:
-                    outputs[("color_identity", f_i, scale)] = input_imgs[("color", f_i, self.src_scale)]
-        return outputs
+        # with open("D:\MA\Recources\monodepth2_tf2\inverse_warp.pkl", 'rb') as df:
+        #     input_imgs, output_tf = pickle.load(df)
 
-    def predict_poses(self, input_imgs):
+        source_scale = 0
+        for scale in range(self.num_scales):
+            # print("===== scale %d ====="%scale)
+            disp_tf = outputs[("disp", scale)]   # tf-version
+            # print("disp_tf shape in scale: ", disp_tf)
+
+            disp = tf.image.resize(disp_tf, (self.height, self.width))
+
+            _, depth = disp_to_depth(disp, self.min_depth, self.max_depth)
+
+            outputs[("depth", 0, scale)] = depth
+
+            for i, f_i in enumerate(self.frame_idx[1:]):
+                T = outputs[("cam_T_cam", 0, f_i)]
+                T = tf.cast(T, tf.float32)
+                cam_points = back_proj_depth(depth, input_Ks[("inv_K", source_scale)],
+                                             self.shape_scale0, source_scale)
+                pix_coords = project_3d(cam_points, input_Ks[("K", source_scale)], T,
+                                        self.shape_scale0, source_scale)
+                outputs[("sample", f_i, scale)] = pix_coords
+
+                input_tf = input_imgs[("color", f_i, source_scale)]
+                res = bilinear_sampler(input_tf, outputs[("sample", f_i, scale)])
+
+                outputs[("color", f_i, scale)] = res
+
+        if debug:
+            for i in range(self.batch_size):
+                fig = plt.figure(figsize=(3, 2))
+                fig.add_subplot(3, 2, 1)
+                tgt = input_imgs[('color', 0, 0)][i]
+                plt.imshow(tgt)
+
+                fig.add_subplot(3, 2, 3)
+                src0 = input_imgs[('color_aug', -1, 0)][i]
+                print(np.max(np.max(src0)), np.min(np.min(src0)))
+                plt.imshow(src0)
+
+                fig.add_subplot(3, 2, 4)
+                src1 = input_imgs[('color_aug', 1, 0)][i]
+                plt.imshow(src1)
+                print(np.max(np.max(src1)), np.min(np.min(src1)))
+
+                fig.add_subplot(3, 2, 5)
+                out0 = outputs[("color", -1, 0)][i]
+                print(np.max(np.max(out0)), np.min(np.min(out0)))
+                plt.imshow(out0)
+                fig.add_subplot(3, 2, 6)
+                out1 = outputs[("color", 1, 0)][i]
+                print(np.max(np.max(out1)), np.min(np.min(out1)))
+                plt.imshow(out1)
+                plt.show()
+
+    def predict_poses(self, input_imgs, outputs):
         """Use pose enc-dec to calculate camera's angles and translations"""
         tgt_image_aug       = input_imgs[('color_aug', self.frame_idx[0], 0)]
         src_image_pre_aug   = input_imgs[('color_aug', self.frame_idx[1], 0)]
         src_image_post_aug  = input_imgs[('color_aug', self.frame_idx[2], 0)]
-        print("============ predict_poses ==============")
-        print(src_image_pre_aug.shape)
-        print(tgt_image_aug.shape)
+        # print("============ predict_poses ==============")
+        # print(src_image_pre_aug.shape)
+        # print(tgt_image_aug.shape)
         # Enocder
         pose_ctp_raw = self.models['pose_enc'](
             tf.concat([src_image_pre_aug, tgt_image_aug], axis=3)
@@ -261,12 +364,20 @@ class Trainer:
         # Collect angles and translations
         pred_pose_ctp = concat_pose_params(pred_pose_ctp_raw, curr2prev=True, curr2next=False)
         pred_pose_ctn = concat_pose_params(pred_pose_ctn_raw, curr2prev=True, curr2next=False)
-        print("\t check concated pose shape: ", pred_pose_ctn.shape)
         pred_poses = tf.concat([pred_pose_ctp, pred_pose_ctn], axis=1)
-        return pred_poses
+        pred_poses = tf.expand_dims(pred_poses, axis=2)
+        # print("\t check concated pose shape: ", pred_poses.shape)
+
+        for i, f_i in enumerate(self.frame_idx[1:]):
+            angs_tf = pred_poses[:, i, :, :3]
+            trans_tf = pred_poses[:, i, :, 3:]
+            outputs[("cam_T_cam", 0, f_i)] = transformation_from_parameters(
+                angs_tf, trans_tf, invert=(f_i < 0))
+        self.pred_poses = pred_poses
+        return outputs
 
 
-    def process_batch(self, input_imgs, input_K_mulscale):
+    def process_batch(self, input_imgs, input_Ks):
         """The whoel pipeline implemented in minibatch (pairwise images)
         1. Use Depth enc-dec, to predict disparity map in mutli-scales
         2. Use Pose enc-dec, to predict poses
@@ -286,18 +397,17 @@ class Trainer:
             outputs[('disp', s)] = disp_raw
             # Collect depth at respective scale, but resized to source_scale
             disp_src_size = tf.image.resize(disp_raw, (self.height, self.width))
-            outputs[('depth', s)], _ = disp_to_depth(disp_src_size, self.min_depth, self.max_depth)
+            _, outputs[('depth', s)] = disp_to_depth(disp_src_size, self.min_depth, self.max_depth)
 
         # -------------
         # 2. Pose
         # -------------
-        pred_poses = self.predict_poses(input_imgs)
-        self.pred_poses = pred_poses
-
+        outputs.update(self.predict_poses(input_imgs, outputs))
         # -------------
         # 3. Generate Reprojection from 1, 2
         # -------------
-        self.generate_images_pred(input_imgs, input_K_mulscale, outputs, pred_poses)
+        # self.generate_images_pred(input_imgs, input_K_mulscale, outputs)
+        self.generate_images_pred(input_imgs, input_Ks, outputs)
 
         # -------------
         # 4. Compute Losses from 3.
@@ -312,44 +422,32 @@ class Trainer:
         - loss function 需要自己定义, 返回 total loss即可, 就可通过 GradientTape 跟踪
         - 然后 compile(loss=compute_loss)
         """
-        if not self.train_pose and not self.train_depth:
-            print("specify a model to train")
-            return
+        dataset_iter = iter(dataset)
+        for epoch in range(self.num_epochs):
+            for i in tqdm(range(self.data_loader.steps_per_epoch),
+                          desc='Epoch%d/%d'%(epoch+1, self.num_epochs)):
+                batch = dataset_iter.get_next()
+                trainable_weights_all = self.get_trainable_weights()
+                input_imgs, input_Ks = self.batch_processor.prepare_batch(batch[..., :3], batch[..., 3:])
+                # ----- Method-1, calculate in custom steps -----
+                grads = self.grad(input_imgs, input_Ks, trainable_weights_all, train_sum_writer)
+                self.optimizer.apply_gradients(zip(grads, trainable_weights_all))
 
-        self.epoch_cnt += 1
-        for i, batch in enumerate(dataset):
-            trainable_weights_all = []
-            for m_name, model in self.models.items():
-                if self.train_pose and "pose" in m_name:
-                    print("Training %s ..."%m_name)
-                    trainable_weights_all.extend(model.trainable_weights)
-                if self.train_depth and "depth" in m_name:
-                    print("Training %s ..."%m_name)
-                    trainable_weights_all.extend(model.trainable_weights)
+    def get_trainable_weights(self):
+        trainable_weights_all = []
+        for m_name, model in self.models.items():
+            if self.train_pose and "pose" in m_name:
+                # print("Training %s ..."%m_name)
+                trainable_weights_all.extend(model.trainable_weights)
+            if self.train_depth and "depth" in m_name:
+                # print("Training %s ..."%m_name)
+                trainable_weights_all.extend(model.trainable_weights)
+        return trainable_weights_all
 
-            input_imgs, input_K_mulscale = self.batch_processor.prepare_batch(batch[0], batch[1])
-            # ----- Method-1, calculate in custom steps -----
-            grads = self.grad(input_imgs, input_K_mulscale, trainable_weights_all, train_sum_writer)
-            self.optimizer.apply_gradients(zip(grads, trainable_weights_all))
-            # summary
-            # if train_sum_writer is not None:
-            #     with train_sum_writer.as_default():
-            #         self.collect_summary()
-                    # pass
-            # losses are reset in compute_losses()
-
-            print(" **** Batch %d****" % i)
-            # # ----- Method-2, call .minimize() directly -----
-            # # This method doesn't support partial model training, must set all models trainable
-            # outputs = self.process_batch(input_imgs, input_K_mulscale)
-            # loss_fn = lambda: self.compute_losses(input_imgs, outputs)
-            # var_list_fn = lambda: trainable_weights_all
-            # self.optimizer.minimize(loss_fn, var_list_fn)
-
-    @tf.function
-    def grad(self, input_imgs, input_K_mulscale, trainables, train_sum_writer=None):
+    # @tf.function    # turn off to use plt
+    def grad(self, input_imgs, input_Ks, trainables, train_sum_writer=None):
         with tf.GradientTape() as tape:
-            outputs = self.process_batch(input_imgs, input_K_mulscale)
+            outputs = self.process_batch(input_imgs, input_Ks)
             total_loss = self.compute_losses(input_imgs, outputs)
             grads = tape.gradient(total_loss, trainables)
 
@@ -358,16 +456,23 @@ class Trainer:
                 self.collect_summary(outputs)
         return grads
 
-    def train(self):
-        self.epoch_cnt = 0
-        dataset = build_dataset(self.num_epochs, self.batch_size)
-        curren_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        train_log_dir = "logs/gradient_tape/" + curren_time + "/train"
-        train_sum_writer = tf.summary.create_file_writer(train_log_dir)
+    def train(self, record=False):
 
-        for epoch in range(self.num_epochs):
-            self.run_epoch(dataset, train_sum_writer)
-            print("------ Epoch %d / %d ------" % (epoch, self.num_epochs))
+        if not self.train_pose and not self.train_depth:
+            print("specify a model to train")
+            return
+        self.epoch_cnt = 0
+
+        train_sum_writer = None
+        dataset = self.data_loader.build_dataset()
+        if record:
+            curren_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            train_log_dir = "logs/gradient_tape/" + curren_time + "/train"
+            train_sum_writer = tf.summary.create_file_writer(train_log_dir)
+
+        # for epoch in range(self.num_epochs):
+        print("Start training...")
+        self.run_epoch(dataset, train_sum_writer)
 
     def collect_summary(self, outputs):
         # total losses in multiple scales
@@ -381,10 +486,11 @@ class Trainer:
         # poses
         axis_names = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz']
         for i in range(len(axis_names)):
-            tf.summary.histogram(axis_names[i], self.pred_poses[:,:,i], step=self.epoch_cnt)
+
+            tf.summary.histogram(axis_names[i], self.pred_poses[:,:,:,i], step=self.epoch_cnt)
 
         # images
-        tf.summary.image('tgt_image', self.tgt_image_all)
+        tf.summary.image('tgt_image', self.tgt_image_all[0], step=self.epoch_cnt)
         for s in range(self.num_scales):
             tf.summary.image('scale{}_disparity_color_image'.format(s),
                              colorize(outputs['disp',s], cmap='plasma'), step=self.epoch_cnt)
@@ -397,7 +503,7 @@ class Trainer:
                                      self.proj_error_stack_all[s][:, :, :, i * 3:(i + 1) * 3], step=self.epoch_cnt)
             if self.auto_mask:
                 tf.summary.image('scale{}_automask_image'.format(s), self.pred_auto_masks[s], step=self.epoch_cnt)
-                # tf.compat.image('scale{}_automask2_image'.format(s), self.pred_auto_masks2[s])
+                # tf.compat.image('scale{}_automask2_image'.format(s), self.pred_auto_masks2[s], step=self.epoch_cnt)
 
     def compute_depth_losses(self, input_imgs, outputs, losses):
         """Compute depth metrics, to allow monitoring during training
@@ -433,5 +539,5 @@ class Trainer:
 
 
 if __name__ == '__main__':
-    trainer = Trainer(train_pose=True, train_depth=False)
-    trainer.train()
+    trainer = Trainer(train_pose=True, train_depth=True)
+    trainer.train(record=True)
