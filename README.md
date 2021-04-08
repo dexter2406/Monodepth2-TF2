@@ -21,7 +21,7 @@ I'm using a normal GTX1060-MaxQ GPU. The FPS for single-image depth estimation:
 
 It's currently just for personal use, but please feel free to contact me if you need anything. 
 
-Forgive me that I haven't used argument-parsing, so you can't run with one command. You need to change some path settings when you run the demo. However, no worries, it's just a simple code **merely for singlet depth estimation** (for now). That is, **no** PoseNet, training and evaluation yet. 
+Forgive me that I haven't used argument-parsing, so you can't run with one command. You need to change some path settings when you run the demo. However, no worries, it's just a simple code **merely for singlet depth estimation** (for now). The Pose networks and training pipeline is still in progress, needs double check. Though bug-free, I can't give any guarantees for total correctness.
 Anyways, Take one minute you will know what's going on in there.
 
 `simple_run.py`: as the name suggests, it's a simple run, important functions are all there, no encapsulement.
