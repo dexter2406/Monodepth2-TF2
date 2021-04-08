@@ -24,9 +24,12 @@ class DataProcessor(object):
 
     def prepare_batch(self, tgt_batch, src_batch):
         """Apply augmentation
-        input_imgs: raw data, intrinsics
-        outputs: raw and augmented data, stored in dictionary
+        tgt_batch: ndarray
+            - [<Batch>, 192, 640, 3]
+        src_batch: ndarray:
+            - [<Batch>, 192, 640, 6]
 
+        Outputs: raw and augmented data, stored in dictionary
         Dictionary keys:
         ("color", <frame_id>, <scale>)          for raw colour images,
         ("color_aug", <frame_id>, <scale>)      for augmented colour images,
@@ -38,31 +41,32 @@ class DataProcessor(object):
         """
         do_color_aug = self.is_train and np.random.random() > 0.5
         do_flip = False
-        print("\t check input batch: ", tgt_batch.shape," VS. ", src_batch.shape)
+        # print("\t check input batch: ", tgt_batch.shape," and ", src_batch.shape)
         self.batch_size = tgt_batch.shape[0]
 
-        input_imgs, input_K_mulscale = {}, None
+        input_imgs, input_Ks = {}, {}
         input_imgs[('color', self.frame_idx[0], -1)] = tgt_batch
         input_imgs[('color', self.frame_idx[1], -1)] = src_batch[..., :3]
         input_imgs[('color', self.frame_idx[2], -1)] = src_batch[..., 3:]
 
-        input_imgs, input_K_mulscale = self.preprocess(input_imgs, input_K_mulscale)
+        input_imgs, input_Ks = self.preprocess(input_imgs, input_Ks)
 
-        return input_imgs, input_K_mulscale
+        return input_imgs, input_Ks
 
     def delete_raw_images(self, input_imgs, scale_to_del=-1):
         for idx in self.frame_idx:
             del input_imgs[('color', self.frame_idx[idx], scale_to_del)]
 
-    def preprocess(self, input_imgs, input_K_multiscale):
+    def preprocess(self, input_imgs, input_Ks):
         """Make pyramids and augmentations
         - pyramid: use the raw (scale=-=1) to produce scale==[0:4] images
         - augment: correspond to the pyramid source
         """
-        print("\t preprocessing batch...")
+        # print("\t preprocessing batch...")
         intrinsics_mscale = []
         for k in list(input_imgs):
             img_type, f_i, scale = k    # key components
+            assert img_type == 'color'
             for scale in range(self.num_scales):
                 src_image = input_imgs[(img_type, f_i, scale - 1)]
                 resized_image = tf.image.resize(src_image,
@@ -72,17 +76,20 @@ class DataProcessor(object):
                 input_imgs[(img_type + '_aug', f_i, scale)] = self.color_aug(resized_image)
 
         for scale in range(self.num_scales):
-            K = tf.expand_dims(self.K, 0)
-            fx = K[:, 0, 0] / (2 ** scale)
-            fy = K[:, 1, 1] / (2 ** scale)
-            cx = K[:, 0, 2] / (2 ** scale)
-            cy = K[:, 1, 2] / (2 ** scale)
-            intrinsics_mscale.append(self.make_intrinsics_matrix(fx, fy, cx, cy))
-            input_K_multiscale = tf.stack(intrinsics_mscale, axis=1)
-            input_K_multiscale = tf.concat([input_K_multiscale]*self.batch_size, axis=0)
-            assert input_K_multiscale.shape[0] == self.batch_size
+            K = self.K.copy()
+            K[0, :] *= self.width // (2 ** scale)
+            K[1, :] *= self.height // (2 ** scale)
 
-        return input_imgs, input_K_multiscale
+            inv_K = np.linalg.pinv(K)
+
+            K = tf.reshape(tf.tile(K, [self.batch_size,1]), (self.batch_size, 4, 4))
+            inv_K = tf.reshape(tf.tile(inv_K, [self.batch_size,1]), (self.batch_size, 4, 4))
+            assert K.shape[-1] == 4
+
+            input_Ks[("K", scale)] = tf.constant(K)
+            input_Ks[("inv_K", scale)] = tf.constant(inv_K)
+
+        return input_imgs, input_Ks
 
     def make_intrinsics_matrix(self, fx, fy, cx, cy):
         # Assumes batch input
