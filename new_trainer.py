@@ -2,24 +2,27 @@ import tensorflow as tf
 from models.depth_decoder_creater import DepthDecoder_full
 from models.encoder_creater import ResNet18_new
 from models.posenet_decoder_creator import PoseDecoder
+
 from utils import process_enc_outputs, disp_to_depth, concat_pose_params
 from src.trainer_helper import *
 from src.dataset_loader import DataLoader
-import numpy as np
 from src.DataPprocessor import DataProcessor
+
+import numpy as np
 import datetime
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import pickle
 
-
-config = tf.compat.v1.ConfigProto()
-config.gpu_options.allow_growth = True
+gpus = tf.config.experimental.list_physical_devices('GPU')
+for gpu in gpus:
+  tf.config.experimental.set_memory_growth(gpu, True)
 
 
 class Trainer:
-    def __init__(self, options=None, train_pose=False, train_depth=False):
+    def __init__(self, options=None, train_pose=False, train_depth=False, debug_mode=False):
         self.opt = options
+        self.debug_mode = debug_mode
         self.models = {}
         self.num_scales = 4
         self.src_scale = 0
@@ -35,7 +38,7 @@ class Trainer:
         self.max_depth = 100
 
         self.num_epochs = 2
-        self.batch_size = 4
+        self.batch_size = 8
         self.data_loader = DataLoader(self.num_epochs, self.batch_size)
         self.shape_scale0 = [self.batch_size, self.height, self.width, 3]
 
@@ -61,6 +64,8 @@ class Trainer:
         self.train_pose = train_pose
         self.train_depth = train_depth
 
+        self.back_project_dict = {}
+        self.project_3d_dict ={}
         self.init_app()
 
     def init_app(self):
@@ -87,6 +92,9 @@ class Trainer:
 
         build_models(self.models, show_summary=False, check_outputs=False)
 
+        # for scale in range(self.num_scales):
+        #     self.back_project_dict[scale] = BackProjDepth(self.shape_scale0, scale)
+        #     self.project_3d_dict[scale] = Project3D(self.shape_scale0, scale)
     # ----- For process_batch() -----
     def get_smooth_loss(self, disp, img):
         norm_disp = disp / (tf.reduce_mean(disp, [1, 2], keepdims=True) + 1e-7)
@@ -108,7 +116,6 @@ class Trainer:
         l1_loss = tf.reduce_mean(tf.math.abs(proj_image - tgt_image), axis=3, keepdims=True)
         ssim_loss = tf.reduce_mean(SSIM(proj_image, tgt_image), axis=3, keepdims=True)
         loss = self.ssim_ratio * ssim_loss + (1 - self.ssim_ratio) * l1_loss
-
         return loss
 
     def reset_loss(self):
@@ -193,7 +200,8 @@ class Trainer:
             disp_s, tgt_image_s = outputs[('disp', scale)], input_imgs['color', 0, scale]
             smooth_loss = self.get_smooth_loss(disp_s, tgt_image_s)
             self.smooth_losses += smooth_loss
-            smooth_loss /= (2 ** scale)
+            smooth_loss /= 2 ** scale
+            # smooth_loss.assign(smooth_loss / (2 ** scale))
 
             # ------------------
             # 5. Overall Loss, accumulate scale-wise
@@ -280,7 +288,7 @@ class Trainer:
     #         del export_list
     #     return outputs
 
-    def generate_images_pred(self, input_imgs, input_Ks, outputs, debug=False):
+    def generate_images_pred(self, input_imgs, input_Ks, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
         Generated images are saved into the `outputs` dictionary.
         """
@@ -294,9 +302,7 @@ class Trainer:
             # print("disp_tf shape in scale: ", disp_tf)
 
             disp = tf.image.resize(disp_tf, (self.height, self.width))
-
             _, depth = disp_to_depth(disp, self.min_depth, self.max_depth)
-
             outputs[("depth", 0, scale)] = depth
 
             for i, f_i in enumerate(self.frame_idx[1:]):
@@ -306,6 +312,9 @@ class Trainer:
                                              self.shape_scale0, source_scale)
                 pix_coords = project_3d(cam_points, input_Ks[("K", source_scale)], T,
                                         self.shape_scale0, source_scale)
+                # print("scale: ", scale)
+                # cam_points = self.back_project_dict[source_scale](depth, input_Ks[("inv_K", source_scale)])
+                # pix_coords = self.project_3d_dict[source_scale](cam_points, input_Ks[("K", source_scale)], T)
                 outputs[("sample", f_i, scale)] = pix_coords
 
                 input_tf = input_imgs[("color", f_i, source_scale)]
@@ -313,7 +322,7 @@ class Trainer:
 
                 outputs[("color", f_i, scale)] = res
 
-        if debug:
+        if self.debug_mode:
             for i in range(self.batch_size):
                 fig = plt.figure(figsize=(3, 2))
                 fig.add_subplot(3, 2, 1)
@@ -355,6 +364,7 @@ class Trainer:
         pose_ctn_raw = self.models['pose_enc'](
             tf.concat([tgt_image_aug, src_image_post_aug], axis=3)
         )
+
         # Decoder
         # pose_ctp = [pose_ctp_raw[-1]]
         # pose_ctn = [pose_ctn_raw[-1]]
@@ -364,6 +374,7 @@ class Trainer:
         # Collect angles and translations
         pred_pose_ctp = concat_pose_params(pred_pose_ctp_raw, curr2prev=True, curr2next=False)
         pred_pose_ctn = concat_pose_params(pred_pose_ctn_raw, curr2prev=True, curr2next=False)
+
         pred_poses = tf.concat([pred_pose_ctp, pred_pose_ctn], axis=1)
         pred_poses = tf.expand_dims(pred_poses, axis=2)
         # print("\t check concated pose shape: ", pred_poses.shape)
@@ -430,6 +441,7 @@ class Trainer:
                 trainable_weights_all = self.get_trainable_weights()
                 input_imgs, input_Ks = self.batch_processor.prepare_batch(batch[..., :3], batch[..., 3:])
                 # ----- Method-1, calculate in custom steps -----
+                # grads = self.grad(input_imgs, input_Ks, trainable_weights_all, train_sum_writer)
                 grads = self.grad(input_imgs, input_Ks, trainable_weights_all, train_sum_writer)
                 self.optimizer.apply_gradients(zip(grads, trainable_weights_all))
 
@@ -444,11 +456,12 @@ class Trainer:
                 trainable_weights_all.extend(model.trainable_weights)
         return trainable_weights_all
 
-    # @tf.function    # turn off to use plt
+    @tf.function    # turn off to use plt
     def grad(self, input_imgs, input_Ks, trainables, train_sum_writer=None):
         with tf.GradientTape() as tape:
             outputs = self.process_batch(input_imgs, input_Ks)
             total_loss = self.compute_losses(input_imgs, outputs)
+
             grads = tape.gradient(total_loss, trainables)
 
         if train_sum_writer is not None:
@@ -539,5 +552,5 @@ class Trainer:
 
 
 if __name__ == '__main__':
-    trainer = Trainer(train_pose=True, train_depth=True)
-    trainer.train(record=True)
+    trainer = Trainer(train_pose=True, train_depth=True, debug_mode=False)
+    trainer.train(record=False)
