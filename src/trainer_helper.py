@@ -56,13 +56,14 @@ def SSIM(x, y):
     SSIM_d = (mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x + sigma_y + C2)
 
     SSIM = SSIM_n / SSIM_d
-
-    return tf.clip_by_value((1 - SSIM) / 2, 0, 1)
+    res = tf.clip_by_value((1 - SSIM) / 2, 0, 1)
+    return res
 
 
 
 def compute_depth_errors(gt, pred):
     """Computation of error metrics between predicted and ground truth depths
+    Not in use for now
     """
     thresh = np.max((gt / pred), (pred / gt))
     a1 = (thresh < 1.25     ).float().mean()
@@ -109,7 +110,8 @@ def normalize_image(x):
 def project_3d(points, K, T, shape, scale):
     """Layer which projects 3D points into a camera with intrinsics K and at position T
     """
-    K = tf.cast(K, tf.float32)
+    # K = tf.cast(K, tf.float32)
+
     batch_size, height, width, _ = shape
     height, width = height // (2 ** scale), width // (2 ** scale)
     eps = 1e-7
@@ -120,15 +122,83 @@ def project_3d(points, K, T, shape, scale):
 
     pix_coords = cam_points[:, :2, :] / (tf.expand_dims(cam_points[:, 2, :], axis=1) + eps)
     pix_coords = tf.reshape(pix_coords, (batch_size, 2, height, width))
+    pix_coords = tf.transpose(pix_coords, [0, 2, 3, 1])
 
-    pix_coords = tf.transpose(pix_coords, [0, 2, 3, 1]).numpy()
-    pix_coords[..., 0] /= width - 1
-    pix_coords[..., 1] /= height - 1
+    # pix_coords = pix_coords.numpy()     # Tensor can't be assigned
+    pix_coords_0 = pix_coords[..., 0]
+    pix_coords_1 = pix_coords[..., 1]
+    tensor_w = tf.ones_like(pix_coords_0) * (width - 1)
+    tensor_h = tf.ones_like(tensor_w) * (height - 1)
+    pix_coords_0 = tf.expand_dims(pix_coords_0 / tensor_w, axis=-1)
+    pix_coords_1 = tf.expand_dims(pix_coords_1 / tensor_h, axis=-1)
+
+    pix_coords = tf.concat([pix_coords_0, pix_coords_1], axis=-1)
+    # pix_coords[..., 0] /= width - 1
+    # pix_coords[..., 1] /= height - 1
+    # pix_coords = tf.convert_to_tensor(pix_coords, dtype=tf.float32)
     pix_coords = (pix_coords - 0.5) * 2
-    pix_coords = tf.constant(pix_coords)
-
-    # pix_coords = torch.from_numpy(pix_coords.numpy()).to(torch.device('cuda'))
     return pix_coords
+
+
+class Project3D(tf.keras.Model):
+    def __init__(self, shape, scale):
+        super(Project3D, self).__init__()
+        self.batch_size, height, width, _ = shape
+        self.height, self.width = height // (2 ** scale), width // (2 ** scale)
+        self.eps = 1e-7
+
+    def call(self, points, K, T):
+        P = tf.matmul(K, T)[:, :3, :]
+
+        cam_points = tf.matmul(P, points)
+
+        pix_coords = cam_points[:, :2, :] / (tf.expand_dims(cam_points[:, 2, :], axis=1) + self.eps)
+        pix_coords = tf.reshape(pix_coords, (self.batch_size, 2, self.height, self.width))
+        pix_coords = tf.transpose(pix_coords, [0, 2, 3, 1])
+
+        # pix_coords = pix_coords.numpy()     # Tensor can't be assigned
+        pix_coords_0 = pix_coords[..., 0]
+        pix_coords_1 = pix_coords[..., 1]
+        tensor_w = tf.ones_like(pix_coords_0) * (self.width - 1)
+        tensor_h = tf.ones_like(tensor_w) * (self.height - 1)
+        pix_coords_0 = tf.expand_dims(pix_coords_0 / tensor_w, axis=-1)
+        pix_coords_1 = tf.expand_dims(pix_coords_1 / tensor_h, axis=-1)
+
+        pix_coords = tf.concat([pix_coords_0, pix_coords_1], axis=-1)
+        # pix_coords[..., 0] /= self.width - 1
+        # pix_coords[..., 1] /= self.height - 1
+        # pix_coords = tf.convert_to_tensor(pix_coords, dtype=tf.float32)
+        pix_coords = (pix_coords - 0.5) * 2
+        return pix_coords
+
+
+class BackProjDepth(tf.keras.Model):
+    def __init__(self, shape, scale):
+        super(BackProjDepth, self).__init__()
+        self.batch_size, height, width, _ = shape
+        height, width = height // (2 ** scale), width // (2 ** scale)
+
+        meshgrid = tf.meshgrid(range(width), range(height), indexing='xy')
+        id_coords = tf.stack(meshgrid, axis=0)
+        ones = tf.ones((self.batch_size, 1, height * width), dtype=tf.int32)
+
+        pix_coords = tf.expand_dims(
+            tf.stack([tf.reshape(id_coords[0], [-1]),
+                      tf.reshape(id_coords[1], [-1])], 0), 0)
+        # - tile/repeat
+        multiples = tf.constant([self.batch_size, 1, 1])
+        pix_coords = tf.tile(pix_coords, multiples)
+
+        pix_coords = tf.concat([pix_coords, ones], 1)
+        self.pix_coords = tf.cast(pix_coords, tf.float32)
+
+        self.ones = tf.cast(ones, tf.float32)
+
+    def call(self, depth, inv_K):
+        cam_points = tf.matmul(inv_K[:, :3, :3], self.pix_coords)
+        cam_points = tf.reshape(depth, (self.batch_size, 1, -1)) * cam_points
+        cam_points = tf.concat([cam_points, self.ones], 1)
+        return cam_points
 
 
 def back_proj_depth(depth, inv_K, shape, scale):
@@ -138,15 +208,16 @@ def back_proj_depth(depth, inv_K, shape, scale):
 
     batch_size, height, width, _ = shape
     height, width = height // (2**scale), width // (2**scale)
-    # print("depth, inv_K, height, width: ", depth.shape, "\t", inv_K.shape, "\t", height, " ", width)
 
-    meshgrid = np.meshgrid(range(width), range(height), indexing='xy')
+    meshgrid = tf.meshgrid(range(width), range(height), indexing='xy')
     id_coords = tf.stack(meshgrid, axis=0)
+
     ones = tf.ones((batch_size, 1, height * width), dtype=tf.int32)
 
+    # tmp = tf.reshape(id_coords[0], -1)
     pix_coords = tf.expand_dims(
-        tf.stack([tf.reshape(id_coords[0], -1),
-                  tf.reshape(id_coords[1], -1)], 0), 0)
+        tf.stack([tf.reshape(id_coords[0], [-1]),
+                  tf.reshape(id_coords[1], [-1])], 0), 0)
 
     # - tile/repeat
     multiples = tf.constant([batch_size, 1, 1])
@@ -154,11 +225,16 @@ def back_proj_depth(depth, inv_K, shape, scale):
 
     pix_coords = tf.concat([pix_coords, ones], 1)
     pix_coords = tf.cast(pix_coords, tf.float32)
+    # pix_coords = tf.Variable(pix_coords)
+
     ones = tf.cast(ones, tf.float32)
+    # ones = tf.Variable(ones)
+
     cam_points = tf.matmul(inv_K[:,:3, :3], pix_coords)
+    # print(tf.reshape(depth, (batch_size, 1, -1)).shape, " vs. ", cam_points.shape)
     cam_points = tf.reshape(depth, (batch_size, 1, -1)) * cam_points
     cam_points = tf.concat([cam_points, ones], 1)
-
+    # cam_points = tf.Variable(cam_points)
     return cam_points
 
 
@@ -202,8 +278,8 @@ def bilinear_sampler(img, coords):
         b = tf.tile(batch_idx, (1, height, width))
 
         indices = tf.stack([b, y, x], 3)
-
-        return tf.gather_nd(img, indices)
+        res = tf.gather_nd(img, indices)
+        return res
 
     H = tf.shape(img)[1]
     W = tf.shape(img)[2]
@@ -257,7 +333,7 @@ def bilinear_sampler(img, coords):
 
     # compute output
     out = tf.add_n([wa * Ia, wb * Ib, wc * Ic, wd * Id])
-
+    # out = tf.Variable(out)
     return out
 
 
@@ -278,23 +354,34 @@ def transformation_from_parameters(axisangle, translation, invert=False):
         M = tf.matmul(R, T)
     else:
         M = tf.matmul(T, R)
-
     return M
 
 
-def get_translation_matrix(translation_vector):
+def get_translation_matrix(trans_vec):
     """Convert a translation vector into a 4x4 transformation matrix
     """
-    T = np.zeros((translation_vector.shape[0], 4, 4))
-    t = np.reshape(translation_vector.numpy(), (-1, 3, 1))
+    # T = np.zeros((trans_vec.shape[0], 4, 4)).astype(np.float32)
+    # t = np.reshape(trans_vec.numpy(), (-1, 3, 1)).astype(np.float32)
+    #
+    # T[:, 0, 0] = 1
+    # T[:, 1, 1] = 1
+    # T[:, 2, 2] = 1
+    # T[:, 3, 3] = 1
+    # T[:, :3, 3, None] = t
 
-    T[:, 0, 0] = 1
-    T[:, 1, 1] = 1
-    T[:, 2, 2] = 1
-    T[:, 3, 3] = 1
-    T[:, :3, 3, None] = t
+    batch_size = trans_vec.shape[0]
+    one = tf.ones([batch_size, 1, 1], dtype=tf.float32)
+    zero = tf.zeros([batch_size, 1, 1], dtype=tf.float32)
+    T = tf.concat([
+        one, zero, zero, trans_vec[:, :, :1],
+        zero, one, zero, trans_vec[:, :, 1:2],
+        zero, zero, one, trans_vec[:, :, 2:3],
+        zero, zero, zero, one
 
-    return tf.constant(T)
+    ], axis=2)
+    T = tf.reshape(T, [batch_size, 4, 4])
+    # T = tf.convert_to_tensor(T, dtype=tf.float32)
+    return T
 
 
 def rot_from_axisangle(vec):
@@ -323,19 +410,41 @@ def rot_from_axisangle(vec):
     yzC = y * zC
     zxC = z * xC
 
-    rot = np.zeros((vec.shape[0], 4, 4))
-    rot[:, 0, 0] = np.squeeze(x * xC + ca)
-    rot[:, 0, 1] = np.squeeze(xyC - zs)
-    rot[:, 0, 2] = np.squeeze(zxC + ys)
-    rot[:, 1, 0] = np.squeeze(xyC + zs)
-    rot[:, 1, 1] = np.squeeze(y * yC + ca)
-    rot[:, 1, 2] = np.squeeze(yzC - xs)
-    rot[:, 2, 0] = np.squeeze(zxC - ys)
-    rot[:, 2, 1] = np.squeeze(yzC + xs)
-    rot[:, 2, 2] = np.squeeze(z * zC + ca)
-    rot[:, 3, 3] = 1
+    # Pytorch impl
+    # rot = np.zeros((vec.shape[0], 4, 4))
+    # rot[:, 0, 0] = np.squeeze(x * xC + ca)
+    # rot[:, 0, 1] = np.squeeze(xyC - zs)
+    # rot[:, 0, 2] = np.squeeze(zxC + ys)
+    # rot[:, 1, 0] = np.squeeze(xyC + zs)
+    # rot[:, 1, 1] = np.squeeze(y * yC + ca)
+    # rot[:, 1, 2] = np.squeeze(yzC - xs)
+    # rot[:, 2, 0] = np.squeeze(zxC - ys)
+    # rot[:, 2, 1] = np.squeeze(yzC + xs)
+    # rot[:, 2, 2] = np.squeeze(z * zC + ca)
+    # rot[:, 3, 3] = 1
+    # rot = tf.convert_to_tensor(rot, dtype=tf.float32)
 
-    return tf.constant(rot)
+    # TF impl
+    one = tf.ones_like(zxC, dtype=tf.float32)
+    zero = tf.zeros_like(zxC, dtype=tf.float32)
+    rot = tf.concat([
+        x * xC + ca,
+        xyC - zs,
+        zxC + ys,
+        zero,
+        xyC + zs,
+        y * yC + ca,
+        yzC - xs,
+        zero,
+        zxC - ys,
+        yzC + xs,
+        z * zC + ca,
+        zero, zero, zero, zero, one
+    ], axis=2)
+
+    rot = tf.reshape(rot, [-1, 4, 4])
+    return rot
+
 
 
 """ -------------- Not In Use ---------------"""
