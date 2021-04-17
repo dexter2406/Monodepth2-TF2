@@ -3,9 +3,10 @@ from models.depth_decoder_creater import DepthDecoder_full
 from models.encoder_creater import ResNet18_new
 from models.posenet_decoder_creator import PoseDecoder
 
-from utils import process_enc_outputs, disp_to_depth, concat_pose_params
+from utils import disp_to_depth, concat_pose_params
 from src.trainer_helper import *
-from src.dataset_loader import DataLoader
+# from src.dataset_loader import DataLoader
+from src.dataset_loader_kitti_raw import DataLoader_KITTI_Raw
 from src.DataPprocessor import DataProcessor
 
 import numpy as np
@@ -20,8 +21,9 @@ for gpu in gpus:
 
 
 class Trainer:
-    def __init__(self, options=None, train_pose=False, train_depth=False, debug_mode=False):
+    def __init__(self, options=None, from_scratch=False, train_pose=False, train_depth=False, debug_mode=False):
         self.opt = options
+        self.from_scratch = from_scratch
         self.debug_mode = debug_mode
         self.models = {}
         self.num_scales = 4
@@ -37,15 +39,16 @@ class Trainer:
         self.min_depth = 0.1
         self.max_depth = 100
 
-        self.num_epochs = 2
-        self.batch_size = 8
-        self.data_loader = DataLoader(self.num_epochs, self.batch_size)
+        self.num_epochs = 10
+        self.batch_size = 6
+        # self.data_loader = DataLoader(self.num_epochs, self.batch_size)
+        self.data_loader = DataLoader_KITTI_Raw(self.num_epochs, self.batch_size,
+                                                dataset_for='train', split_name='eigen_zhou')
         self.shape_scale0 = [self.batch_size, self.height, self.width, 3]
 
         self.tgt_image = None
         self.tgt_image_net = None
         self.tgt_image_aug = None
-
         self.avg_reprojection = False
 
         self.tgt_image_all = []
@@ -57,15 +60,23 @@ class Trainer:
         self.smooth_losses = 0.
         self.total_loss = 0.
         self.losses = {}
+        self.summary_freq = 200
 
         self.batch_processor = DataProcessor()
-        lr = 1e-3   # todo: learning rate scheduler
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+        # exponential_decay = tf.keras.optimizers.schedules.ExponentialDecay(
+        #     initial_learning_rate=1e-3, decay_steps=1000, decay_rate=0.96)
+        self.epoch_cnt = 0
+        boundaries = [15, 30]
+        values = [1e-4, 1e-5, 1e-6]
+        self.lr_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
+        learning_rate = self.lr_fn(self.epoch_cnt)
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
         self.train_pose = train_pose
         self.train_depth = train_depth
+        self.train_sum_writer = None
 
         self.back_project_dict = {}
-        self.project_3d_dict ={}
+        self.project_3d_dict = {}
         self.init_app()
 
     def init_app(self):
@@ -75,26 +86,33 @@ class Trainer:
         self.models['pose_enc'] = ResNet18_new([2, 2, 2, 2]), channel_num=6
         self.models['pose_dec'] = PoseDecoder(num_ch_enc=[64, 64, 128, 256, 512])
         """
+
         self.models['depth_enc'] = ResNet18_new([2, 2, 2, 2])
-        self.models['depth_enc'].load_weights("weights/depth_enc/")
-
         self.models['depth_dec'] = DepthDecoder_full()
-        self.models['depth_dec'].load_weights("weights/depth_dec/")
-
         self.models['pose_enc'] = ResNet18_new([2, 2, 2, 2])
-        self.models['pose_enc'].load_weights("weights/pose_enc/")
-
         shapes = [(1, 96, 320, 64), (1, 48, 160, 64), (1, 24, 80, 128), (1, 12, 40, 256), (1, 6, 20, 512)]
         inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
         self.models['pose_dec'] = PoseDecoder(num_ch_enc=[64, 64, 128, 256, 512])
         _ = self.models['pose_dec'].predict(inputs)
-        self.models['pose_dec'].load_weights("weights/pose_dec/")
 
         build_models(self.models, show_summary=False, check_outputs=False)
 
+        if not self.from_scratch:
+            print("loading trained models...")
+            self.models['depth_enc'].load_weights(r"D:\MA\Recources\monodepth2-torch\tf_models\depth_e_test0.h5",
+                                                  by_name=True, skip_mismatch=False)
+            self.models['depth_dec'].load_weights(r"D:\MA\Recources\monodepth2-torch\tf_models\depth_d_test0.h5",
+                                                  by_name=True, skip_mismatch=False)
+            self.models['pose_enc'].load_weights(r"D:\MA\Recources\monodepth2-torch\tf_models\pose_e_test0.h5",
+                                                  by_name=True, skip_mismatch=False)
+            self.models['pose_dec'].load_weights(r"D:\MA\Recources\monodepth2-torch\tf_models\pose_e_test0_flip.h5",
+                                                  by_name=True, skip_mismatch=False)
+
         # for scale in range(self.num_scales):
-        #     self.back_project_dict[scale] = BackProjDepth(self.shape_scale0, scale)
-        #     self.project_3d_dict[scale] = Project3D(self.shape_scale0, scale)
+        source_scale = 0
+        self.back_project_dict[source_scale] = BackProjDepth(self.shape_scale0, source_scale)
+        self.project_3d_dict[source_scale] = Project3D(self.shape_scale0, source_scale)
+
     # ----- For process_batch() -----
     def get_smooth_loss(self, disp, img):
         norm_disp = disp / (tf.reduce_mean(disp, [1, 2], keepdims=True) + 1e-7)
@@ -118,14 +136,17 @@ class Trainer:
         loss = self.ssim_ratio * ssim_loss + (1 - self.ssim_ratio) * l1_loss
         return loss
 
-    def reset_loss(self):
+    def reset_losses(self):
         self.smooth_losses = 0.
         self.pixel_losses = 0.
         self.total_loss = 0.
+        self.proj_image_stack_all = []
+        self.proj_error_stack_all = []
+        self.tgt_image_all = []
 
     def compute_losses(self, input_imgs, outputs):
         tgt_image = input_imgs[('color', 0, 0)]
-        self.reset_loss()
+        self.reset_losses()
 
         for scale in range(self.num_scales):
             # -------------------
@@ -155,7 +176,7 @@ class Trainer:
             # -------------------
             # 2. Optional: auto-masking
             # -------------------
-            combined = reproject_losses     # incase no auto-masking
+            combined = reproject_losses     # in case no auto-masking
             if self.auto_mask:
                 pred_auto_masks = []
                 identity_reprojection_losses = []
@@ -176,50 +197,55 @@ class Trainer:
                 identity_reprojection_loss += (tf.random.normal(identity_reprojection_loss.shape) * 1e-5)
                 combined = tf.concat([identity_reprojection_loss, reproject_loss], axis=3)
 
-                if combined.shape[1] == 1:
-                    to_optimise = combined
-                else:
-                    to_optimise, idxs = tf.math.reduce_min(combined, dim=3)
-                    if self.auto_mask:
-                        outputs["identity_selection/{}".format(scale)] = (
-                                idxs > identity_reprojection_loss.shape[1] - 1).float()
+                # if self.auto_mask:
+                #     outputs["identity_selection/{}".format(scale)] = (
+                #             idxs > identity_reprojection_loss.shape[3] - 1)   # idx??
 
+                # todo: check auto-mask
                 pred_auto_masks.append(
                     tf.expand_dims(
                         tf.cast(tf.math.argmin(combined, axis=3) > 1, tf.float32) * 255, -1)
                 )
+
             # -------------------
             # 3. Final reprojectioni loss -> as pixel loss
             # -------------------
-            reprojection_loss = tf.reduce_mean(tf.reduce_min(combined, axis=3))
+            assert combined.shape[-1] != 1
+            to_optimise = tf.reduce_min(combined, axis=3)
+            reprojection_loss = tf.reduce_mean(to_optimise)
             self.pixel_losses += reprojection_loss
 
             # -------------------
             # 4. Smoothness loss: Gradient Loss based on image pixels
             # -------------------
+
             disp_s, tgt_image_s = outputs[('disp', scale)], input_imgs['color', 0, scale]
-            smooth_loss = self.get_smooth_loss(disp_s, tgt_image_s)
-            self.smooth_losses += smooth_loss
-            smooth_loss /= 2 ** scale
-            # smooth_loss.assign(smooth_loss / (2 ** scale))
+            smooth_loss_raw = self.get_smooth_loss(disp_s, tgt_image_s)
+            smooth_loss = self.smoothness_ratio * smooth_loss_raw / 2 ** scale
+            self.smooth_losses += smooth_loss   # for summary
 
             # ------------------
             # 5. Overall Loss, accumulate scale-wise
             # ------------------
-            scale_total_loss = reprojection_loss + self.smoothness_ratio * smooth_loss
-            self.total_loss += scale_total_loss
-            self.losses['loss/%d'%scale] = scale_total_loss
+            total_loss_tmp = reprojection_loss + smooth_loss
+            self.total_loss += total_loss_tmp
+            self.losses['loss/%d'%scale] = total_loss_tmp
 
             # ------------------
             # Optional: Collect results for summary
             # ------------------
-            self.proj_image_stack_all.append(proj_image_stack)
-            self.proj_error_stack_all.append(proj_error_stack)
-            if scale == 0:
-                # src_image_stack_aug = tf.concat([input_imgs[('color_aug', -1, 0)],
-                #                                  input_imgs[('color_aug', -1, 0)]], axis=3)
-                # self.src_image_stack_all.append(src_image_stack_aug)
-                self.tgt_image_all.append(tgt_image)
+            if self.global_step % self.data_loader.steps_per_epoch == 0:
+                self.proj_image_stack_all.append(proj_image_stack)
+                self.proj_error_stack_all.append(proj_error_stack)
+                if scale == 0:
+                    src_image_stack_aug = tf.concat([input_imgs[('color_aug', -1, 0)],
+                                                     input_imgs[('color_aug', -1, 0)]], axis=3)
+                    self.src_image_stack_all.append(src_image_stack_aug)
+                    self.tgt_image_all.append(tgt_image)
+
+        if self.debug_mode:
+            colormapped_normal = colorize(outputs[('disp', 0)], cmap='plasma')
+            plt.imshow(colormapped_normal.numpy()[0]), plt.show()
 
         self.pixel_losses /= self.num_scales
         self.smooth_losses /= self.num_scales
@@ -227,97 +253,54 @@ class Trainer:
         self.total_loss /= self.num_scales
         self.losses['loss/total'] = self.total_loss
         return self.total_loss
-    #
-    # def generate_images_pred_orig(self, input_imgs, input_K_mulscale, outputs, pred_poses):
-    #     """Generate warped/reprojected images for a minibatch
-    #     produced images are saved in 'outputs' dir
-    #     """
-    #     print("generate_images_pred...")
-    #     for scale in range(self.num_scales):
-    #         for i, f_i in enumerate(self.frame_idx[1:]):
-    #             # Calculate reprojected image.
-    #             # When f_i==-1, since pose is current->previous, inverse order,
-    #             # so intrinsics K also needs to be inverted before warping
-    #             do_invert = True if f_i == -1 else False
-    #             print("\tinput_K_mulscale: ", input_K_mulscale.shape)
-    #             curr_proj_image = projective_inverse_warp(input_imgs[('color', f_i, self.src_scale)],
-    #                                                       tf.squeeze(outputs[('depth', scale)], axis=3),
-    #                                                       pred_poses[:, i, :],
-    #                                                       intrinsics=input_K_mulscale[:, self.src_scale, :, :],
-    #                                                       invert=do_invert)
-    #             print("\tprojected image shape :", curr_proj_image.shape, " at scale %d"%scale, " f_id %d"%f_i)
-    #
-    #             outputs[('color', f_i, scale)] = curr_proj_image
-    #
-    #             # not in use for now
-    #             if self.auto_mask:
-    #                 outputs[("color_identity", f_i, scale)] = input_imgs[("color", f_i, self.src_scale)]
-    #
-    #     # -----------------
-    #     # Visualize for debugging
-    #     # -----------------
-    #     fig = plt.figure(figsize=(3, 2))
-    #     fig.add_subplot(3, 2, 1)
-    #     plt.imshow(input_imgs[('color', 0, 0)][0])
-    #     fig.add_subplot(3, 2, 3)
-    #     plt.imshow(input_imgs[('color', -1, 0)][0])
-    #     fig.add_subplot(3, 2, 4)
-    #     plt.imshow(outputs[('color', -1, 0)][0])
-    #     fig.add_subplot(3, 2, 5)
-    #     plt.imshow(input_imgs[('color', 1, 0)][0])
-    #     fig.add_subplot(3, 2, 6)
-    #     plt.imshow(outputs[('color', 1, 0)][0])
-    #     plt.show()
-    #     del fig
-    #     yes = input("store result?: ")
-    #     if yes=='y':
-    #         print("saving the results...")
-    #         inputs_tf = {}
-    #         outputs_tf = {}
-    #         for k, v in input_imgs.items():
-    #             inputs_tf[k] = v.numpy()
-    #         for k, v in outputs.items():
-    #             outputs_tf[k] = v.numpy()
-    #         export_list = [inputs_tf, outputs_tf]
-    #         with open("inverse_warp.pkl", 'wb') as df:
-    #             pickle.dump(export_list, df)
-    #         with open("pose_res.ple", 'wb') as df:
-    #             poses = tf.expand_dims(pred_poses, 2)
-    #             pickle.dump(poses, df)
-    #         exit("!")
-    #         del export_list
-    #     return outputs
+
 
     def generate_images_pred(self, input_imgs, input_Ks, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
         Generated images are saved into the `outputs` dictionary.
         """
-        # with open("D:\MA\Recources\monodepth2_tf2\inverse_warp.pkl", 'rb') as df:
-        #     input_imgs, output_tf = pickle.load(df)
+        # -----------
+        # with open(r"D:\MA\Recources\monodepth2-original\check_inverse_warp_model.pkl", 'rb') as df:
+        #     imported = pickle.load(df)
+        # inputs_imp = imported['inputs_imgs_Ks']
+        # # outputs_imp = imported['outputs']
+        # -----------
 
         source_scale = 0
         for scale in range(self.num_scales):
             # print("===== scale %d ====="%scale)
-            disp_tf = outputs[("disp", scale)]   # tf-version
-            # print("disp_tf shape in scale: ", disp_tf)
+
+            # -----------------------------
+            disp_tf = outputs[("disp", scale)]
+            # disp_tf = outputs_imp[("disp", scale)]
+            # disp_tf = np.transpose(disp_tf, [0, 2, 3, 1])
+            # print("disp_tf shape", disp_tf.shape)
+            # -----------------------------
 
             disp = tf.image.resize(disp_tf, (self.height, self.width))
             _, depth = disp_to_depth(disp, self.min_depth, self.max_depth)
-            outputs[("depth", 0, scale)] = depth
+
+            # -----------------------------
+            # outputs[("depth", 0, scale)] = depth
+            # outputs_imp[("depth", 0, scale)] = depth
+            # -----------------------------
 
             for i, f_i in enumerate(self.frame_idx[1:]):
                 T = outputs[("cam_T_cam", 0, f_i)]
-                T = tf.cast(T, tf.float32)
-                cam_points = back_proj_depth(depth, input_Ks[("inv_K", source_scale)],
-                                             self.shape_scale0, source_scale)
-                pix_coords = project_3d(cam_points, input_Ks[("K", source_scale)], T,
-                                        self.shape_scale0, source_scale)
-                # print("scale: ", scale)
-                # cam_points = self.back_project_dict[source_scale](depth, input_Ks[("inv_K", source_scale)])
-                # pix_coords = self.project_3d_dict[source_scale](cam_points, input_Ks[("K", source_scale)], T)
+
+                # ----------
+                cam_points = self.back_project_dict[source_scale].run_func(depth, input_Ks[("inv_K", source_scale)])
+                pix_coords = self.project_3d_dict[source_scale].run_func(cam_points, input_Ks[("K", source_scale)], T)
+                # cam_points = self.back_project_dict[source_scale].run_func(depth, inputs_imp[("inv_K", source_scale)])
+                # pix_coords = self.project_3d_dict[source_scale].run_func(cam_points, inputs_imp[("K", source_scale)], T)
+                # ----------
                 outputs[("sample", f_i, scale)] = pix_coords
 
+                # -----------
                 input_tf = input_imgs[("color", f_i, source_scale)]
+                # input_tf = inputs_imp[("color", f_i, source_scale)]
+                # input_tf = np.transpose(input_tf, [0,2,3,1])
+                # ------------
                 res = bilinear_sampler(input_tf, outputs[("sample", f_i, scale)])
 
                 outputs[("color", f_i, scale)] = res
@@ -326,67 +309,67 @@ class Trainer:
             for i in range(self.batch_size):
                 fig = plt.figure(figsize=(3, 2))
                 fig.add_subplot(3, 2, 1)
-                tgt = input_imgs[('color', 0, 0)][i]
+                tgt = input_imgs[('color', 0, 0)][i].numpy()
+                # tgt = inputs_imp[('color', 0, 0)][i]
+                # tgt = np.transpose(tgt, [1,2,0])
                 plt.imshow(tgt)
 
                 fig.add_subplot(3, 2, 3)
-                src0 = input_imgs[('color_aug', -1, 0)][i]
+                src0 = input_imgs[('color_aug', -1, 0)][i].numpy()
+                # src0 = inputs_imp[('color_aug', -1, 0)][i]
+                # src0 = np.transpose(src0, [1,2,0])
                 print(np.max(np.max(src0)), np.min(np.min(src0)))
                 plt.imshow(src0)
 
                 fig.add_subplot(3, 2, 4)
-                src1 = input_imgs[('color_aug', 1, 0)][i]
-                plt.imshow(src1)
+                src1 = input_imgs[('color_aug', 1, 0)][i].numpy()
+                # src1 = inputs_imp[('color_aug', 1, 0)][i]
+                # src1 = np.transpose(src1, [1, 2, 0])
                 print(np.max(np.max(src1)), np.min(np.min(src1)))
+                plt.imshow(src1)
 
                 fig.add_subplot(3, 2, 5)
-                out0 = outputs[("color", -1, 0)][i]
+                out0 = outputs[("color", -1, 0)][i].numpy()
                 print(np.max(np.max(out0)), np.min(np.min(out0)))
                 plt.imshow(out0)
                 fig.add_subplot(3, 2, 6)
-                out1 = outputs[("color", 1, 0)][i]
+                out1 = outputs[("color", 1, 0)][i].numpy()
                 print(np.max(np.max(out1)), np.min(np.min(out1)))
                 plt.imshow(out1)
                 plt.show()
 
     def predict_poses(self, input_imgs, outputs):
         """Use pose enc-dec to calculate camera's angles and translations"""
-        tgt_image_aug       = input_imgs[('color_aug', self.frame_idx[0], 0)]
-        src_image_pre_aug   = input_imgs[('color_aug', self.frame_idx[1], 0)]
-        src_image_post_aug  = input_imgs[('color_aug', self.frame_idx[2], 0)]
-        # print("============ predict_poses ==============")
-        # print(src_image_pre_aug.shape)
-        # print(tgt_image_aug.shape)
-        # Enocder
-        pose_ctp_raw = self.models['pose_enc'](
-            tf.concat([src_image_pre_aug, tgt_image_aug], axis=3)
-        )
-        pose_ctn_raw = self.models['pose_enc'](
-            tf.concat([tgt_image_aug, src_image_post_aug], axis=3)
-        )
+        # ---------------
+        # with open("D:\MA\Recources\monodepth2-original\check_inverse_warp_model.pkl", 'rb') as df:
+        #     imported = pickle.load(df)
+        # outputs_imp = imported['outputs']
+        # input_imp = imported['inputs_imgs_Ks']
+        # frames_for_pose = {f_i: tf.constant(np.transpose(input_imp[("color_aug", f_i, 0)],[0,2,3,1]))
+        #                    for f_i in self.frame_idx}
+        frames_for_pose = {f_i: input_imgs[("color_aug", f_i, 0)] for f_i in self.frame_idx}
+        # ---------------
 
-        # Decoder
-        # pose_ctp = [pose_ctp_raw[-1]]
-        # pose_ctn = [pose_ctn_raw[-1]]
-        pred_pose_ctp_raw = self.models['pose_dec'](pose_ctp_raw, self.train_pose)
-        pred_pose_ctn_raw = self.models['pose_dec'](pose_ctn_raw, self.train_pose)
+        for f_i in self.frame_idx[1:]:
+            # To maintain ordering we always pass frames in temporal order
+            if f_i < 0:
+                pose_inputs = [frames_for_pose[f_i], frames_for_pose[0]]
+            else:
+                pose_inputs = [frames_for_pose[0], frames_for_pose[f_i]]
 
-        # Collect angles and translations
-        pred_pose_ctp = concat_pose_params(pred_pose_ctp_raw, curr2prev=True, curr2next=False)
-        pred_pose_ctn = concat_pose_params(pred_pose_ctn_raw, curr2prev=True, curr2next=False)
+            pose_inputs = self.models["pose_enc"](tf.concat(pose_inputs, axis=3))
 
-        pred_poses = tf.concat([pred_pose_ctp, pred_pose_ctn], axis=1)
-        pred_poses = tf.expand_dims(pred_poses, axis=2)
-        # print("\t check concated pose shape: ", pred_poses.shape)
-
-        for i, f_i in enumerate(self.frame_idx[1:]):
-            angs_tf = pred_poses[:, i, :, :3]
-            trans_tf = pred_poses[:, i, :, 3:]
+            pred_pose_raw = self.models["pose_dec"](pose_inputs)
+            # ---------
+            axisangle = pred_pose_raw['angles']
+            translation = pred_pose_raw['translations']
+            # axisangle = outputs_imp[("axisangle", 0, f_i)]
+            # translation = outputs_imp[("translation", 0, f_i)]
+            # ---------
+            # Invert the matrix if the frame id is negative
             outputs[("cam_T_cam", 0, f_i)] = transformation_from_parameters(
-                angs_tf, trans_tf, invert=(f_i < 0))
-        self.pred_poses = pred_poses
+                axisangle[:, 0], translation[:, 0], invert=(f_i < 0))
         return outputs
-
 
     def process_batch(self, input_imgs, input_Ks):
         """The whoel pipeline implemented in minibatch (pairwise images)
@@ -395,7 +378,13 @@ class Trainer:
         3. Use products from 1.2. to generate image (reprojection) predictions
         4. Compute Losses from 3.
         """
+        # ------------
+        # with open("D:\MA\Recources\monodepth2-original\check_inverse_warp_model.pkl", 'rb') as df:
+        #     imported = pickle.load(df)
+        # inputs_imp = imported['inputs_imgs_Ks']
+        # tgt_image_aug = tf.constant(np.transpose(inputs_imp[('color_aug', 0, 0)], [0,2,3,1]))
         tgt_image_aug = input_imgs[('color_aug', 0, 0)]
+        # -------------
 
         # Depth Encoder
         feature_raw = self.models['depth_enc'](tgt_image_aug, self.train_depth)
@@ -427,23 +416,46 @@ class Trainer:
         # -------------
         return outputs
 
-    def run_epoch(self, dataset, train_sum_writer=None):
+    def run_epoch(self, dataset):
         """Training loop
         Tf.keras 与 pytorch 相似，只是将 loss.backward() 换成 tf.GradientTape()
         - loss function 需要自己定义, 返回 total loss即可, 就可通过 GradientTape 跟踪
         - 然后 compile(loss=compute_loss)
         """
         dataset_iter = iter(dataset)
+        self.global_step = 0
+
         for epoch in range(self.num_epochs):
+            self.epoch_cnt = epoch
+            self.optimizer.lr = self.lr_fn(epoch+1)     # learning rate 15:1e-4; >16:1e-5
+            print("learning rate - epoch %d: "%epoch, self.optimizer.lr)
+
             for i in tqdm(range(self.data_loader.steps_per_epoch),
                           desc='Epoch%d/%d'%(epoch+1, self.num_epochs)):
+                # data preparation
                 batch = dataset_iter.get_next()
                 trainable_weights_all = self.get_trainable_weights()
                 input_imgs, input_Ks = self.batch_processor.prepare_batch(batch[..., :3], batch[..., 3:])
-                # ----- Method-1, calculate in custom steps -----
-                # grads = self.grad(input_imgs, input_Ks, trainable_weights_all, train_sum_writer)
-                grads = self.grad(input_imgs, input_Ks, trainable_weights_all, train_sum_writer)
+                # training
+                grads = self.grad(input_imgs, input_Ks, trainable_weights_all)
                 self.optimizer.apply_gradients(zip(grads, trainable_weights_all))
+                self.global_step += 1
+
+    @tf.function    # turn off to debug, e.g. with plt
+    def grad(self, input_imgs, input_Ks, trainables):
+        with tf.GradientTape() as tape:
+            outputs = self.process_batch(input_imgs, input_Ks)
+            total_loss = self.compute_losses(input_imgs, outputs)
+            grads = tape.gradient(total_loss, trainables)
+
+        # collect summary
+        if self.train_sum_writer is not None and self.global_step % self.summary_freq == 0:
+            with self.train_sum_writer.as_default():
+                self.collect_summary(outputs)
+        if self.global_step != 0 and self.global_step % (self.summary_freq * 2) == 0:
+            self.train_sum_writer.flush()
+
+        return grads
 
     def get_trainable_weights(self):
         trainable_weights_all = []
@@ -456,36 +468,21 @@ class Trainer:
                 trainable_weights_all.extend(model.trainable_weights)
         return trainable_weights_all
 
-    @tf.function    # turn off to use plt
-    def grad(self, input_imgs, input_Ks, trainables, train_sum_writer=None):
-        with tf.GradientTape() as tape:
-            outputs = self.process_batch(input_imgs, input_Ks)
-            total_loss = self.compute_losses(input_imgs, outputs)
-
-            grads = tape.gradient(total_loss, trainables)
-
-        if train_sum_writer is not None:
-            with train_sum_writer.as_default():
-                self.collect_summary(outputs)
-        return grads
-
     def train(self, record=False):
 
         if not self.train_pose and not self.train_depth:
             print("specify a model to train")
             return
-        self.epoch_cnt = 0
 
-        train_sum_writer = None
         dataset = self.data_loader.build_dataset()
         if record:
             curren_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
             train_log_dir = "logs/gradient_tape/" + curren_time + "/train"
-            train_sum_writer = tf.summary.create_file_writer(train_log_dir)
+            self.train_sum_writer = tf.summary.create_file_writer(train_log_dir)
 
         # for epoch in range(self.num_epochs):
         print("Start training...")
-        self.run_epoch(dataset, train_sum_writer)
+        self.run_epoch(dataset)
 
     def collect_summary(self, outputs):
         # total losses in multiple scales
@@ -497,18 +494,17 @@ class Trainer:
         tf.summary.scalar("smooth loss", self.smooth_losses, step=self.epoch_cnt)
 
         # poses
-        axis_names = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz']
-        for i in range(len(axis_names)):
-
-            tf.summary.histogram(axis_names[i], self.pred_poses[:,:,:,i], step=self.epoch_cnt)
+        # axis_names = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz']
+        # for i in range(len(axis_names)):
+        #     tf.summary.histogram(axis_names[i], self.pred_poses[:, :, :, i], step=self.epoch_cnt)
 
         # images
-        tf.summary.image('tgt_image', self.tgt_image_all[0], step=self.epoch_cnt)
+        # tf.summary.image('tgt_image', self.tgt_image_all[0], step=self.epoch_cnt)
         for s in range(self.num_scales):
             tf.summary.image('scale{}_disparity_color_image'.format(s),
                              colorize(outputs['disp',s], cmap='plasma'), step=self.epoch_cnt)
-            tf.summary.image('scale{}_disparity_gray_image'.format(s),
-                             normalize_image(outputs['disp',s]), step=self.epoch_cnt)
+            # tf.summary.image('scale{}_disparity_gray_image'.format(s),
+            #                  normalize_image(outputs['disp',s]), step=self.epoch_cnt)
             for i in range(2):
                 tf.summary.image('scale{}_projected_image_{}'.format(s, i),
                                  self.proj_image_stack_all[s][:, :, :, i * 3:(i + 1) * 3], step=self.epoch_cnt)
@@ -516,7 +512,6 @@ class Trainer:
                                      self.proj_error_stack_all[s][:, :, :, i * 3:(i + 1) * 3], step=self.epoch_cnt)
             if self.auto_mask:
                 tf.summary.image('scale{}_automask_image'.format(s), self.pred_auto_masks[s], step=self.epoch_cnt)
-                # tf.compat.image('scale{}_automask2_image'.format(s), self.pred_auto_masks2[s], step=self.epoch_cnt)
 
     def compute_depth_losses(self, input_imgs, outputs, losses):
         """Compute depth metrics, to allow monitoring during training
@@ -552,5 +547,5 @@ class Trainer:
 
 
 if __name__ == '__main__':
-    trainer = Trainer(train_pose=True, train_depth=True, debug_mode=False)
+    trainer = Trainer(from_scratch=True, train_pose=True, train_depth=True, debug_mode=False)
     trainer.train(record=False)
