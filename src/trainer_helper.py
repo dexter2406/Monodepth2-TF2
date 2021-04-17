@@ -36,7 +36,7 @@ def build_models(models_dict, check_outputs=False, show_summary=False):
                     print(elem.shape)
         if show_summary:
             m.summary()
-
+    return models_dict
 
 def SSIM(x, y):
     C1 = 0.01 ** 2
@@ -140,14 +140,15 @@ def project_3d(points, K, T, shape, scale):
     return pix_coords
 
 
-class Project3D(tf.keras.Model):
+class Project3D:
     def __init__(self, shape, scale):
         super(Project3D, self).__init__()
         self.batch_size, height, width, _ = shape
         self.height, self.width = height // (2 ** scale), width // (2 ** scale)
         self.eps = 1e-7
 
-    def call(self, points, K, T):
+    def run_func(self, points, K, T):
+    # def call(self, points, K, T):
         P = tf.matmul(K, T)[:, :3, :]
 
         cam_points = tf.matmul(P, points)
@@ -156,7 +157,6 @@ class Project3D(tf.keras.Model):
         pix_coords = tf.reshape(pix_coords, (self.batch_size, 2, self.height, self.width))
         pix_coords = tf.transpose(pix_coords, [0, 2, 3, 1])
 
-        # pix_coords = pix_coords.numpy()     # Tensor can't be assigned
         pix_coords_0 = pix_coords[..., 0]
         pix_coords_1 = pix_coords[..., 1]
         tensor_w = tf.ones_like(pix_coords_0) * (self.width - 1)
@@ -165,14 +165,11 @@ class Project3D(tf.keras.Model):
         pix_coords_1 = tf.expand_dims(pix_coords_1 / tensor_h, axis=-1)
 
         pix_coords = tf.concat([pix_coords_0, pix_coords_1], axis=-1)
-        # pix_coords[..., 0] /= self.width - 1
-        # pix_coords[..., 1] /= self.height - 1
-        # pix_coords = tf.convert_to_tensor(pix_coords, dtype=tf.float32)
         pix_coords = (pix_coords - 0.5) * 2
         return pix_coords
 
 
-class BackProjDepth(tf.keras.Model):
+class BackProjDepth:
     def __init__(self, shape, scale):
         super(BackProjDepth, self).__init__()
         self.batch_size, height, width, _ = shape
@@ -194,7 +191,8 @@ class BackProjDepth(tf.keras.Model):
 
         self.ones = tf.cast(ones, tf.float32)
 
-    def call(self, depth, inv_K):
+    def run_func(self, depth, inv_K):
+    # def call(self, depth, inv_K):
         cam_points = tf.matmul(inv_K[:, :3, :3], self.pix_coords)
         cam_points = tf.reshape(depth, (self.batch_size, 1, -1)) * cam_points
         cam_points = tf.concat([cam_points, self.ones], 1)
@@ -214,7 +212,6 @@ def back_proj_depth(depth, inv_K, shape, scale):
 
     ones = tf.ones((batch_size, 1, height * width), dtype=tf.int32)
 
-    # tmp = tf.reshape(id_coords[0], -1)
     pix_coords = tf.expand_dims(
         tf.stack([tf.reshape(id_coords[0], [-1]),
                   tf.reshape(id_coords[1], [-1])], 0), 0)
@@ -225,16 +222,12 @@ def back_proj_depth(depth, inv_K, shape, scale):
 
     pix_coords = tf.concat([pix_coords, ones], 1)
     pix_coords = tf.cast(pix_coords, tf.float32)
-    # pix_coords = tf.Variable(pix_coords)
 
     ones = tf.cast(ones, tf.float32)
-    # ones = tf.Variable(ones)
 
     cam_points = tf.matmul(inv_K[:,:3, :3], pix_coords)
-    # print(tf.reshape(depth, (batch_size, 1, -1)).shape, " vs. ", cam_points.shape)
     cam_points = tf.reshape(depth, (batch_size, 1, -1)) * cam_points
     cam_points = tf.concat([cam_points, ones], 1)
-    # cam_points = tf.Variable(cam_points)
     return cam_points
 
 
@@ -258,7 +251,7 @@ def bilinear_sampler(img, coords):
     def get_pixel_value(img, x, y):
         """
         Utility function to get pixel value for coordinate
-        vectors x and y from a  4D tensor image.
+        vectors x and y from a 4D tensor image.
         Input
         -----
         - img: tensor of shape (B, H, W, C)
@@ -285,15 +278,20 @@ def bilinear_sampler(img, coords):
     W = tf.shape(img)[2]
     max_y = tf.cast(H - 1, 'int32')
     max_x = tf.cast(W - 1, 'int32')
-    zero = tf.zeros([], dtype='int32')
+
+    # zero = tf.zeros([], dtype='int32')    #o
+    zero = tf.zeros([1], dtype=tf.int32)     #t
+    eps = tf.constant([0.5], 'float32')    #t
 
     # rescale x and y to [0, W-1/H-1]
     x, y = coords[:, ..., 0], coords[:, ..., 1]
-    # print(x.shape)
     x = tf.cast(x, 'float32')
     y = tf.cast(y, 'float32')
-    x = 0.5 * ((x + 1.0) * tf.cast(max_x - 1, 'float32'))
-    y = 0.5 * ((y + 1.0) * tf.cast(max_y - 1, 'float32'))
+
+    x = 0.5 * ((x + 1.0) * tf.cast(max_x - 1, 'float32')) #o
+    y = 0.5 * ((y + 1.0) * tf.cast(max_y - 1, 'float32')) #o
+    x = tf.clip_by_value(x, eps, tf.cast(max_x, tf.float32) - eps)   #t
+    y = tf.clip_by_value(y, eps, tf.cast(max_y, tf.float32) - eps)   #t
 
     # grab 4 nearest corner points for each (x_i, y_i)
     x0 = tf.cast(tf.floor(x), 'int32')
@@ -333,7 +331,6 @@ def bilinear_sampler(img, coords):
 
     # compute output
     out = tf.add_n([wa * Ia, wb * Ib, wc * Ic, wd * Id])
-    # out = tf.Variable(out)
     return out
 
 
@@ -360,6 +357,7 @@ def transformation_from_parameters(axisangle, translation, invert=False):
 def get_translation_matrix(trans_vec):
     """Convert a translation vector into a 4x4 transformation matrix
     """
+    # np impl
     # T = np.zeros((trans_vec.shape[0], 4, 4)).astype(np.float32)
     # t = np.reshape(trans_vec.numpy(), (-1, 3, 1)).astype(np.float32)
     #
@@ -368,6 +366,7 @@ def get_translation_matrix(trans_vec):
     # T[:, 2, 2] = 1
     # T[:, 3, 3] = 1
     # T[:, :3, 3, None] = t
+    # T = tf.convert_to_tensor(T, dtype=tf.float32)
 
     batch_size = trans_vec.shape[0]
     one = tf.ones([batch_size, 1, 1], dtype=tf.float32)
@@ -380,7 +379,6 @@ def get_translation_matrix(trans_vec):
 
     ], axis=2)
     T = tf.reshape(T, [batch_size, 4, 4])
-    # T = tf.convert_to_tensor(T, dtype=tf.float32)
     return T
 
 
@@ -410,7 +408,7 @@ def rot_from_axisangle(vec):
     yzC = y * zC
     zxC = z * xC
 
-    # Pytorch impl
+    # np impl
     # rot = np.zeros((vec.shape[0], 4, 4))
     # rot[:, 0, 0] = np.squeeze(x * xC + ca)
     # rot[:, 0, 1] = np.squeeze(xyC - zs)
@@ -444,7 +442,6 @@ def rot_from_axisangle(vec):
 
     rot = tf.reshape(rot, [-1, 4, 4])
     return rot
-
 
 
 """ -------------- Not In Use ---------------"""
