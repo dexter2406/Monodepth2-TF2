@@ -52,6 +52,7 @@ Now you can train your own model using the `train.py` and `new_trainer.py`. For 
 - completing the *evaluate* code.
 - modify the code to take more dataset (for now only *KITTI_Raw* is supported), e.g. *KITTI_Odometry* and *Cityscapes*
 
+---
 
 ### History note
 
