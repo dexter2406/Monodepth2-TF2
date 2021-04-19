@@ -16,12 +16,49 @@ I'm using a normal GTX1060-MaxQ GPU. The FPS for single-image depth estimation:
 - using `tf.keras.models.load_model` with `model.predict()`:
   - overall : ~100 FPS (details forgot...)
 
+### example usage:
+Use `@tf.function` decorator for `Train.grad()` and `DataPprocessor.prepare_batch()` will allow much larger `batch_size`
+```
+# Start training (from scratch):
+python train.py --from_scratch
 
-### Note
+# Continue training:
+python train.py --weights_dir <weights_folder_path>
 
-It's currently just for personal use, but please feel free to contact me if you need anything. 
+# To see intermediate result:
+# remember to comment "tf.function" decorator for Train.grad() and DataPprocessor.prepare_batch()
+python train.py --weights_dir <folder_path> --debug_mode True
+```
+Check `train.py` file for more details.
 
-Forgive me that I haven't used argument-parsing, so you can't run with one command. You need to change some path settings when you run the demo. However, no worries, it's just a simple code **merely for singlet depth estimation** (for now). The Pose networks and training pipeline is still in progress, needs double check. Though bug-free, I can't give any guarantees for total correctness.
+
+The models (transferred from official Pytorch model, trained on KITTI-Odometry dataset, size (640x192).):
+- [weights_all_4_models](https://drive.google.com/drive/folders/1hPLVCowqvypekJy4UAB_HHAt1xtqR-H_?usp=sharing) 
+
+Note：It's trained on *Odometry* split, so if applied on *Raw* data, the results won't be perfect.
+
+### TODO
+- [X] implement the encoder-decoder model in TF2.x, just for singlet depth estimation. 
+- [X] Pose encoder: multi-image-input version of the encoder
+- [X] Pose decoder
+- [X] training code
+- [ ] evluation code
+- [ ] simple test code
+- [ ] modify data loader to accept more dataset
+- [ ] try new stuff in similar papers, e.g. *struct2dpeth*
+
+### Note up-to-date
+Now you can train your own model using the `train.py` and `new_trainer.py`. For now I just trained for 1 epoch, and the results (the reconstructed image and the disp image) seem to head to the correct way. Next step will be:
+- completing the *evaluate* code.
+- modify the code to take more dataset (for now only *KITTI_Raw* is supported), e.g. *KITTI_Odometry* and *Cityscapes*
+
+
+### History note
+
+#### March
+Just for personal use, but please feel free to contact me if you need anything. 
+
+I haven't used argument-parsing, so you can't run with one command. You need to change some path settings when you run the demo. However, no worries, it's just a simple code **merely for singlet depth estimation** (for now). The Pose networks and training pipeline is still in progress, needs double check. Though bug-free, I can't give any guarantees for total correctness.
 Anyways, Take one minute you will know what's going on in there.
 
 `simple_run.py`: as the name suggests, it's a simple run, important functions are all there, no encapsulement.
@@ -31,21 +68,6 @@ Anyways, Take one minute you will know what's going on in there.
 The `depth_decoder_creater.py` and `encoder_creator.py` is used to 
 - Useful part: build the Model in TF2.x the same way as the official *monodepth2* implemented in Pytroch.
 - Neglectable part: weights loading. Weights were extracted from the official torch model in `numpy.ndarray` form, then directly loaded to the TF model layer-/parameter-wise. It's trivial. But I will upload the converted `SavedModel` directly, so no worries.
-
-The models (official weights, trained on KITTI-Odometry dataset, size (640x192).):
-- [resnet18-encoder](https://drive.google.com/drive/folders/1yBIYsphJInPIjGtL3NjMzHhjVk6ExoRC?usp=sharing) 
-- [depth-decoder_one_output](https://drive.google.com/drive/folders/19LdqNfcLJDneNu79TtUupDPael3vo0VM?usp=sharing) 
-- [pose_encoder (same resnet18)](https://drive.google.com/drive/folders/1FW_Biq18WUNDV34sDZUt7Ztd5_1_U6Zo?usp=sharing)
-- [pose_decoder](https://drive.google.com/drive/folders/1_H1HZNXFUAZgnBWNLcbeuHDM9eoNP-5k?usp=sharing)
-
-### TODO
-- [X] implement the encoder-decoder model in TF2.x, just for singlet depth estimation. 
-- [X] Pose encoder: multi-image-input version of the encoder
-- [X] Pose decoder
-- [X] training code (still veriifying the correctness)
-- [ ] evluation code
-- [ ] test code
-
 
 ### Credits
 - the Official repo: https://github.com/nianticlabs/monodepth2
