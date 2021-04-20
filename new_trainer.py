@@ -3,10 +3,12 @@ from models.depth_decoder_creater import DepthDecoder_full
 from models.encoder_creater import ResNet18_new
 from models.posenet_decoder_creator import PoseDecoder
 
-from utils import disp_to_depth, concat_pose_params
+from utils import disp_to_depth
 from src.trainer_helper import *
 # from src.dataset_loader import DataLoader
-from src.dataset_loader_kitti_raw import DataLoader_KITTI_Raw
+# from src.dataset_loader_kitti_raw import DataLoader_KITTI_Raw
+from datasets.data_loader_kitti import DataLoader
+from datasets.dataset_kitti import KITTIRaw, KITTIOdom
 from src.DataPprocessor import DataProcessor
 
 import numpy as np
@@ -27,8 +29,7 @@ class Trainer:
         self.opt = options
         self.models = {}
         self.num_frames_per_batch = len(self.opt.frame_idx)
-        self.data_loader = DataLoader_KITTI_Raw(self.opt.num_epochs, self.opt.batch_size, debug_mode=self.opt.debug_mode,
-                                                dataset_for='train', split_name='eigen_zhou')
+        self.data_loader: DataLoader = None
         self.shape_scale0 = [self.opt.batch_size, self.opt.height, self.opt.width, 3]
 
         self.tgt_image = None
@@ -44,18 +45,15 @@ class Trainer:
 
         self.pixel_losses = 0.
         self.smooth_losses = 0.
-        # self.total_loss = 0.
         self.losses = {}
         self.global_step = tf.Variable(0, dtype=tf.int32, trainable=False)
         self.batch_idx = tf.Variable(0, dtype=tf.int32, trainable=False)
-
-        self.batch_processor = DataProcessor(not self.opt.debug_mode)
         self.epoch_cnt = tf.Variable(0, dtype=tf.int64, trainable=False)
-        boundaries = [self.opt.lr_step_size, self.opt.lr_step_size*2]           # [15, 30]
-        values = [self.opt.learning_rate * scale for scale in [1, 0.1, 0.01]]   # [1e-4, 1e-5, 1e-6]
-        self.lr_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
-        learning_rate = self.lr_fn(self.epoch_cnt)
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+
+        self.dataset = None
+        self.batch_processor: DataProcessor = None
+        self.lr_fn = None
+        self.optimizer = None
 
         self.train_sum_writer = None
         self.weights_idx = 0    # for saved weights
@@ -65,13 +63,27 @@ class Trainer:
         self.init_app()
 
     def init_app(self):
-        """Initiate Pose, Depth and Auto-Masking models
+        """Init dataset Class, init Pose, Depth and Auto-Masking models
         self.models['depth_enc'] = ResNet18_new([2, 2, 2, 2]), channel_num=3
         self.models['depth_dec'] = DepthDecoder_full()
         self.models['pose_enc'] = ResNet18_new([2, 2, 2, 2]), channel_num=6
         self.models['pose_dec'] = PoseDecoder(num_ch_enc=[64, 64, 128, 256, 512])
         """
+        # Choose dataset
+        dataset_dict = {
+            'kitti_raw': KITTIRaw,
+            'kitti_odom': KITTIOdom
+        }
+        split_folder = os.path.join('splits', self.opt.split)
+        split_name = 'train_files.txt' if 'train' in self.opt.run_mode else 'val_files.txt'
+        self.dataset = dataset_dict[self.opt.dataset](
+            split_folder, split_name, data_path=self.opt.data_path
+        )
+        self.data_loader = DataLoader(self.dataset, self.opt.num_epochs, self.opt.batch_size,
+                                      self.opt.frame_idx, dataset_for=self.opt.run_mode)
+        self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx, intrinsics=self.dataset.K)
 
+        # Init models
         self.models['depth_enc'] = ResNet18_new([2, 2, 2, 2])
         self.models['depth_dec'] = DepthDecoder_full()
         self.models['pose_enc'] = ResNet18_new([2, 2, 2, 2])
@@ -83,6 +95,13 @@ class Trainer:
         build_models(self.models, show_summary=False, check_outputs=False)
         self.load_models()
 
+        # Set optimizer
+        boundaries = [self.opt.lr_step_size, self.opt.lr_step_size*2]           # [15, 30]
+        values = [self.opt.learning_rate * scale for scale in [1, 0.1, 0.01]]   # [1e-4, 1e-5, 1e-6]
+        self.lr_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate = self.lr_fn(self.epoch_cnt))
+
+        # Init inverse-warping helpers
         # for scale in range(self.opt.num_scales):
         self.back_project_dict[self.opt.src_scale] = BackProjDepth(self.shape_scale0, self.opt.src_scale)
         self.project_3d_dict[self.opt.src_scale] = Project3D(self.shape_scale0, self.opt.src_scale)
@@ -272,11 +291,11 @@ class Trainer:
             for i, f_i in enumerate(self.opt.frame_idx[1:]):
                 T = outputs[("cam_T_cam", 0, f_i)]
 
-                # ----------
-                cam_points = self.back_project_dict[self.opt.src_scale].run_func(depth, input_Ks[("inv_K", self.opt.src_scale)])
-                pix_coords = self.project_3d_dict[self.opt.src_scale].run_func(cam_points, input_Ks[("K", self.opt.src_scale)], T)
+                cam_points = self.back_project_dict[self.opt.src_scale].run_func(
+                    depth, input_Ks[("inv_K", self.opt.src_scale)])
+                pix_coords = self.project_3d_dict[self.opt.src_scale].run_func(
+                    cam_points, input_Ks[("K", self.opt.src_scale)], T)
 
-                # ----------
                 outputs[("sample", f_i, scale)] = pix_coords
 
                 # -----------
@@ -400,12 +419,12 @@ class Trainer:
         # -------------
         return outputs
 
-    def start_training(self, dataset):
-        """Training loop
-        Tf.keras 与 pytorch 相似，只是将 loss.backward() 换成 tf.GradientTape()
-        - loss function 需要自己定义, 返回 total loss即可, 就可通过 GradientTape 跟踪
+    def start_training(self, data_iter):
+        """Custom training loop
+        - use @tf.function for self.grad() and self.dataloader.prepare_batch()
+            allow larger batch_size GPU utilization.
         """
-        dataset_iter = iter(dataset)
+        # self.batch_processor.K = self.data_loader.datset.K
         for epoch in range(self.opt.num_epochs):
             self.epoch_cnt.assign(epoch)
             self.optimizer.lr = self.lr_fn(epoch)     # learning rate 15:1e-4; >16:1e-5
@@ -415,9 +434,15 @@ class Trainer:
                           desc='Epoch%d/%d' % (epoch+1, self.opt.num_epochs)):
                 self.batch_idx.assign(i)
                 # data preparation
-                batch = dataset_iter.get_next()
+                batch = data_iter.get_next()
+                # print(type(batch_depths), batch_depths.shape)
+                if type(batch) == tuple:
+                    batch_imgs, batch_depths = batch
+                else:
+                    batch_imgs = batch
+                tgt_image_stack, src_image_stack = batch_imgs[..., :3], batch_imgs[..., 3:]
                 trainable_weights_all = self.get_trainable_weights()
-                input_imgs, input_Ks = self.batch_processor.prepare_batch(batch[..., :3], batch[..., 3:])
+                input_imgs, input_Ks = self.batch_processor.prepare_batch(tgt_image_stack, src_image_stack)
                 # training
                 # grads = self.grad(input_imgs, input_Ks, trainable_weights_all)
                 grads, outputs = self.grad(input_imgs, input_Ks, trainable_weights_all)
@@ -428,7 +453,7 @@ class Trainer:
                     if not self.opt.debug_mode:
                         self.save_models()
 
-    # @tf.function    # turn off to debug, e.g. with plt
+    @tf.function    # turn off to debug, e.g. with plt
     def grad(self, input_imgs, input_Ks, trainables):
         with tf.GradientTape() as tape:
             outputs = self.process_batch(input_imgs, input_Ks)
@@ -465,14 +490,14 @@ class Trainer:
             print("specify a model to train")
             return
 
-        dataset = self.data_loader.build_dataset()
+        data_iter = self.data_loader.build_combined_dataset(include_depth=self.opt.include_depth)
         if self.opt.recording:
             train_log_dir = self.opt.record_summary_path + self.opt.model_name + "/" + self.opt.run_mode
             self.train_sum_writer = tf.summary.create_file_writer(train_log_dir)
-            print('Summary will be stored in %s ' % train_log_dir)
+            print('\tSummary will be stored in %s ' % train_log_dir)
         # for epoch in range(self.opt.num_epochs):
         print("->Start training...")
-        self.start_training(dataset)
+        self.start_training(data_iter)
 
     def save_models(self, not_saved=()):
         weights_path = os.path.join(self.opt.save_model_path, 'weights_%d' % self.weights_idx)
