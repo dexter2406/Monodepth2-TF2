@@ -6,22 +6,17 @@ import numpy as np
 
 
 class DataProcessor(object):
-    def __init__(self, is_train=False):
+    def __init__(self, frame_idx, intrinsics=None, is_train=False):
         self.is_train = is_train
         self.num_scales = 4
         self.height = 192
         self.width = 640
-        self.frame_idx = [0, -1, 1]
+        self.frame_idx = frame_idx
         self.batch_size = -1
         # For KITTI. Must *normalize* when using on different scale
-        self.K = np.array([[0.58, 0, 0.5, 0],
-                           [0, 1.92, 0.5, 0],
-                           [0, 0, 1, 0],
-                           [0, 0, 0, 1]], dtype=np.float32)
+        self.K = intrinsics
 
-    def set_train(self):
-        self.is_train = True
-
+    @tf.function
     def prepare_batch(self, tgt_batch, src_batch):
         """Apply augmentation
         tgt_batch: ndarray
@@ -50,6 +45,7 @@ class DataProcessor(object):
         input_imgs[('color', self.frame_idx[2], -1)] = src_batch[..., 3:]
 
         input_imgs, input_Ks = self.preprocess(input_imgs, input_Ks)
+        self.delete_raw_images(input_imgs)
 
         return input_imgs, input_Ks
 
@@ -86,8 +82,8 @@ class DataProcessor(object):
             inv_K = tf.reshape(tf.tile(inv_K, [self.batch_size,1]), (self.batch_size, 4, 4))
             assert K.shape[-1] == 4
 
-            input_Ks[("K", scale)] = tf.constant(K)
-            input_Ks[("inv_K", scale)] = tf.constant(inv_K)
+            input_Ks[("K", scale)] = K
+            input_Ks[("inv_K", scale)] = inv_K
 
         return input_imgs, input_Ks
 
