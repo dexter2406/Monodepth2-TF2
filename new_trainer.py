@@ -29,7 +29,8 @@ class Trainer:
         self.opt = options
         self.models = {}
         self.num_frames_per_batch = len(self.opt.frame_idx)
-        self.data_loader: DataLoader = None
+        self.train_loader: DataLoader = None
+        self.val_loader: DataLoader = None
         self.shape_scale0 = [self.opt.batch_size, self.opt.height, self.opt.width, 3]
 
         self.tgt_image = None
@@ -49,6 +50,8 @@ class Trainer:
         self.global_step = tf.Variable(0, dtype=tf.int32, trainable=False)
         self.batch_idx = tf.Variable(0, dtype=tf.int32, trainable=False)
         self.epoch_cnt = tf.Variable(0, dtype=tf.int64, trainable=False)
+        self.depth_metric_names = [
+            "de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms", "da/a1", "da/a2", "da/a3"]
 
         self.dataset = None
         self.batch_processor: DataProcessor = None
@@ -70,17 +73,21 @@ class Trainer:
         self.models['pose_dec'] = PoseDecoder(num_ch_enc=[64, 64, 128, 256, 512])
         """
         # Choose dataset
-        dataset_dict = {
+        dataset_choices = {
             'kitti_raw': KITTIRaw,
             'kitti_odom': KITTIOdom
         }
         split_folder = os.path.join('splits', self.opt.split)
         split_name = 'train_files.txt' if 'train' in self.opt.run_mode else 'val_files.txt'
-        self.dataset = dataset_dict[self.opt.dataset](
+        self.dataset = dataset_choices[self.opt.dataset](
             split_folder, split_name, data_path=self.opt.data_path
         )
-        self.data_loader = DataLoader(self.dataset, self.opt.num_epochs, self.opt.batch_size,
-                                      self.opt.frame_idx, dataset_for=self.opt.run_mode)
+        self.train_loader = DataLoader(self.dataset, self.opt.num_epochs,
+                                       self.opt.batch_size, self.opt.frame_idx)
+        self.val_loader = DataLoader(self.dataset, num_epoch=1,
+                                     batch_size=2, frame_idx=self.opt.frame_idx)
+        self.train_iter = self.train_loader.build_train_dataset()
+        self.val_iter = self.val_loader.build_val_dataset()
         self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx, intrinsics=self.dataset.K)
 
         # Init models
@@ -419,7 +426,7 @@ class Trainer:
         # -------------
         return outputs
 
-    def start_training(self, data_iter):
+    def start_training(self):
         """Custom training loop
         - use @tf.function for self.grad() and self.dataloader.prepare_batch()
             allow larger batch_size GPU utilization.
@@ -430,28 +437,26 @@ class Trainer:
             self.optimizer.lr = self.lr_fn(epoch)     # learning rate 15:1e-4; >16:1e-5
             print("\tlearning rate - epoch %d: " % epoch, self.optimizer.get_config()['learning_rate'])
 
-            for i in tqdm(range(self.data_loader.steps_per_epoch),
+            for i in tqdm(range(self.train_loader.steps_per_epoch),
                           desc='Epoch%d/%d' % (epoch+1, self.opt.num_epochs)):
                 self.batch_idx.assign(i)
+
                 # data preparation
-                batch = data_iter.get_next()
-                # print(type(batch_depths), batch_depths.shape)
-                if type(batch) == tuple:
-                    batch_imgs, batch_depths = batch
-                else:
-                    batch_imgs = batch
-                tgt_image_stack, src_image_stack = batch_imgs[..., :3], batch_imgs[..., 3:]
-                trainable_weights_all = self.get_trainable_weights()
-                input_imgs, input_Ks = self.batch_processor.prepare_batch(tgt_image_stack, src_image_stack)
+                batch = self.train_iter.get_next()
+                input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+
                 # training
                 # grads = self.grad(input_imgs, input_Ks, trainable_weights_all)
+                trainable_weights_all = self.get_trainable_weights()
                 grads, outputs = self.grad(input_imgs, input_Ks, trainable_weights_all)
                 self.optimizer.apply_gradients(zip(grads, trainable_weights_all))
                 self.global_step.assign_add(1)
 
-                if (self.global_step + 1) % (self.data_loader.steps_per_epoch // 2) == 0:
-                    if not self.opt.debug_mode:
+                if not self.opt.debug_mode:
+                    if self.is_time_to('save_model'):
                         self.save_models()
+                    if self.is_time_to('validate'):
+                        self.validate()
 
     @tf.function    # turn off to debug, e.g. with plt
     def grad(self, input_imgs, input_Ks, trainables):
@@ -459,7 +464,7 @@ class Trainer:
             outputs = self.process_batch(input_imgs, input_Ks)
             total_loss = self.compute_losses(input_imgs, outputs)
             grads = tape.gradient(total_loss, trainables)
-            if self.global_step % self.opt.record_freq == 0:
+            if self.is_time_to('print_loss'):
                 tf.print("loss: ", self.losses['loss/total'], output_stream=sys.stdout)
             # # collect data
             # early_phase = self.batch_idx % self.summary_freq == 0 and self.global_step < 2000
@@ -487,17 +492,42 @@ class Trainer:
 
     def train(self):
         if not self.opt.train_pose and not self.opt.train_depth:
-            print("specify a model to train")
+            print("Please specify a model to train")
             return
 
-        data_iter = self.data_loader.build_combined_dataset(include_depth=self.opt.include_depth)
         if self.opt.recording:
             train_log_dir = self.opt.record_summary_path + self.opt.model_name + "/" + self.opt.run_mode
             self.train_sum_writer = tf.summary.create_file_writer(train_log_dir)
             print('\tSummary will be stored in %s ' % train_log_dir)
         # for epoch in range(self.opt.num_epochs):
         print("->Start training...")
-        self.start_training(data_iter)
+        self.start_training()
+
+    def start_validating(self, input_imgs, input_Ks):
+        outputs = self.process_batch(input_imgs, input_Ks)
+        total_loss = self.compute_losses(input_imgs, outputs)
+
+        if 'depth_gt' in input_imgs.keys():
+            self.losses.update(
+                self.compute_depth_losses(input_imgs, outputs)
+            )
+        # ----------
+        # log val losses and delete
+        # ----------
+        print('-> Validating losses by depth ground-truth: ')
+        val_loss_str = ''
+        for k in list(self.losses):
+            if k in self.depth_metric_names:
+                val_loss_str = ''.join([val_loss_str, '{}: {} | '.format(k, self.losses[k])])
+                del self.losses[k]
+
+        val_loss_str = ''.join([val_loss_str, 'total_loss: {}'.format(total_loss)])
+        tf.print('\t', val_loss_str, output_stream=sys.stdout)
+
+    def validate(self):
+        batch = self.val_iter.get_next()
+        input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+        self.start_validating(input_imgs, input_Ks)
 
     def save_models(self, not_saved=()):
         weights_path = os.path.join(self.opt.save_model_path, 'weights_%d' % self.weights_idx)
@@ -542,57 +572,54 @@ class Trainer:
                 tf.summary.image('scale{}_automask_image'.format(s),
                                  self.pred_auto_masks[s], step=self.epoch_cnt)
 
-    def compute_depth_losses(self, input_imgs, outputs, losses):
+    def compute_depth_losses(self, input_imgs, outputs):
         """Compute depth metrics, to allow monitoring during training
         -> Only for KITTI-RawData, where velodyne depth map is valid !!!
 
         This isn't particularly accurate as it averages over the entire batch,
         so is only used to give an indication of validation performance
         """
+        losses = {}
         depth_pred = outputs[("depth", 0, 0)]
-        depth_pred = tf.clip_by_value(tf.image.resize(depth_pred, [375, 1242]), 1e-3, 80)
-        depth_pred = depth_pred.detach()
+        assert depth_pred.shape[1] == 375   # size should be [B, 375, 1242]
+        depth_pred = tf.clip_by_value(depth_pred, 1e-3, 80)
 
         depth_gt = input_imgs["depth_gt"]
-        mask = depth_gt > 0
+        mask = tf.cast(depth_gt > 0, tf.int32)
 
         # garg/eigen crop
-        crop_mask = tf.zeros_like(mask)
+        # crop_mask = tf.zeros_like(mask)
+        crop_mask = np.zeros(shape=mask.shape, dtype=np.int32)
         crop_mask[:, :, 153:371, 44:1197] = 1
         mask = mask * crop_mask
 
-        depth_gt = depth_gt[mask]
-        depth_pred = depth_pred[mask]
-        depth_pred *= np.median(depth_gt) / np.median(depth_pred)
+        depth_gt_masked = depth_gt[mask]
+        depth_pred_masked = depth_pred[mask]
+        depth_pred_med = depth_pred_masked * np.median(depth_gt_masked) / np.median(depth_pred_masked)
 
-        depth_pred = tf.clip_by_value(depth_pred, min=1e-3, max=80)
+        depth_pred_final = tf.clip_by_value(depth_pred_med, min=1e-3, max=80)
 
-        depth_errors = compute_depth_errors(depth_gt, depth_pred)
-        self.depth_metric_names = [
-            "de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms", "da/a1", "da/a2", "da/a3"]
+        depth_errors = compute_depth_errors(depth_gt_masked, depth_pred_final)
 
         for i, metric in enumerate(self.depth_metric_names):
-            losses[metric] = np.array(depth_errors[i].cpu())
+            losses[metric] = depth_errors[i]
 
-    # def is_time_to_flush(self):
-    #     decision = False
-    #     if self.global_step < 2000 and self.batch_idx % (self.summary_freq * 2) == 0:
-    #         decision = True
-    #     elif self.global_step >= 2000 and self.is_time_to_collect():
-    #         decision = True
-    #     if decision:
-    #         tf.print("data is flushed in step ", self.global_step, output_stream=sys.stdout)
-    #     return decision
-    #
-    # def is_time_to_collect(self):
-    #     if self.train_sum_writer is None:
-    #         return False
-    #     early_phase = self.batch_idx % self.summary_freq == 0 and self.global_step < 2000
-    #     late_phase = self.global_step % 2000 == 0
-    #     decision = early_phase or late_phase
-    #     if decision:
-    #         tf.print("data is collected in step ", self.global_step, output_stream=sys.stdout)
-    #     return decision
+        return losses
+
+    def is_time_to(self, event):
+        is_time = False
+        events = {0: 'print_loss', 1: 'save_model', 2: 'validate'}
+        if event not in events.values():
+            raise NotImplementedError
+
+        if event == events[0] and self.global_step % self.opt.record_freq == 0:
+            is_time = True
+        elif event == 'save_model' and (self.global_step + 1) % (self.train_loader.steps_per_epoch // 2) == 0:
+            is_time = True
+        elif event == 'validate' and (self.global_step + 1) % (self.train_loader.steps_per_epoch // 3) == 0:
+            is_time = True
+
+        return is_time
 
 
 if __name__ == '__main__':
