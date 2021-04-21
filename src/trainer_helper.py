@@ -5,8 +5,9 @@ import matplotlib.pyplot as plt
 
 
 def build_models(models_dict, check_outputs=False, show_summary=False):
+    print("->Building models")
     for k, m in models_dict.items():
-        print(k)
+        print("\t%s" % k)
         if "depth_enc" == k:
             inputs = tf.random.uniform(shape=(1, 192, 640, 3))
             outputs = m(inputs)
@@ -34,9 +35,12 @@ def build_models(models_dict, check_outputs=False, show_summary=False):
             else:
                 for elem in outputs:
                     print(elem.shape)
+
         if show_summary:
             m.summary()
+
     return models_dict
+
 
 def SSIM(x, y):
     C1 = 0.01 ** 2
@@ -60,27 +64,39 @@ def SSIM(x, y):
     return res
 
 
-
 def compute_depth_errors(gt, pred):
     """Computation of error metrics between predicted and ground truth depths
     Not in use for now
     """
-    thresh = np.max((gt / pred), (pred / gt))
-    a1 = (thresh < 1.25     ).float().mean()
-    a2 = (thresh < 1.25 ** 2).float().mean()
-    a3 = (thresh < 1.25 ** 3).float().mean()
+    # 1 - percentile
+    thresh = tf.math.maximum((gt / pred), (pred / gt))
+    a = [None] * 3
+    for i in range(len(a)):
+        a[i] = tf.reduce_mean(tf.cast(
+            thresh < 1.25**(i+1), dtype=tf.float32)
+        )
+    # a1 = (thresh < 1.25     ).float().mean()
+    # a2 = (thresh < 1.25 ** 2).float().mean()
+    # a3 = (thresh < 1.25 ** 3).float().mean()
 
-    rmse = (gt - pred) ** 2
-    rmse = tf.math.sqrt(rmse.mean())
+    # 2 - rooted mean squared error
+    rmse = tf.math.sqrt(tf.reduce_mean(
+        (gt - pred) ** 2
+    ))
 
-    rmse_log = (tf.math.log(gt) - tf.math.log(pred)) ** 2
-    rmse_log = tf.math.sqrt(rmse_log.mean())
+    # 3 - log rmse
+    # rmse_log = (tf.math.log(gt) - tf.math.log(pred)) ** 2
+    # rmse_log = tf.math.sqrt(rmse_log.mean())
+    rmse_log = tf.math.sqrt(tf.reduce_mean(
+        (tf.math.log(gt) - tf.math.log(pred)) ** 2
+    ))
 
-    abs_rel = np.mean(tf.abs(gt - pred) / gt)
+    # 4 - absolute relative error
+    abs_rel = tf.reduce_mean(tf.abs(gt - pred) / gt)
+    # 5 - squared relative error
+    sq_rel = tf.reduce_mean((gt - pred) ** 2 / gt)
 
-    sq_rel = np.mean((gt - pred) ** 2 / gt)
-
-    return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
+    return abs_rel, sq_rel, rmse, rmse_log, a[0], a[1], a[2]
 
 
 def colorize(value, vmin=None, vmax=None, cmap=None):
@@ -97,6 +113,7 @@ def colorize(value, vmin=None, vmax=None, cmap=None):
     colors = tf.constant(cm.colors, dtype=tf.float32)
     value = tf.gather(colors, indices)
     return value
+
 
 def normalize_image(x):
     """Rescale image pixels to span range [0, 1]
@@ -143,18 +160,16 @@ def project_3d(points, K, T, shape, scale):
 class Project3D:
     def __init__(self, shape, scale):
         super(Project3D, self).__init__()
-        self.batch_size, height, width, _ = shape
+        _, height, width, _ = shape
         self.height, self.width = height // (2 ** scale), width // (2 ** scale)
         self.eps = 1e-7
 
     def run_func(self, points, K, T):
-    # def call(self, points, K, T):
         P = tf.matmul(K, T)[:, :3, :]
 
         cam_points = tf.matmul(P, points)
-
         pix_coords = cam_points[:, :2, :] / (tf.expand_dims(cam_points[:, 2, :], axis=1) + self.eps)
-        pix_coords = tf.reshape(pix_coords, (self.batch_size, 2, self.height, self.width))
+        pix_coords = tf.reshape(pix_coords, (points.shape[0], 2, self.height, self.width))
         pix_coords = tf.transpose(pix_coords, [0, 2, 3, 1])
 
         pix_coords_0 = pix_coords[..., 0]
@@ -172,18 +187,18 @@ class Project3D:
 class BackProjDepth:
     def __init__(self, shape, scale):
         super(BackProjDepth, self).__init__()
-        self.batch_size, height, width, _ = shape
+        batch_size, height, width, _ = shape
         height, width = height // (2 ** scale), width // (2 ** scale)
 
         meshgrid = tf.meshgrid(range(width), range(height), indexing='xy')
         id_coords = tf.stack(meshgrid, axis=0)
-        ones = tf.ones((self.batch_size, 1, height * width), dtype=tf.int32)
+        ones = tf.ones((batch_size, 1, height * width), dtype=tf.int32)
 
         pix_coords = tf.expand_dims(
             tf.stack([tf.reshape(id_coords[0], [-1]),
                       tf.reshape(id_coords[1], [-1])], 0), 0)
         # - tile/repeat
-        multiples = tf.constant([self.batch_size, 1, 1])
+        multiples = tf.constant([batch_size, 1, 1])
         pix_coords = tf.tile(pix_coords, multiples)
 
         pix_coords = tf.concat([pix_coords, ones], 1)
@@ -192,10 +207,15 @@ class BackProjDepth:
         self.ones = tf.cast(ones, tf.float32)
 
     def run_func(self, depth, inv_K):
-    # def call(self, depth, inv_K):
-        cam_points = tf.matmul(inv_K[:, :3, :3], self.pix_coords)
-        cam_points = tf.reshape(depth, (self.batch_size, 1, -1)) * cam_points
-        cam_points = tf.concat([cam_points, self.ones], 1)
+        batch_size = inv_K.shape[0]
+        pix_coords = self.pix_coords
+        ones = self.ones
+        if batch_size != self.pix_coords.shape[0]:
+            pix_coords = tf.slice(pix_coords, [0, 0, 0], [batch_size, -1, -1])
+            ones = tf.slice(ones, [0, 0, 0], [batch_size, -1, -1])
+        cam_points = tf.matmul(inv_K[:, :3, :3], pix_coords)
+        cam_points = tf.reshape(depth, (batch_size, 1, -1)) * cam_points
+        cam_points = tf.concat([cam_points, ones], 1)
         return cam_points
 
 
@@ -209,13 +229,11 @@ def back_proj_depth(depth, inv_K, shape, scale):
 
     meshgrid = tf.meshgrid(range(width), range(height), indexing='xy')
     id_coords = tf.stack(meshgrid, axis=0)
-
     ones = tf.ones((batch_size, 1, height * width), dtype=tf.int32)
 
     pix_coords = tf.expand_dims(
         tf.stack([tf.reshape(id_coords[0], [-1]),
                   tf.reshape(id_coords[1], [-1])], 0), 0)
-
     # - tile/repeat
     multiples = tf.constant([batch_size, 1, 1])
     pix_coords = tf.tile(pix_coords, multiples)
