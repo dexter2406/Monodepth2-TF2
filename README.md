@@ -42,15 +42,18 @@ Note：It's trained on *Odometry* split, so if applied on *Raw* data, the result
 - [X] Pose encoder: multi-image-input version of the encoder
 - [X] Pose decoder
 - [X] training code
+- [X] validation code in training
+- [X] modify data loader to accept more dataset (*KITTI_Raw* and *KITTI_Odom*)
 - [ ] evluation code
 - [ ] simple test code
-- [ ] modify data loader to accept more dataset
 - [ ] try new stuff in similar papers, e.g. *struct2dpeth*
 
 ### Note up-to-date
-Now you can train your own model using the `train.py` and `new_trainer.py`. For now I just trained for 1 epoch, and the results (the reconstructed image and the disp image) seem to head to the correct way. Next step will be:
-- completing the *evaluate* code.
-- modify the code to take more dataset (for now only *KITTI_Raw* is supported), e.g. *KITTI_Odometry* and *Cityscapes*
+Now you can train your own model using the `train.py` and `new_trainer.py`. For now I just trained for 1 epoch, and the results seem to head to the correct way. See the reconstructed image and the disp image under *assets/first_epoch_res.jpg*. 
+
+Next step will be:
+- completing the *evaluatiion* code.
+- try new stuff in similar papers, e.g. *struct2dpeth* to improve the model
 
 ---
 
