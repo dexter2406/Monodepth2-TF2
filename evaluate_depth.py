@@ -4,18 +4,20 @@ import os
 from models.depth_decoder_creater import DepthDecoder_full
 from models.encoder_creater import ResNet18_new
 from src.trainer_helper import build_models
-from src.dataset_loader_kitti_raw import DataLoader_KITTI_Raw
+
+from datasets.dataset_kitti import KITTIRaw, KITTIOdom
+from datasets.data_loader_kitti import DataLoader
 from src.DataPprocessor import DataProcessor
 from src.eval_helper import compute_errors
 from options import get_options
 import cv2 as cv
 
 
-root_dir = os.path.dirname(__file__)
+root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 splits_dir = os.path.join(root_dir, "splits")
 
 
-def evaluate(opt):
+def evaluate_depth(opt):
     """Evaluates a pretrained model using a specified test set
     """
     MIN_DEPTH = 1e-3
@@ -41,19 +43,21 @@ def evaluate(opt):
         # ----------
         # Get dataset
         # ----------
-        data_loader = DataLoader_KITTI_Raw(opt.num_epochs, opt.batch_size, debug_mode=opt.debug_mode,
-                                           dataset_for='eval', split_name='eigen_zhou')
-        dataset = data_loader.build_dataset()
-        dataset_iter = iter(dataset)
-        batch_processor = DataProcessor()
+        split_folder = os.path.join('splits', opt.eval_split)
+        split_name = 'test_files.txt'.format(opt.eval_split)
+        dataset = KITTIRaw(split_folder, split_name, data_path=opt.data_path)
+        data_loader = DataLoader(dataset, num_epoch=1,
+                                 batch_size=2, frame_idx=opt.frame_idx)
+        eval_iter = data_loader.build_eval_dataset()
+        batch_processor = DataProcessor(frame_idx=opt.frame_idx, intrinsics=dataset.K)
 
         # ----------
         # Generate predicted disparity map
         # ----------
         pred_disps = []
         for i in range(len(filenames)):
-            batch = dataset_iter.get_next()
-            input_imgs, input_Ks = batch_processor.prepare_batch(batch[..., :3], batch[..., 3:])
+            batch = eval_iter.get_next()
+            input_imgs, input_Ks = batch_processor.prepare_batch(batch)
             input_color = input_imgs[('color', 0, 0)]
 
             output = models['depth_dec'](models['depth_enc'](input_color))
@@ -74,7 +78,7 @@ def evaluate(opt):
             pred_disps = pred_disps[eigen_to_benchmark_ids]
 
     if opt.save_pred_disps:
-        output_dir = os.path.join(root_dir, 'output_disps')
+        output_dir = os.path.join(root_dir, 'outputs', 'disps')
         if not os.path.isdir(output_dir):
             os.makedirs(output_dir)
         output_path = os.path.join(output_dir, 'disps_{}_split.npy'.format(opt.eval_split))
@@ -140,4 +144,4 @@ def evaluate(opt):
 
 if __name__ == "__main__":
     options = get_options()
-    evaluate(options)
+    evaluate_depth(options)
