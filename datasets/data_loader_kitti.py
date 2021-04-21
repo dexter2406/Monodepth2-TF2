@@ -16,9 +16,7 @@ class DataLoader(object):
     def __init__(self, dataset,
                  num_epoch, batch_size, frame_idx,
                  dataset_for='train'):
-        # self.root = r"D:\MA\Struct2Depth\KITTI_odom_02\image_2\left"
         self.dataset = dataset
-        self.is_train = True if 'train' in dataset_for else False
         self.num_epoch = num_epoch
         self.batch_size = batch_size
         self.buffer_size = 1000  # todo: how to set good buffer size?
@@ -29,7 +27,8 @@ class DataLoader(object):
         self.num_items: int = None
         self.read_filenames()
         self.data_path = self.dataset.data_path
-        self.include_depth = self.has_depth_file()
+        self.include_depth = None
+        self.has_depth = self.has_depth_file()
 
     def print_info(self):
         if 'odom' in self.dataset.data_path:
@@ -86,7 +85,7 @@ class DataLoader(object):
         calib_path = os.path.join(self.data_path, img_str_split[-5])
         return calib_path, depth_full_path, side
 
-    def parse_include_depth(self, tgt_path):
+    def parse_helper_get_depth(self, tgt_path):
         """Get depth gt, helper for parse_func_combined()"""
         calib_path, depth_path, side = self.derive_depth_path_from_img(tgt_path)
         depth_gt = generate_depth_map(calib_path, depth_path, side)
@@ -95,11 +94,7 @@ class DataLoader(object):
         depth_gt = tf.constant(depth_gt, dtype=tf.float32)
         return depth_gt
 
-    def parse_func_combined(self, filepath, resized_to=(192, 640)):
-        """Decode filenames to images
-        Givn one file, find the neighbors and concat to shape [192,640,9]
-        """
-        # index, img_ext = bytes.decode(filepath.numpy()).split("\\")[-1].split(".")
+    def parse_helper_get_image(self, filepath, resized_to=(192, 640)):
         full_path = bytes.decode(filepath.numpy())
         file_root, file_name = os.path.split(full_path)
         image_idx, image_ext = file_name.split('.')
@@ -123,40 +118,62 @@ class DataLoader(object):
             image = tf.image.convert_image_dtype(image, tf.float32)
             image_stack[i] = tf.image.resize(image, resized_to)
         output_imgs = tf.concat(image_stack, axis=2)
+        return output_imgs, tgt_path
 
+    def parse_func_combined(self, filepath, resized_to=(192, 640)):
+        """Decode filenames to images
+        Givn one file, find the neighbors and concat to shape [192,640,9]
+        """
+        # parse images
+        output_imgs, tgt_path = self.parse_helper_get_image(filepath, resized_to)
+
+        # parse depth_gt
         depth_gt = None
         if self.include_depth:
-            depth_gt = self.parse_include_depth(tgt_path)
+            depth_gt = self.parse_helper_get_depth(tgt_path)
 
         return output_imgs, depth_gt
 
-    def build_combined_dataset(self, include_depth=None):
+    def build_train_dataset(self):
+        return self.build_combined_dataset(is_train=True, include_depth=False)
+
+    def build_val_dataset(self):
+        return self.build_combined_dataset(is_train=False, include_depth=True)
+
+    def build_eval_dataset(self):
+        # todo: verify file numbers
+        return self.build_combined_dataset(is_train=False, include_depth=False,
+                                           shuffle=False, drop_last=False)
+
+    def build_combined_dataset(self, is_train, include_depth, drop_last=True, shuffle=True):
         # Data path
         data = self.collect_image_files()
         dataset = tf.data.Dataset.from_tensor_slices(data)
-
         # ----------
         # Generate dataset by file paths.
         # - if include depth, generate dataset giving (images, depths), other wise only images
         # - can be manually turned off
-        if include_depth is not None and include_depth is False:
-            self.include_depth = include_depth  # manual override is only for turning-off
-        elif include_depth is True and not self.include_depth:
+        if not include_depth:
+            self.include_depth = include_depth
+        elif include_depth and not self.has_depth:
             warnings.warn('Will not use depth gt, because no available depth file found')
         # the outputs are implicitly handled by 'out_maps'
         out_maps = [tf.float32, tf.float32] if self.include_depth else tf.float32
         dataset = dataset.map(lambda x: tf.py_function(self.parse_func_combined, [x], Tout=out_maps),
                               num_parallel_calls=tf.data.experimental.AUTOTUNE)
         # ----------
+        if shuffle:
+            buffer_size = self.buffer_size if is_train else 200
+            dataset = dataset.shuffle(buffer_size=buffer_size, reshuffle_each_iteration=is_train)
 
-        if self.is_train:
-            dataset = dataset.shuffle(buffer_size=self.buffer_size, reshuffle_each_iteration=True)
-        dataset = dataset.batch(self.batch_size, True)
-        if self.is_train:
+        dataset = dataset.batch(self.batch_size, drop_remainder=drop_last)
+
+        if is_train:
             dataset = dataset.repeat(self.num_epoch)
         dataset = dataset.prefetch(1)
         data_iter = iter(dataset)
         return data_iter
+
 
     def has_depth_file(self):
         line = self.filenames[0].split()
