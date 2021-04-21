@@ -9,7 +9,7 @@ all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_enc']
 FLAGS = flags.FLAGS
 
 # Pre-settings
-flags.DEFINE_string('weights_dir', './logs/weights/epoch_1',  'the folder that stores weights files.')
+flags.DEFINE_string('weights_dir', r'.\logs\weights\epoch_4\weights_0',  'the folder that stores weights files.')
 flags.DEFINE_list('models_to_load', all_models,
                   'load weights for specified models, by default all of them')
 flags.DEFINE_string('model_name', curren_time, 'specify a dirname to collect weights, if not, current time is used')
@@ -17,14 +17,13 @@ flags.DEFINE_bool('train_depth', True, 'whether to train depth decoder-encoder')
 flags.DEFINE_bool('train_pose', True, 'whether to train pose decoder-encoder')
 flags.DEFINE_bool('from_scratch', False, 'whether trained from scratch, coorperate with load_weights_folder')
 flags.DEFINE_string('save_model_path', '', 'path where weights are saved')
-flags.DEFINE_string('dataset', 'kitti_raw', 'choose from [\'kitti_raw\', \'kitti_odom\']')
-flags.DEFINE_bool('include_depth', False, 'whether to use depth gt')
-flags.DEFINE_string('data_path', r'F:\Dataset\kitti_raw', 'path that stores dataset')
+flags.DEFINE_string('data_path', r'F:\Dataset\kitti_raw', 'path that stores corresponding dataset')
+flags.DEFINE_string('dataset', 'kitti_raw', 'specify a dataset, choices from [\'kitti_raw\', \'kitti_odom\']')
 
 # Training
-flags.DEFINE_string('run_mode', 'train', 'train or eval')
+flags.DEFINE_string('run_mode', 'train', 'choose from [\'train\', \'eval_depth\', \'eval_pose\']')
 flags.DEFINE_string('split', 'eigen_zhou', 'training split, choose from: '
-                                      '["eigen_zhou", "eigen_full", "odom", "benchmark"]')
+                                           '["eigen_zhou", "eigen_full", "odom", "benchmark"]')
 flags.DEFINE_bool('recording', False, 'whether to write results by tf.summary')
 flags.DEFINE_string('record_summary_path', 'logs/gradient_tape/', 'root path to write summary')
 flags.DEFINE_integer('record_freq', 250, 'frequency to record')
@@ -56,9 +55,7 @@ flags.DEFINE_float('pred_depth_scale_factor', 1., 'additional depth scaling fact
 flags.DEFINE_bool('use_median_scaling', True, 'use median filter to calculate scaling ratio')
 flags.DEFINE_string('eval_split', 'eigen', 'evaluation split, choose from: '
                                            '["eigen", "eigen_benchmark", "benchmark", "odom_9", "odom_10"]')
-
 flags.mark_flag_as_required('run_mode')
-flags.mark_flag_as_required('include_depth')
 
 
 def get_options():
