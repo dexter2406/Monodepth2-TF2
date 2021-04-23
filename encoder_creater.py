@@ -2,101 +2,6 @@ import tensorflow as tf
 from tensorflow.keras.layers import Conv2D, BatchNormalization, Activation, MaxPool2D, Dropout, Flatten, Dense
 
 
-class BasicBlock(tf.keras.layers.Layer):
-
-    def __init__(self, filter_num, stride=1, block_id=-1, layer_id=-1):
-        super(BasicBlock, self).__init__()
-        prefix = 'conv%d_%d/' % (block_id, layer_id)
-        # 1
-        self.conv1 = Conv2D(filters=filter_num, kernel_size=(3, 3), strides=stride,
-                            use_bias=False, padding="same", name=''.join([prefix, 'conv_1']))
-        self.bn1 = BatchNormalization(name=''.join([prefix, 'BatchNorm_1']))
-        self.a1 = Activation('relu')
-        # 2
-        self.conv2 = Conv2D(filters=filter_num, kernel_size=(3, 3),
-                            use_bias=False, padding="same")
-        self.bn2 = BatchNormalization(name=''.join([prefix, 'BatchNorm_2']))
-        # residual_path为True时，对输入进行下采样，即用1x1的卷积核做卷积操作，保证x能和F(x)维度相同，顺利相加
-        if stride != 1:
-            self.downsample = tf.keras.Sequential()
-            self.downsample.add(Conv2D(filters=filter_num, kernel_size=(1, 1), strides=stride,
-                                       use_bias=False, padding="same", name=''.join([prefix, 'downsample'])))
-            self.downsample.add(BatchNormalization(name='downsample/BatchNorm_3'))
-        else:
-            self.downsample = lambda x: x
-        # 最后的relu
-        self.a2 = Activation('relu')
-
-    def call(self, x, training=None, **kwargs):
-        out = self.conv1(x)
-        out = self.bn1(out, training=training)
-        out = self.a1(out)
-        out = self.conv2(out, training=training)
-        out = self.bn2(out)
-
-        identity = self.downsample(x)
-
-        out = tf.keras.layers.add([identity, out])
-        out = self.a2(out)
-        return out
-
-
-class ResNet18_new(tf.keras.Model):
-    def __init__(self, block_list, initial_filters=64, padding_mode='constant'):
-        super(ResNet18_new, self).__init__()
-        padding = 'valid' if padding_mode != 'same' else 'same'
-        padding_options = {'reflect': {'mode': 'REFLECT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]},
-                           'constant': {'mode': 'CONSTANT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]}}
-        self.pad_3 = padding_options[padding_mode]
-
-        self.num_blocks = len(block_list)  # 共有几个block
-        self.block_list = block_list
-        self.out_filters = initial_filters
-
-        self.conv1 = Conv2D(filters=self.out_filters, kernel_size=(7, 7), strides=2,
-                            use_bias=False, padding=padding, name='conv0')
-        self.bn1 = BatchNormalization(name='conv0/BatchNorm')
-        self.a1 = Activation('relu', name='conv0/ReLU')
-
-        self.pool1 = tf.keras.layers.MaxPool2D(pool_size=(3, 3), strides=2, padding="same", name='maxpool')
-
-        self.layer1 = self._make_basic_block_layer(filter_num=64, blocks=block_list[0], block_id=1)
-        self.layer2 = self._make_basic_block_layer(filter_num=128, blocks=block_list[1], stride=2, block_id=2)
-        self.layer3 = self._make_basic_block_layer(filter_num=256, blocks=block_list[2], stride=2, block_id=3)
-        self.layer4 = self._make_basic_block_layer(filter_num=512, blocks=block_list[3], stride=2, block_id=4)
-
-    def _make_basic_block_layer(self, filter_num, blocks, stride=1, block_id=-1):
-        res_block = tf.keras.Sequential(name='seq_%d' % block_id)
-        res_block.add(BasicBlock_pad(filter_num, stride=stride, block_id=block_id, layer_id=1, padding_mode='constant'))
-
-        for i in range(1, blocks):
-            res_block.add(BasicBlock(filter_num, stride=1, block_id=block_id, layer_id=i + 1))
-
-        return res_block
-
-    def call(self, inputs, training=None, mask=None):
-        outputs = []
-        # ----- PADDING -----
-        x = tf.pad(inputs, **self.pad_3)
-        # ----- PADDING -----
-        x = self.conv1(x)
-        x = self.bn1(x, training=training)
-        x = self.a1(x)
-        outputs.append(x)
-        x = self.pool1(x)
-
-        x = self.layer1(x, training=training)
-        outputs.append(x)
-        x = self.layer2(x, training=training)
-        outputs.append(x)
-        x = self.layer3(x, training=training)
-        outputs.append(x)
-        x = self.layer4(x, training=training)
-        outputs.append(x)
-
-        return outputs
-
-
 class BasicBlock_pad(tf.keras.layers.Layer):
 
     def __init__(self, filter_num, stride=1, padding_mode='reflect', block_id=-1, layer_id=-1):
@@ -146,7 +51,6 @@ class BasicBlock_pad(tf.keras.layers.Layer):
         out = tf.keras.layers.add([identity, out])
         out = self.a2(out)
         return out
-
 
 
 def check_weights(enc_weights):
@@ -215,7 +119,6 @@ def check_model(model_path=None, keras=False, pb=False):
     if model_path is None:
         print("please specify name")
         return
-
     if keras:
         encoder_reload = tf.keras.models.load_model(model_path)
         print("reloaded")
@@ -261,9 +164,108 @@ def build_pose_encoder_pair_input(verbose=False):
     return pose_encoder
 
 
+"""Previous Version"""
+# BasicBlock and BasicBlock_pad 是分开的
+class BasicBlock_nopad(tf.keras.layers.Layer):
+
+    def __init__(self, filter_num, stride=1, block_id=-1, layer_id=-1):
+        super(BasicBlock_nopad, self).__init__()
+        prefix = 'conv%d_%d/' % (block_id, layer_id)
+        # 1
+        self.conv1 = Conv2D(filters=filter_num, kernel_size=(3, 3), strides=stride,
+                            use_bias=False, padding="same", name=''.join([prefix, 'conv_1']))
+        self.bn1 = BatchNormalization(name=''.join([prefix, 'BatchNorm_1']))
+        self.a1 = Activation('relu')
+        # 2
+        self.conv2 = Conv2D(filters=filter_num, kernel_size=(3, 3),
+                            use_bias=False, padding="same")
+        self.bn2 = BatchNormalization(name=''.join([prefix, 'BatchNorm_2']))
+        # residual_path为True时，对输入进行下采样，即用1x1的卷积核做卷积操作，保证x能和F(x)维度相同，顺利相加
+        if stride != 1:
+            self.downsample = tf.keras.Sequential()
+            self.downsample.add(Conv2D(filters=filter_num, kernel_size=(1, 1), strides=stride,
+                                       use_bias=False, padding="same", name=''.join([prefix, 'downsample'])))
+            self.downsample.add(BatchNormalization(name='downsample/BatchNorm_3'))
+        else:
+            self.downsample = lambda x: x
+        # 最后的relu
+        self.a2 = Activation('relu')
+
+    def call(self, x, training=None, **kwargs):
+        out = self.conv1(x)
+        out = self.bn1(out, training=training)
+        out = self.a1(out)
+        out = self.conv2(out, training=training)
+        out = self.bn2(out)
+
+        identity = self.downsample(x)
+
+        out = tf.keras.layers.add([identity, out])
+        out = self.a2(out)
+        return out
+
+
+class ResNet18_new(tf.keras.Model):
+    def __init__(self, block_list=(2, 2, 2, 2), initial_filters=64, padding_mode='constant'):
+        super(ResNet18_new, self).__init__()
+        padding = 'valid' if padding_mode != 'same' else 'same'
+        padding_options = {'reflect': {'mode': 'CONSTANT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]},
+                           'constant': {'mode': 'CONSTANT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]}}
+        self.pad_3 = padding_options[padding_mode]
+
+        self.num_blocks = len(block_list)  # 共有几个block
+        self.block_list = block_list
+        self.out_filters = initial_filters
+
+        self.conv1 = Conv2D(filters=self.out_filters, kernel_size=(7, 7), strides=2,
+                            use_bias=False, padding=padding, name='conv0')
+        self.bn1 = BatchNormalization(name='conv0/BatchNorm')
+        self.a1 = Activation('relu', name='conv0/ReLU')
+
+        self.pool1 = tf.keras.layers.MaxPool2D(pool_size=(3, 3), strides=2, padding="same", name='maxpool')
+
+        self.layer1 = self._make_basic_block_layer(filter_num=64, blocks=block_list[0], block_id=1)
+        self.layer2 = self._make_basic_block_layer(filter_num=128, blocks=block_list[1], stride=2, block_id=2)
+        self.layer3 = self._make_basic_block_layer(filter_num=256, blocks=block_list[2], stride=2, block_id=3)
+        self.layer4 = self._make_basic_block_layer(filter_num=512, blocks=block_list[3], stride=2, block_id=4)
+
+    def _make_basic_block_layer(self, filter_num, blocks, stride=1, block_id=-1):
+        res_block = tf.keras.Sequential(name='seq_%d' % block_id)
+        res_block.add(BasicBlock_pad(filter_num, stride=stride, block_id=block_id, layer_id=1, padding_mode='constant'))
+
+        for i in range(1, blocks):
+            res_block.add(BasicBlock_nopad(filter_num, stride=1, block_id=block_id, layer_id=i + 1))
+
+        return res_block
+
+    def call(self, inputs, training=None, mask=None):
+        outputs = []
+        # ----- PADDING -----
+        x = tf.pad(inputs, **self.pad_3)
+        # ----- PADDING -----
+        x = self.conv1(x)
+        x = self.bn1(x, training=training)
+        x = self.a1(x)
+        outputs.append(x)
+        x = self.pool1(x)
+        x = self.layer1(x, training=training)
+
+        outputs.append(x)
+        x = self.layer2(x, training=training)
+        outputs.append(x)
+        x = self.layer3(x, training=training)
+        outputs.append(x)
+        x = self.layer4(x, training=training)
+        outputs.append(x)
+
+        return outputs
+
+
 if __name__ == '__main__':
     # set_weights_enc()
     # check_model("models/pose_encoder_one_input", keras=True, pb=False)
     pose_encoder = build_pose_encoder_pair_input(verbose=False)
     pose_encoder.summary()
-    # tf.keras.models.save_model(pose_encoder, "models/pose_encoder")
+    tf.keras.models.save_model(pose_encoder, "models/pose_encoder")
+
+
