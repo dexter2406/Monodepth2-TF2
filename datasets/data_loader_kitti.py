@@ -153,9 +153,9 @@ class DataLoader(object):
         # Generate dataset by file paths.
         # - if include depth, generate dataset giving (images, depths), other wise only images
         # - can be manually turned off
-        if not include_depth:
-            self.include_depth = include_depth
-        elif include_depth and not self.has_depth:
+        self.include_depth = include_depth
+        if include_depth and not self.has_depth:
+            self.include_depth = False
             warnings.warn('Will not use depth gt, because no available depth file found')
         # the outputs are implicitly handled by 'out_maps'
         out_maps = [tf.float32, tf.float32] if self.include_depth else tf.float32
