@@ -20,17 +20,21 @@ I'm using a normal GTX1060-MaxQ GPU. The FPS for single-image depth estimation:
 Use `@tf.function` decorator for `Train.grad()` and `DataPprocessor.prepare_batch()` will allow much larger `batch_size`
 ```
 # Start training (from scratch):
-python train.py --from_scratch
+python Start.py --run_mode train --from_scratch True --data_path <path_to_kiiti>
 
 # Continue training:
-python train.py --weights_dir <weights_folder_path>
-
-# To see intermediate result:
-# remember to comment "tf.function" decorator for Train.grad() and DataPprocessor.prepare_batch()
-python train.py --weights_dir <folder_path> --debug_mode True
+python Start.py --run_mode train --weights_dir <weights_folder_path> --data_path <path_to_kiiti>
 ```
-Check `train.py` file for more details.
-
+Check intermediate result:
+- method 1: run training code
+```
+# remember to comment "tf.function" decorator for Train.grad() and DataPprocessor.prepare_batch()
+python train.py --weights_dir <folder_path> --debug_mode True --data_path <path_to_kiiti>
+```
+- method 2: run simple_run.py (recommanded, details see Notes below)
+```
+python simple_run.py --weights_dir --data_path --save_result_to --save_concat_image
+```
 
 The models (transferred from official Pytorch model, trained on KITTI-Odometry dataset, size (640x192).):
 - [weights_all_4_models](https://drive.google.com/drive/folders/1hPLVCowqvypekJy4UAB_HHAt1xtqR-H_?usp=sharing) 
@@ -61,8 +65,8 @@ python simple_run.py --weights_dir --data_path --save_result_to --save_concat_im
 - save_concat_image: optional, show concatenated images with original image for comparison
 
 Next move:
-- [ ] training. For now I only train the model for 7 epoch. It's getting better but remains to be seen. Hope I could restore the official results.
-- [ ] try new stuff in similar papers, e.g. *struct2dpeth*
+- training. For now I only train the model for 7 epoch. It's getting better but remains to be seen. Hope I could restore the official results.
+- try new stuff in similar papers, e.g. *struct2dpeth*
 
 ---
 
