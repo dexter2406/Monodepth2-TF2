@@ -289,12 +289,12 @@ class Trainer:
 
             disp = tf.image.resize(disp_tf, (self.opt.height, self.opt.width))
             _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
-
+            if scale == 0:
+                outputs[('depth', 0, 0)] = depth
             # -----------------------------
             # outputs[("depth", 0, scale)] = depth
             # outputs_imp[("depth", 0, scale)] = depth
             # -----------------------------
-
             for i, f_i in enumerate(self.opt.frame_idx[1:]):
                 T = outputs[("cam_T_cam", 0, f_i)]
 
@@ -458,7 +458,7 @@ class Trainer:
                     if self.is_time_to('validate'):
                         self.validate()
 
-    @tf.function    # turn off to debug, e.g. with plt
+    # @tf.function    # turn off to debug, e.g. with plt
     def grad(self, input_imgs, input_Ks, trainables):
         with tf.GradientTape() as tape:
             outputs = self.process_batch(input_imgs, input_Ks)
@@ -526,7 +526,9 @@ class Trainer:
 
     def validate(self):
         batch = self.val_iter.get_next()
-        input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+        print('val batch ', type(batch), batch[0].shape, batch[1].shape)
+        # input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+        input_imgs, input_Ks = self.batch_processor.prepare_batch_val(batch)
         self.start_validating(input_imgs, input_Ks)
 
     def save_models(self, not_saved=()):
@@ -580,24 +582,26 @@ class Trainer:
         so is only used to give an indication of validation performance
         """
         losses = {}
-        depth_pred = outputs[("depth", 0, 0)]
-        assert depth_pred.shape[1] == 375   # size should be [B, 375, 1242]
-        depth_pred = tf.clip_by_value(depth_pred, 1e-3, 80)
-
         depth_gt = input_imgs["depth_gt"]
-        mask = tf.cast(depth_gt > 0, tf.int32)
+        mask = depth_gt > 0
+        depth_pred = outputs[("depth", 0, 0)]   # to be resized to (375, 1242)
+        depth_pred = tf.clip_by_value(
+            tf.image.resize(depth_pred, depth_gt.shape[1:-1]),
+            1e-3, 80
+        )
+        assert depth_pred.shape[1] == 375, \
+            'shape: {}, should be {}'.format(depth_pred.shape, depth_gt.shape[1:])
 
         # garg/eigen crop
-        # crop_mask = tf.zeros_like(mask)
-        crop_mask = np.zeros(shape=mask.shape, dtype=np.int32)
-        crop_mask[:, :, 153:371, 44:1197] = 1
-        mask = mask * crop_mask
+        crop_mask = np.zeros(shape=mask.shape, dtype=np.bool)
+        crop_mask[:, 153:371, 44:1197, :] = True
+        mask = mask.numpy() * crop_mask
 
-        depth_gt_masked = depth_gt[mask]
-        depth_pred_masked = depth_pred[mask]
+        depth_gt_masked = tf.boolean_mask(depth_gt, mask)
+        depth_pred_masked = tf.boolean_mask(depth_pred, mask)
         depth_pred_med = depth_pred_masked * np.median(depth_gt_masked) / np.median(depth_pred_masked)
 
-        depth_pred_final = tf.clip_by_value(depth_pred_med, min=1e-3, max=80)
+        depth_pred_final = tf.clip_by_value(depth_pred_med, 1e-3, 80)
 
         depth_errors = compute_depth_errors(depth_gt_masked, depth_pred_final)
 
@@ -614,9 +618,9 @@ class Trainer:
 
         if event == events[0] and self.global_step % self.opt.record_freq == 0:
             is_time = True
-        elif event == 'save_model' and (self.global_step + 1) % (self.train_loader.steps_per_epoch // 2) == 0:
+        elif event == events[1] and (self.global_step + 1) % (self.train_loader.steps_per_epoch // 2) == 0:
             is_time = True
-        elif event == 'validate' and (self.global_step + 1) % (self.train_loader.steps_per_epoch // 3) == 0:
+        elif event == events[2] and (self.global_step + 1) % (self.train_loader.steps_per_epoch // 10) == 0:
             is_time = True
 
         return is_time
