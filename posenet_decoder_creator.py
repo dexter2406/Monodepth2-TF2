@@ -6,7 +6,7 @@ import numpy as np
 class PoseDecoder(tf.keras.Model):
     def __init__(self, num_ch_enc, num_input_features=1, num_frames_to_predict_for=2, stride=1):
         super(PoseDecoder, self).__init__()
-
+        # (64, 64, 128, 256, 512)
         self.num_ch_enc = num_ch_enc
         self.num_input_features = num_input_features
         self.pose_scale = 0.01
@@ -24,14 +24,15 @@ class PoseDecoder(tf.keras.Model):
 
         pose_0_nopad = Conv2D(256, kernel_size=3, strides=stride, padding="valid", name='Conv_pose_0')
         pose_1_nopad = Conv2D(256, kernel_size=3, strides=stride, padding='valid', name='Conv_pose_1')
-        pose_2_nopad = Conv2D(6 * num_frames_to_predict_for, kernel_size=1, strides=1, name='Conv_pose_2')
+        pose_2_nopad = Conv2D(6*self.num_frames_to_predict_for, kernel_size=1, strides=1, name='Conv_pose_2')
         self.convs_pose = [pose_0_nopad, pose_1_nopad, pose_2_nopad]
 
     def call(self, input_features, training=None, mask=None):
-        # input_features = [f[-1] for f in input_features]  # if input have multiple sources: [5-features] * N
-        # cat_features = [self.relu(self.convs_squeeze(f)) for f in input_features]
-        # cat_features = tf.concat(out, 3)  # ch=3 for 'channel-last'
-        """ pass encoder-features one by one, not pairwise """
+        """ pass encoder-features pairwise
+        output: [Batch, 2, 3] for angles and translations, respectively,
+        - output[:, 0] is current->previous; output[:,1] for current->next
+        """
+
         last_features = input_features[-1]
         out = self.convs_squeeze(last_features)
         out = self.relu(out)
@@ -41,13 +42,13 @@ class PoseDecoder(tf.keras.Model):
             out = self.convs_pose[i](out)
             if i != 2:
                 out = self.relu(out)
-
         out = tf.reduce_mean(out, [1, 2], keepdims=True)
         out = tf.reshape(out, [-1, self.num_frames_to_predict_for, 1, 6])
         out = tf.cast(self.pose_scale, dtype=tf.float32) * out
 
         self.angles = out[..., 3:]
         self.translations = out[..., :3]
+
         return {"angles": self.angles, "translations": self.translations}
 
 
@@ -55,14 +56,40 @@ def build_posenet():
     num_ch_enc = [64, 64, 128, 256, 512]
     shapes = [(1, 64, 96, 320), (1, 48, 160, 64), (1, 24, 80, 128), (1, 12, 40, 256), (1, 6, 20, 512)]
     dummy_inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
-    pose_decoder = PoseDecoder(num_ch_enc, num_input_features=1, num_frames_to_predict_for=2, stride=1)
-    pose_decoder.predict(dummy_inputs)
-    return pose_decoder, dummy_inputs
+    pose_decoder = PoseDecoder(num_ch_enc, num_input_features=1, num_frames_to_predict_for=1, stride=1)
+    outputs = pose_decoder.predict(dummy_inputs)
+    return pose_decoder, dummy_inputs, outputs
+
+def combine_pose_params(pred_pose_raw, curr2prev=False, curr2next=False):
+    """Combine pose angles and translations, from raw dictionary"""
+
+    if curr2prev and curr2next:
+        raise NotImplementedError
+    if not curr2prev and not curr2next:
+        print("concat poses for both frames")
+        return tf.concat([pred_pose_raw['angles'], pred_pose_raw['translations']], axis=3)
+    else:
+        print("concat poses for one frame")
+        seq_choice = 0 if curr2prev else 1
+        return tf.concat([pred_pose_raw['angles'][:, seq_choice],
+                          pred_pose_raw['translations'][:, seq_choice]], axis=2)
+
+if __name__ == '__main__':
+    # pose_decoder, dummy_inputs, outputs = build_posenet()
+    # for k,v in outputs.items():
+    #     print(k,"\t", v.shape)
+    res = {}
+    res["angles"] = tf.random.uniform(shape=(1,2,1,3))
+    res["translations"] = tf.random.uniform(shape=(1,2,1,3))
+    out_ctp = combine_pose_params(res, curr2prev=True)
+    out_ctn = combine_pose_params(res, curr2next=True)
+    a = tf.concat([out_ctn, out_ctn], axis=1)
+    print(a.shape)
 
 
 # -------- Archived below ---------
 
-
+"""
 def load_weights_from_pkl(weights_path=None):
     import pickle
     with open("D:\MA\Recources\monodepth2-torch\models\pose_decoder.pkl", 'rb') as df:
@@ -96,7 +123,6 @@ def load_weights_pose_decoder():
         print(k)
         print(v.shape)
         print(np.squeeze(v).shape)
+"""
 
 
-if __name__ == '__main__':
-    load_weights_pose_decoder()
