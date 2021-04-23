@@ -44,20 +44,36 @@ Note：It's trained on *Odometry* split, so if applied on *Raw* data, the result
 - [X] training code
 - [X] validation code in training
 - [X] modify data loader to accept more dataset (*KITTI_Raw* and *KITTI_Odom*)
-- [ ] evluation code
-- [ ] simple test code
+- [X] evluation code
+- [X] simple test code
 - [ ] try new stuff in similar papers, e.g. *struct2dpeth*
 
 ### Note up-to-date
+First, Evaluation code, i.e. `eval_depth.py` and `eval_pose.py` is finished.
+
+Then `simple_run.py` also finished, try it with:
+```
+python simple_run.py --weights_dir --data_path --save_result_to --save_concat_image
+```
+- data_path: path to a video or image file
+- weights_dir: path to a folder with necessary weights (.h5)
+- save_result_to: optional, a folder path where the result will be saved
+- save_concat_image: optional, show concatenated images with original image for comparison
+
+Next move:
+- [ ] training. For now I only train the model for 7 epoch. It's getting better but remains to be seen. Hope I could restore the official results.
+- [ ] try new stuff in similar papers, e.g. *struct2dpeth*
+
+---
+
+### History note
+#### April
+
 Now you can train your own model using the `train.py` and `new_trainer.py`. For now I just trained for 1 epoch, and the results seem to head to the correct way. See the reconstructed image and the disp image under *assets/first_epoch_res.jpg*. 
 
 Next step will be:
 - completing the *evaluatiion* code.
 - try new stuff in similar papers, e.g. *struct2dpeth* to improve the model
-
----
-
-### History note
 
 #### March
 Just for personal use, but please feel free to contact me if you need anything. 
