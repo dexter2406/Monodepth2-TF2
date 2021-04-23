@@ -4,7 +4,7 @@ import datetime
 
 
 rootdir = os.path.dirname(__file__)
-curren_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
 all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_enc']
 FLAGS = flags.FLAGS
 
@@ -12,7 +12,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string('weights_dir', r'.\logs\weights\epoch_4\weights_0',  'the folder that stores weights files.')
 flags.DEFINE_list('models_to_load', all_models,
                   'load weights for specified models, by default all of them')
-flags.DEFINE_string('model_name', curren_time, 'specify a dirname to collect weights, if not, current time is used')
+flags.DEFINE_string('model_name', current_time, 'specify a dirname to collect weights, if not, current time is used')
 flags.DEFINE_bool('train_depth', True, 'whether to train depth decoder-encoder')
 flags.DEFINE_bool('train_pose', True, 'whether to train pose decoder-encoder')
 flags.DEFINE_bool('from_scratch', False, 'whether trained from scratch, coorperate with load_weights_folder')
@@ -47,7 +47,6 @@ flags.DEFINE_float('min_depth', 0.1, 'minimum depth when applying scaling/normal
 flags.DEFINE_float('max_depth', 100., 'maximum depth when applying scaling/normalizing to depth estimates')
 
 # Evaluation
-flags.DEFINE_bool('use_ext_disp', False, 'import external disp maps to eval')
 flags.DEFINE_bool('eval_eigen_to_benchmark', False, '?')
 flags.DEFINE_bool('save_pred_disps', False, 'save generated dispairty maps')
 flags.DEFINE_bool('no_eval', False, 'don\'t conduct evaluation for debugging or saving preds')
@@ -55,6 +54,9 @@ flags.DEFINE_float('pred_depth_scale_factor', 1., 'additional depth scaling fact
 flags.DEFINE_bool('use_median_scaling', True, 'use median filter to calculate scaling ratio')
 flags.DEFINE_string('eval_split', 'eigen', 'evaluation split, choose from: '
                                            '["eigen", "eigen_benchmark", "benchmark", "odom_9", "odom_10"]')
+flags.DEFINE_string('use_ext_res', None, 'use imported disparity predictions for evaluation, '
+                                         'instead of generating them now')
+
 flags.mark_flag_as_required('run_mode')
 
 
