@@ -50,11 +50,13 @@ class DataProcessor(object):
         input_imgs, input_Ks = self.process_batch_main(batch, depth_batch)
         return input_imgs, input_Ks
 
-    def process_batch_main(self, batch, depth_batch=None):
+    def process_batch_main(self, batch):
         input_imgs, input_Ks = {}, {}
-        if depth_batch is not None:
-            input_imgs[('depth_gt', 0)] = tf.expand_dims(depth_batch, 3)
-        batch_imgs = batch
+        if type(batch) == tuple:
+            batch_imgs = batch[0]
+            input_imgs[('depth_gt', 0)] = tf.expand_dims(batch[1], 3)
+        else:
+            batch_imgs = batch
         tgt_batch, src_batch = batch_imgs[..., :3], batch_imgs[..., 3:]
         self.batch_size = tgt_batch.shape[0]
 
@@ -116,3 +118,4 @@ class DataProcessor(object):
         same augmentation.
         """
         return image
+
