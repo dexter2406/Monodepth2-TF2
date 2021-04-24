@@ -3,6 +3,7 @@ import os
 import time
 import math
 import numpy as np
+import sys
 
 
 class DataProcessor(object):
@@ -35,24 +36,25 @@ class DataProcessor(object):
         """
         # do_color_aug = self.is_train and np.random.random() > 0.5
         # do_flip = False
-        input_imgs, input_Ks = {}, {}
-        input_imgs, input_Ks = self.process_batch_main(batch, input_imgs, input_Ks)
+        # tf.print('train shape', batch[0].shape, batch[1].shape)
+        input_imgs, input_Ks = self.process_batch_main(batch)
         return input_imgs, input_Ks
 
-    def prepare_batch_val(self, batch):
+    @tf.function
+    def prepare_batch_val(self, batch, depth_batch):
         """duplicate of prepare_batch(), no @tf.function decorator
         For validation OR evaluation
         """
-        input_imgs, input_Ks = {}, {}
-        input_imgs, input_Ks = self.process_batch_main(batch, input_imgs, input_Ks)
+        # tf.print('val shape')
+        # tf.print(batch[0].shape, batch[1].shape, output_stream=sys.stdout)
+        input_imgs, input_Ks = self.process_batch_main(batch, depth_batch)
         return input_imgs, input_Ks
 
-    def process_batch_main(self, batch, input_imgs, input_Ks):
-        if type(batch) == tuple:
-            batch_imgs, batch_depths = batch
-            input_imgs['depth_gt'] = tf.expand_dims(batch_depths, 3)
-        else:
-            batch_imgs = batch
+    def process_batch_main(self, batch, depth_batch=None):
+        input_imgs, input_Ks = {}, {}
+        if depth_batch is not None:
+            input_imgs[('depth_gt', 0)] = tf.expand_dims(depth_batch, 3)
+        batch_imgs = batch
         tgt_batch, src_batch = batch_imgs[..., :3], batch_imgs[..., 3:]
         self.batch_size = tgt_batch.shape[0]
 
@@ -74,8 +76,8 @@ class DataProcessor(object):
         """
         # print("\t preprocessing batch...")
         for k in list(input_imgs):
-            if type(k) is not tuple:
-                continue    # skip input_imgs['depth_dt']
+            if 'depth_gt' in k:
+                continue
             img_type, f_i, scale = k    # key components
             if img_type == 'color':
                 for scale in range(self.num_scales):
@@ -114,4 +116,3 @@ class DataProcessor(object):
         same augmentation.
         """
         return image
-
