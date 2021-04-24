@@ -12,6 +12,7 @@ from datasets.dataset_kitti import KITTIRaw, KITTIOdom
 from src.DataPprocessor import DataProcessor
 
 import numpy as np
+from collections import defaultdict
 import datetime
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -44,21 +45,25 @@ class Trainer:
         self.proj_error_stack_all = []
         self.pred_auto_masks = []
 
-        self.pixel_losses = 0.
-        self.smooth_losses = 0.
+        # self.pixel_losses = 0.
+        # self.smooth_losses = 0.
+        self.train_loss = 0.
         self.losses = {}
-        self.global_step = tf.Variable(0, dtype=tf.int32, trainable=False)
+        # self.early_stopping_losses = defaultdict(list)
+        # self.global_step = tf.Variable(0, dtype=tf.int32, trainable=False)
+        self.global_step = tf.constant(0, dtype=tf.int64)
         self.batch_idx = tf.Variable(0, dtype=tf.int32, trainable=False)
         self.epoch_cnt = tf.Variable(0, dtype=tf.int64, trainable=False)
         self.depth_metric_names = [
             "de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms", "da/a1", "da/a2", "da/a3"]
 
-        self.dataset = None
+        self.val_iter = None
+        self.train_iter = None
         self.batch_processor: DataProcessor = None
         self.lr_fn = None
         self.optimizer = None
 
-        self.train_sum_writer = None
+        self.summary_writer = {}
         self.weights_idx = 0    # for saved weights
         self.back_project_dict = {}
         self.project_3d_dict = {}
@@ -78,17 +83,25 @@ class Trainer:
             'kitti_odom': KITTIOdom
         }
         split_folder = os.path.join('splits', self.opt.split)
-        split_name = 'train_files.txt' if 'train' in self.opt.run_mode else 'val_files.txt'
-        self.dataset = dataset_choices[self.opt.dataset](
-            split_folder, split_name, data_path=self.opt.data_path
-        )
-        self.train_loader = DataLoader(self.dataset, self.opt.num_epochs,
+        train_file = 'train_files.txt'
+        val_file = 'val_files.txt'
+
+        # train dataset & loader
+        train_dataset = dataset_choices[self.opt.dataset](
+            split_folder, train_file, data_path=self.opt.data_path)
+        self.train_loader = DataLoader(train_dataset, self.opt.num_epochs,
                                        self.opt.batch_size, self.opt.frame_idx)
-        self.val_loader = DataLoader(self.dataset, num_epoch=1,
-                                     batch_size=2, frame_idx=self.opt.frame_idx)
         self.train_iter = self.train_loader.build_train_dataset()
-        self.val_iter = self.val_loader.build_val_dataset()
-        self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx, intrinsics=self.dataset.K)
+        # if available, validation dataset & loader
+        if self.train_loader.has_depth:
+            val_dataset = dataset_choices[self.opt.dataset](
+                split_folder, val_file, data_path=self.opt.data_path)
+            self.val_loader = DataLoader(val_dataset, num_epoch=2,
+                                         batch_size=2, frame_idx=self.opt.frame_idx)
+            self.val_iter = self.val_loader.build_val_dataset()
+
+        # batch data preprocessor
+        self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx, intrinsics=train_dataset.K)
 
         # Init models
         self.models['depth_enc'] = ResNet18_new([2, 2, 2, 2])
@@ -107,6 +120,7 @@ class Trainer:
         values = [self.opt.learning_rate * scale for scale in [1, 0.1, 0.01]]   # [1e-4, 1e-5, 1e-6]
         self.lr_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
         self.optimizer = tf.keras.optimizers.Adam(learning_rate = self.lr_fn(self.epoch_cnt))
+        # self.optm_ckpt = tf.train.Checkpoint(optimizer=self.optimizer)
 
         # Init inverse-warping helpers
         # for scale in range(self.opt.num_scales):
@@ -114,12 +128,21 @@ class Trainer:
         self.project_3d_dict[self.opt.src_scale] = Project3D(self.shape_scale0, self.opt.src_scale)
 
     def load_models(self):
-        if self.opt.from_scratch:
-            print("\tfrom scratch, no weights loaded")
+        print("\tloading models from %s..." % self.opt.weights_dir)
+        if not self.opt.from_scratch:
+            # todo: get actual ImageNet-pretrained weights for ResNet-18
+            print('\tloading pretrained encoder weights')
+            pt_enc_weights_path = 'logs/weights/trained_odom'
         else:
-            print("\tloading trained models from %s..." % self.opt.weights_dir)
-            for m_name in self.opt.models_to_load:
-                self.models[m_name].load_weights(os.path.join(self.opt.weights_dir, m_name + '.h5'))
+            pt_enc_weights_path = self.opt.weights_dir
+
+        for m_name in self.opt.models_to_load:
+            if 'enc' in m_name:
+                self.models[m_name].load_weights(
+                    os.path.join(pt_enc_weights_path, m_name+'.h5'))
+            elif 'dec' in m_name:
+                self.models[m_name].load_weights(
+                    os.path.join(self.opt.weights_dir, m_name + '.h5'))
 
     # ----- For process_batch() -----
     def get_smooth_loss(self, disp, img):
@@ -145,14 +168,8 @@ class Trainer:
         return loss
 
     def reset_losses(self):
-        self.smooth_losses = 0.
-        self.pixel_losses = 0.
-        # self.total_loss = 0.
-        self.losses = {}
-        self.proj_image_stack_all = []
-        self.proj_error_stack_all = []
-        self.pred_auto_masks = []
-        self.tgt_image_all = []
+        self.train_loss = 0.
+        self.losses = {'pixel_loss': 0, 'smooth_loss': 0}
 
     def compute_losses(self, input_imgs, outputs):
         sourec_scale = 0
@@ -169,15 +186,10 @@ class Trainer:
                 proj_image = outputs[('color', f_i, scale)]
                 assert proj_image.shape[2] == tgt_image.shape[2] == self.opt.width
                 reproject_losses.append(self.compute_reproject_loss(proj_image, tgt_image))
-
-                # for collect
-                proj_error = tf.math.abs(proj_image - tgt_image)
-                if i == 0:
-                    proj_image_stack = proj_image
-                    proj_error_stack = proj_error
-                else:
-                    proj_image_stack = tf.concat([proj_image_stack, proj_image], axis=3)
-                    proj_error_stack = tf.concat([proj_error_stack, proj_error], axis=3)
+                # to collect
+                if scale == 0:
+                    proj_error = tf.math.abs(proj_image - tgt_image)
+                    outputs[('proj_error', f_i, scale)] = proj_error
 
             reproject_losses = tf.concat(reproject_losses, axis=3)
 
@@ -211,10 +223,8 @@ class Trainer:
                 identity_reprojection_loss += (tf.random.normal(identity_reprojection_loss.shape)
                                                * tf.constant(1e-5, dtype=tf.float32))
                 combined = tf.concat([identity_reprojection_loss, reproject_loss], axis=3)
-
-                self.pred_auto_masks.append(
-                    tf.expand_dims(
-                        tf.cast(tf.math.argmin(combined, axis=3) > 1, tf.float32) * 255, -1))
+                outputs[('automask', 0)] = tf.expand_dims(
+                        tf.cast(tf.math.argmin(combined, axis=3) > 1, tf.float32) * 255, -1)
 
             # -------------------
             # 3. Final reprojectioni loss -> as pixel loss
@@ -224,7 +234,8 @@ class Trainer:
             else:
                 to_optimise = combined
             reprojection_loss = tf.reduce_mean(to_optimise)
-            self.pixel_losses += reprojection_loss
+            # self.pixel_losses += reprojection_loss
+            self.losses['pixel_loss'] += reprojection_loss
 
             # -------------------
             # 4. Smoothness loss: Gradient Loss based on image pixels
@@ -243,28 +254,26 @@ class Trainer:
             # ------------------
             # Optional: Collect results for summary
             # ------------------
-            self.smooth_losses += smooth_loss
-            self.losses['loss/%d' % scale] = total_loss_tmp
-            self.proj_image_stack_all.append(proj_image_stack)
-            self.proj_error_stack_all.append(proj_error_stack)
+            # self.smooth_losses += smooth_loss
+            self.losses['smooth_loss'] += smooth_loss
+            # self.losses['loss/%d' % scale] = total_loss_tmp
             if scale == 0:
                 src_image_stack_aug = tf.concat([input_imgs[('color_aug', -1, 0)],
                                                  input_imgs[('color_aug', -1, 0)]], axis=3)
                 self.src_image_stack_all.append(src_image_stack_aug)
                 self.tgt_image_all.append(tgt_image)
 
-        self.pixel_losses /= self.opt.num_scales
-        self.smooth_losses /= self.opt.num_scales
+        self.losses['pixel_loss'] /= self.opt.num_scales
+        self.losses['smooth_loss'] /= self.opt.num_scales
         total_loss /= self.opt.num_scales
-
         self.losses['loss/total'] = total_loss
+
         if self.opt.debug_mode:
             colormapped_normal = colorize(outputs[('disp', 0)], cmap='plasma')
             print("disp map shape", colormapped_normal.shape)
             plt.imshow(colormapped_normal.numpy()), plt.show()
 
-        return total_loss
-
+        return self.losses
 
     def generate_images_pred(self, input_imgs, input_Ks, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
@@ -431,7 +440,6 @@ class Trainer:
         - use @tf.function for self.grad() and self.dataloader.prepare_batch()
             allow larger batch_size GPU utilization.
         """
-        # self.batch_processor.K = self.data_loader.datset.K
         for epoch in range(self.opt.num_epochs):
             self.epoch_cnt.assign(epoch)
             self.optimizer.lr = self.lr_fn(epoch)     # learning rate 15:1e-4; >16:1e-5
@@ -440,7 +448,6 @@ class Trainer:
             for i in tqdm(range(self.train_loader.steps_per_epoch),
                           desc='Epoch%d/%d' % (epoch+1, self.opt.num_epochs)):
                 self.batch_idx.assign(i)
-
                 # data preparation
                 batch = self.train_iter.get_next()
                 input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
@@ -448,36 +455,31 @@ class Trainer:
                 # training
                 # grads = self.grad(input_imgs, input_Ks, trainable_weights_all)
                 trainable_weights_all = self.get_trainable_weights()
-                grads, outputs = self.grad(input_imgs, input_Ks, trainable_weights_all)
+                grads, self.train_loss = self.grad(input_imgs, input_Ks,
+                                                   trainable_weights_all, global_step=self.global_step)
                 self.optimizer.apply_gradients(zip(grads, trainable_weights_all))
-                self.global_step.assign_add(1)
+                # self.global_step.assign_add(1)
+                self.global_step += 1
 
                 if not self.opt.debug_mode:
-                    if self.is_time_to('save_model'):
+                    if self.is_time_to('save_model', self.global_step):
                         self.save_models()
-                    if self.is_time_to('validate'):
+                    if self.is_time_to('validate', self.global_step):
+                        # self.train_loss = total_loss_train
                         self.validate()
 
-    # @tf.function    # turn off to debug, e.g. with plt
-    def grad(self, input_imgs, input_Ks, trainables):
+    @tf.function    # turn off to debug, e.g. with plt
+    def grad(self, input_imgs, input_Ks, trainables, global_step):
         with tf.GradientTape() as tape:
             outputs = self.process_batch(input_imgs, input_Ks)
-            total_loss = self.compute_losses(input_imgs, outputs)
+            losses = self.compute_losses(input_imgs, outputs)
+            total_loss = losses['loss/total']
             grads = tape.gradient(total_loss, trainables)
-            if self.is_time_to('print_loss'):
-                tf.print("loss: ", self.losses['loss/total'], output_stream=sys.stdout)
-            # # collect data
-            # early_phase = self.batch_idx % self.summary_freq == 0 and self.global_step < 2000
-            # late_phase = self.global_step % 2000 == 0
-            # if early_phase or late_phase:
-            # print("colleting data in step ", self.global_step, " batch index ", self.batch_idx)
-            #     with self.train_sum_writer.as_default():
-            #         self.collect_summary(outputs)
-            # if self.global_step % self.summary_freq == 0:
-            #     print("flush data in step ", self.global_step, " batch index ", self.batch_idx)
-            #     self.train_sum_writer.flush()
-
-        return grads, outputs
+            if self.is_time_to('print_loss', global_step):
+                tf.print("loss: ", total_loss, output_stream=sys.stdout)
+                print("colleting data in step ", global_step)
+                self.collect_summary('train', losses, input_imgs, outputs, global_step)
+        return grads, total_loss
 
     def get_trainable_weights(self):
         trainable_weights_all = []
@@ -496,40 +498,78 @@ class Trainer:
             return
 
         if self.opt.recording:
-            train_log_dir = self.opt.record_summary_path + self.opt.model_name + "/" + self.opt.run_mode
-            self.train_sum_writer = tf.summary.create_file_writer(train_log_dir)
+            train_log_dir = os.path.join(self.opt.record_summary_path, self.opt.model_name, 'train')
+            self.summary_writer['train'] = tf.summary.create_file_writer(train_log_dir)
+            if self.train_loader.has_depth:
+                val_log__dir = os.path.join(self.opt.record_summary_path, self.opt.model_name, 'val')
+                self.summary_writer['val'] = tf.summary.create_file_writer(val_log__dir)
             print('\tSummary will be stored in %s ' % train_log_dir)
-        # for epoch in range(self.opt.num_epochs):
+
         print("->Start training...")
         self.start_training()
 
-    def start_validating(self, input_imgs, input_Ks):
+    @tf.function
+    def compute_batch_losses(self, input_imgs, input_Ks):
         outputs = self.process_batch(input_imgs, input_Ks)
-        total_loss = self.compute_losses(input_imgs, outputs)
+        losses = self.compute_losses(input_imgs, outputs)
+        return outputs, losses
 
-        if 'depth_gt' in input_imgs.keys():
-            self.losses.update(
-                self.compute_depth_losses(input_imgs, outputs)
-            )
+    def start_validating(self, input_imgs, input_Ks, global_step):
+        outputs, losses = self.compute_batch_losses(input_imgs, input_Ks)
+
+        if ('depth_gt', 0) in input_imgs.keys():
+            losses.update(
+                self.compute_depth_losses(input_imgs, outputs))
         # ----------
         # log val losses and delete
         # ----------
+        if self.opt.recording:
+            print('-> Writing loss/metrics...')
+            self.collect_summary('val', losses, input_imgs, outputs, global_step=global_step)
+
         print('-> Validating losses by depth ground-truth: ')
         val_loss_str = ''
-        for k in list(self.losses):
+        for k in list(losses):
             if k in self.depth_metric_names:
-                val_loss_str = ''.join([val_loss_str, '{}: {} | '.format(k, self.losses[k])])
-                del self.losses[k]
-
-        val_loss_str = ''.join([val_loss_str, 'total_loss: {}'.format(total_loss)])
+                val_loss_str = ''.join([val_loss_str, '{}: {} | '.format(k, losses[k])])
+        val_loss_str = ''.join([val_loss_str, 'val loss: {}'.format(losses['loss/total'])])
         tf.print('\t', val_loss_str, output_stream=sys.stdout)
+
+        return losses
+
+    def early_stopping(self, losses, patience=2):
+        min_errors = {'de/rms': 4.8,
+                      'de/abs_rel': 0.14,
+                      'de/sq_rel': 1.,
+                      'da/a1': 0.83}
+        early_stop = False
+        early_stopping_losses = defaultdict(list)
+        for metric in min_errors:
+            early_stopping_losses[metric].append(losses[metric])
+            mean_error = np.mean(early_stopping_losses[metric][-patience:])
+            if mean_error > min_errors[metric]:
+                return early_stop
+
+        if self.train_loss < 0.1:
+            early_stop = True
+
+        return early_stop
 
     def validate(self):
         batch = self.val_iter.get_next()
-        print('val batch ', type(batch), batch[0].shape, batch[1].shape)
-        # input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
-        input_imgs, input_Ks = self.batch_processor.prepare_batch_val(batch)
-        self.start_validating(input_imgs, input_Ks)
+        if type(batch) == tuple:
+            input_imgs, input_Ks = self.batch_processor.prepare_batch_val(batch[0], batch[1])
+        else:
+            input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+        val_losses = self.start_validating(input_imgs, input_Ks, self.global_step)
+
+        # early stopping
+        if self.early_stopping(val_losses):
+            self.save_models()
+            quit()
+
+        for k in self.depth_metric_names:
+            del val_losses[k]
 
     def save_models(self, not_saved=()):
         weights_path = os.path.join(self.opt.save_model_path, 'weights_%d' % self.weights_idx)
@@ -539,40 +579,47 @@ class Trainer:
         for m_name, model in self.models.items():
             if m_name not in not_saved:
                 m_path = os.path.join(weights_path, m_name + '.h5')
+                # m_path = os.path.join(weights_path, m_name)
                 tf.print("saving {} to:".format(m_name), m_path, output_stream=sys.stdout)
                 model.save_weights(m_path)
 
-    def collect_summary(self, outputs):
-        # total losses in multiple scales
-        # tf.print("saving total losses in different scales...")
-        for loss_name, loss_val in self.losses.items():
-            tf.summary.scalar(loss_name, loss_val, step=self.epoch_cnt)
+        # ---- testing ckpt ----
+        # optm_path = 'logs/ckpts/ckpt_0/adam/adam_ckpt'
+        # self.optm_ckpt.save(optm_path)
+        # self.optm_ckpt.restore(optm_path).assert_consumed()
+        # print(self.optimizer.get_config()['learning_rate'])
+        # exit('1')
 
-        # sub-losses
-        tf.print("saving pixel and smoothness loss...")
-        tf.summary.scalar("pixel loss", self.pixel_losses, step=self.epoch_cnt)
-        tf.summary.scalar("smooth loss", self.smooth_losses, step=self.epoch_cnt)
+    def collect_summary(self, mode, losses, input_imgs, outputs, global_step):
+        """collect summary for train / validation"""
+        writer = self.summary_writer[mode]
+        with writer.as_default():
+            for loss_name in list(losses):
+                loss_val = losses[loss_name]
+                tf.summary.scalar(loss_name, loss_val, step=global_step)
+            # tf.summary.scalar('train_loss', losses['loss/total'], step=global_step)
 
-        # poses
-        # axis_names = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz']
-        # for i in range(len(axis_names)):
-        #     tf.summary.histogram(axis_names[i], self.pred_poses[:, :, :, i], step=self.epoch_cnt)
+            # images
+            tf.summary.image('tgt_image', input_imgs[('color', 0, 0)][:2], step=global_step)
+            # tf.summary.image('scale0_disp_color', colorize(outputs[('disp', 0)], cmap='plasma'), step=global_step)
+            tf.summary.image('scale0_disp_gray',
+                             normalize_image(outputs[('disp', 0)][:2]), step=global_step)
 
-        # images
-        tf.summary.image('tgt_image', self.tgt_image_all[0], step=self.epoch_cnt)
-        for s in range(self.opt.num_scales):
-            tf.summary.image('scale{}_disparity_color_image'.format(s),
-                             colorize(outputs['disp',s], cmap='plasma'), step=self.epoch_cnt)
-            # tf.summary.image('scale{}_disparity_gray_image'.format(s),
-            #                  normalize_image(outputs['disp',s]), step=self.epoch_cnt)
-            for i in range(2):
-                tf.summary.image('scale{}_projected_image_{}'.format(s, i),
-                                 self.proj_image_stack_all[s][:, :, :, i * 3:(i + 1) * 3], step=self.epoch_cnt)
-                tf.summary.image('scale{}_proj_error_{}'.format(s, i),
-                                     self.proj_error_stack_all[s][:, :, :, i * 3:(i + 1) * 3], step=self.epoch_cnt)
+            for f_i in self.opt.frame_idx[1:]:
+                tf.summary.image('scale0_proj_{}'.format(f_i),
+                                 outputs[('color', f_i, 0)][:2], step=global_step)
+                tf.summary.image('scale0_proj_error_{}'.format(f_i),
+                                 outputs[('proj_error', f_i, 0)][:2], step=global_step)
+
             if self.opt.do_automasking:
-                tf.summary.image('scale{}_automask_image'.format(s),
-                                 self.pred_auto_masks[s], step=self.epoch_cnt)
+                tf.summary.image('scale0_automask_image',
+                                 outputs[('automask', 0)][:2], step=self.epoch_cnt)
+
+            # poses
+            # axis_names = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz']
+            # for i in range(len(axis_names)):
+            #     tf.summary.histogram(axis_names[i], self.pred_poses[:, :, :, i], step=self.epoch_cnt)
+        writer.flush()
 
     def compute_depth_losses(self, input_imgs, outputs):
         """Compute depth metrics, to allow monitoring during training
@@ -582,7 +629,7 @@ class Trainer:
         so is only used to give an indication of validation performance
         """
         losses = {}
-        depth_gt = input_imgs["depth_gt"]
+        depth_gt = input_imgs[('depth_gt', 0)]
         mask = depth_gt > 0
         depth_pred = outputs[("depth", 0, 0)]   # to be resized to (375, 1242)
         depth_pred = tf.clip_by_value(
@@ -610,19 +657,21 @@ class Trainer:
 
         return losses
 
-    def is_time_to(self, event):
+    def is_time_to(self, event, global_step):
         is_time = False
         events = {0: 'print_loss', 1: 'save_model', 2: 'validate'}
         if event not in events.values():
             raise NotImplementedError
 
-        if event == events[0] and self.global_step % self.opt.record_freq == 0:
+        if event == events[0]:
+            early_phase = global_step % self.opt.record_freq == 0 and global_step < 2000
+            late_phase = global_step % 1000 == 0
+            if early_phase or late_phase:
+                is_time = True
+        elif event == events[1] and (global_step + 1) % (self.train_loader.steps_per_epoch // 2) == 0:
             is_time = True
-        elif event == events[1] and (self.global_step + 1) % (self.train_loader.steps_per_epoch // 2) == 0:
+        elif event == events[2] and (global_step + 1) % (self.train_loader.steps_per_epoch // 100) == 0:
             is_time = True
-        elif event == events[2] and (self.global_step + 1) % (self.train_loader.steps_per_epoch // 10) == 0:
-            is_time = True
-
         return is_time
 
 
