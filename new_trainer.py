@@ -3,7 +3,7 @@ from models.depth_decoder_creater import DepthDecoder_full
 from models.encoder_creater import ResNet18_new
 from models.posenet_decoder_creator import PoseDecoder
 
-from utils import disp_to_depth
+from utils import disp_to_depth, del_files
 from src.trainer_helper import *
 # from src.dataset_loader import DataLoader
 # from src.dataset_loader_kitti_raw import DataLoader_KITTI_Raw
@@ -49,14 +49,15 @@ class Trainer:
         # self.smooth_losses = 0.
         self.train_loss = 0.
         self.losses = {}
-        # self.early_stopping_losses = defaultdict(list)
+        self.early_stopping_losses = defaultdict(list)
         # self.global_step = tf.Variable(0, dtype=tf.int32, trainable=False)
         self.global_step = tf.constant(0, dtype=tf.int64)
         self.batch_idx = tf.Variable(0, dtype=tf.int32, trainable=False)
         self.epoch_cnt = tf.Variable(0, dtype=tf.int64, trainable=False)
         self.depth_metric_names = [
             "de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms", "da/a1", "da/a2", "da/a3"]
-
+        self.min_errors = {}
+        self.val_losses_min = defaultdict(lambda:10)    # random number as initiation
         self.val_iter = None
         self.train_iter = None
         self.batch_processor: DataProcessor = None
@@ -127,22 +128,21 @@ class Trainer:
         self.back_project_dict[self.opt.src_scale] = BackProjDepth(self.shape_scale0, self.opt.src_scale)
         self.project_3d_dict[self.opt.src_scale] = Project3D(self.shape_scale0, self.opt.src_scale)
 
-    def load_models(self):
-        print("\tloading models from %s..." % self.opt.weights_dir)
-        if not self.opt.from_scratch:
-            # todo: get actual ImageNet-pretrained weights for ResNet-18
-            print('\tloading pretrained encoder weights')
-            pt_enc_weights_path = 'logs/weights/trained_odom'
-        else:
-            pt_enc_weights_path = self.opt.weights_dir
+        self.min_errors = {'de/abs_rel': 0.14,
+                           'de/sq_rel': 1.,
+                           'de/rms': 4.8,
+                           'da/a1': 0.83}
 
-        for m_name in self.opt.models_to_load:
-            if 'enc' in m_name:
+    def load_models(self):
+        if self.opt.from_scratch:
+            print('\ttraining from scratch, no ImageNet-pretrained weights for encoder...')
+        else:
+            # todo: should have pretrained ResNet-18 available for the first epoch, will accelerate convergence
+            print('\tloading pretrained weights')
+            for m_name in self.opt.models_to_load:
                 self.models[m_name].load_weights(
-                    os.path.join(pt_enc_weights_path, m_name+'.h5'))
-            elif 'dec' in m_name:
-                self.models[m_name].load_weights(
-                    os.path.join(self.opt.weights_dir, m_name + '.h5'))
+                    os.path.join(self.opt.weights_dir, m_name + '.h5')
+                )
 
     # ----- For process_batch() -----
     def get_smooth_loss(self, disp, img):
@@ -537,31 +537,47 @@ class Trainer:
 
         return losses
 
+    def should_save_model(self, val_losses):
+        """save model when val loss hits new low"""
+        # skip when loss is not the new low
+        if self.val_losses_min['da/a1'] == 10 or \
+                val_losses['loss/total'] > self.val_losses_min['loss/total']:
+            return False
+
+        # if the loss is the new low, should at least 2 another metrics
+        num_pass = 0
+        for metric in self.min_errors:
+            if val_losses[metric] < self.val_losses_min[metric]:
+                self.val_losses_min[metric] = val_losses[metric]
+                num_pass += 1
+        return num_pass > 1
+
     def early_stopping(self, losses, patience=2):
-        min_errors = {'de/rms': 4.8,
-                      'de/abs_rel': 0.14,
-                      'de/sq_rel': 1.,
-                      'da/a1': 0.83}
         early_stop = False
-        early_stopping_losses = defaultdict(list)
-        for metric in min_errors:
-            early_stopping_losses[metric].append(losses[metric])
-            mean_error = np.mean(early_stopping_losses[metric][-patience:])
-            if mean_error > min_errors[metric]:
+        for metric in self.min_errors:
+            self.early_stopping_losses[metric].append(losses[metric])
+            mean_error = np.mean(self.early_stopping_losses[metric][-patience:])
+            if losses[metric] > self.min_errors[metric]:
+                print('* early stopping ready')
+            if mean_error > self.min_errors[metric]:
                 return early_stop
 
-        if self.train_loss < 0.1:
+        if self.train_loss < 0.11:
             early_stop = True
 
         return early_stop
 
     def validate(self):
         batch = self.val_iter.get_next()
-        if type(batch) == tuple:
-            input_imgs, input_Ks = self.batch_processor.prepare_batch_val(batch[0], batch[1])
-        else:
-            input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+        input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+        # if type(batch) == tuple:
+        #     input_imgs, input_Ks = self.batch_processor.prepare_batch_val(batch[0], batch[1])
+        # else:
+        #     input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
         val_losses = self.start_validating(input_imgs, input_Ks, self.global_step)
+
+        if self.should_save_model(val_losses):
+            self.save_models()
 
         # early stopping
         if self.early_stopping(val_losses):
@@ -572,14 +588,20 @@ class Trainer:
             del val_losses[k]
 
     def save_models(self, not_saved=()):
-        weights_path = os.path.join(self.opt.save_model_path, 'weights_%d' % self.weights_idx)
-        self.weights_idx += 1
+        # - delete previous weights
+        del_files(self.opt.save_model_path)
+
+        # - save new weights
+        weights_name = '_'.join(['weights', str(self.val_losses_min['loss/total'])[2:4],
+                                str(self.val_losses_min['da/a1'])[2:4]])
+        print('-> Saving weights with new low loss:\n', self.val_losses_min)
+        weights_path = os.path.join(self.opt.save_model_path, weights_name)
         if not os.path.isdir(weights_path):
             os.makedirs(weights_path)
+
         for m_name, model in self.models.items():
             if m_name not in not_saved:
                 m_path = os.path.join(weights_path, m_name + '.h5')
-                # m_path = os.path.join(weights_path, m_name)
                 tf.print("saving {} to:".format(m_name), m_path, output_stream=sys.stdout)
                 model.save_weights(m_path)
 
@@ -670,7 +692,7 @@ class Trainer:
                 is_time = True
         elif event == events[1] and (global_step + 1) % (self.train_loader.steps_per_epoch // 2) == 0:
             is_time = True
-        elif event == events[2] and (global_step + 1) % (self.train_loader.steps_per_epoch // 100) == 0:
+        elif event == events[2] and (global_step + 1) % (self.train_loader.steps_per_epoch // 50) == 0:
             is_time = True
         return is_time
 
