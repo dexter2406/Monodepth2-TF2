@@ -1,4 +1,4 @@
-import os
+import os, shutil
 import pickle
 import numpy as np
 import tensorflow as tf
@@ -118,6 +118,15 @@ def sec_to_hm_str(t):
     return "{:02d}h{:02d}m{:02d}s".format(h, m, s)
 
 
+def del_files(root_dir):
+    for f in os.listdir(root_dir):
+        file_path = os.path.join(root_dir, f)
+        try:
+            shutil.rmtree(file_path)
+        except OSError:
+            os.remove(file_path)
+
+
 def check_options(FLAGS):
     all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_enc']
 
@@ -140,7 +149,7 @@ def check_options(FLAGS):
             print('\tno save_model_path specified, use %s instead' % FLAGS.save_model_path)
 
         save_path = os.path.join(save_dir, FLAGS.model_name)
-        if not os.path.isdir(save_path):
+        if not os.path.isdir(save_path) and not FLAGS.debug_mode:
             os.makedirs(save_path)
         FLAGS.save_model_path = save_path
         print('\tweights will be saved in folder {}'.format(save_path))
@@ -221,3 +230,4 @@ def get_depth_savedmodel(get_enc=True, get_dec=True, enc_keras=False, dec_keras=
             print("encoder Keras model loaded")
 
     return enc_imported, dec_imported
+
