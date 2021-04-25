@@ -4,6 +4,38 @@ import matplotlib
 import matplotlib.pyplot as plt
 
 
+def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
+    """save model when val loss hits new low"""
+    # just update val_loss_min, but not save model
+    if val_losses_min['da/a1'] == 10:
+        print('initialize self.val_loss_min, doesn\'t count')
+        skip = True
+        val_losses_min['loss/total'] = val_losses['loss/total']
+        for metric in min_errors_thresh:
+            val_losses_min[metric] = val_losses[metric]
+    else:
+        # directly skip when loss is not low enough
+        # if the loss is the new low, should at least 2 another metrics
+        if val_losses['loss/total'] < max(0.1, val_losses_min['loss/total']):
+            val_losses_min['loss/total'] = val_losses['loss/total']
+            num_pass = 0
+            for metric in min_errors_thresh:
+                if metric == 'da/a1':
+                    print('--- a1 ---')
+                    if val_losses[metric] > val_losses_min[metric]:
+                        val_losses_min[metric] = val_losses[metric]
+                        num_pass += 1
+                else:
+                    if val_losses[metric] < val_losses_min[metric]:
+                        val_losses_min[metric] = val_losses[metric]
+                        num_pass += 1
+            skip = num_pass < 2
+            if not skip: print('val loss hits new low!')
+        else:
+            skip = True
+    return not skip, val_losses_min
+
+
 def build_models(models_dict, check_outputs=False, show_summary=False):
     print("->Building models")
     for k, m in models_dict.items():
@@ -105,7 +137,7 @@ def colorize(value, vmin=None, vmax=None, cmap=None):
     vmax = tf.reduce_max(value) if vmax is None else vmax
     value = (value - vmin) / (vmax - vmin)  # vmin..vmax
     # squeeze last dim if it exists
-    value = tf.compat.v1.squeeze(value)
+    value = tf.squeeze(value)
     # quantize
     indices = tf.cast(tf.math.round(value * 255), tf.int32)
     # gather
@@ -488,6 +520,41 @@ def make_intrinsics_matrix(fx, fy, cx, cy):
     r3 = tf.tile(r3, [batch_size, 1])
     intrinsics = tf.stack([r1, r2, r3], axis=1)
     return intrinsics
+
+
+def show_images(batch_size, input_imgs, outputs):
+    for i in range(batch_size):
+        print(i)
+        fig = plt.figure(figsize=(3, 2))
+        fig.add_subplot(3, 2, 1)
+        tgt = input_imgs[('color', 0, 0)][i].numpy()
+        # tgt = inputs_imp[('color', 0, 0)][i]
+        # tgt = np.transpose(tgt, [1,2,0])
+        plt.imshow(tgt)
+
+        fig.add_subplot(3, 2, 3)
+        src0 = input_imgs[('color_aug', -1, 0)][i].numpy()
+        # src0 = inputs_imp[('color_aug', -1, 0)][i]
+        # src0 = np.transpose(src0, [1,2,0])
+        print(np.max(np.max(src0)), np.min(np.min(src0)))
+        plt.imshow(src0)
+
+        fig.add_subplot(3, 2, 4)
+        src1 = input_imgs[('color_aug', 1, 0)][i].numpy()
+        # src1 = inputs_imp[('color_aug', 1, 0)][i]
+        # src1 = np.transpose(src1, [1, 2, 0])
+        print(np.max(np.max(src1)), np.min(np.min(src1)))
+        plt.imshow(src1)
+
+        fig.add_subplot(3, 2, 5)
+        out0 = outputs[("color", -1, 0)][i].numpy()
+        print(np.max(np.max(out0)), np.min(np.min(out0)))
+        plt.imshow(out0)
+        fig.add_subplot(3, 2, 6)
+        out1 = outputs[("color", 1, 0)][i].numpy()
+        print(np.max(np.max(out1)), np.min(np.min(out1)))
+        plt.imshow(out1)
+        plt.show()
 
 
 if __name__ == '__main__':
