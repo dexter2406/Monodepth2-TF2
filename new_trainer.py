@@ -5,8 +5,6 @@ from models.posenet_decoder_creator import PoseDecoder
 
 from utils import disp_to_depth, del_files
 from src.trainer_helper import *
-# from src.dataset_loader import DataLoader
-# from src.dataset_loader_kitti_raw import DataLoader_KITTI_Raw
 from datasets.data_loader_kitti import DataLoader
 from datasets.dataset_kitti import KITTIRaw, KITTIOdom
 from src.DataPprocessor import DataProcessor
@@ -45,18 +43,15 @@ class Trainer:
         self.proj_error_stack_all = []
         self.pred_auto_masks = []
 
-        # self.pixel_losses = 0.
-        # self.smooth_losses = 0.
         self.train_loss = 0.
         self.losses = {}
         self.early_stopping_losses = defaultdict(list)
         # self.global_step = tf.Variable(0, dtype=tf.int32, trainable=False)
         self.global_step = tf.constant(0, dtype=tf.int64)
-        self.batch_idx = tf.Variable(0, dtype=tf.int32, trainable=False)
         self.epoch_cnt = tf.Variable(0, dtype=tf.int64, trainable=False)
         self.depth_metric_names = [
             "de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms", "da/a1", "da/a2", "da/a3"]
-        self.min_errors = {}
+        self.min_errors_thresh = {}
         self.val_losses_min = defaultdict(lambda:10)    # random number as initiation
         self.val_iter = None
         self.train_iter = None
@@ -98,8 +93,11 @@ class Trainer:
             val_dataset = dataset_choices[self.opt.dataset](
                 split_folder, val_file, data_path=self.opt.data_path)
             self.val_loader = DataLoader(val_dataset, num_epoch=2,
-                                         batch_size=2, frame_idx=self.opt.frame_idx)
+                                         batch_size=4, frame_idx=self.opt.frame_idx)
             self.val_iter = self.val_loader.build_val_dataset()
+            # validation metrics
+            self.min_errors_thresh = {'de/abs_rel': 0.14, 'de/sq_rel': 1.,
+                                      'de/rms': 4.8, 'da/a1': 0.83}
 
         # batch data preprocessor
         self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx, intrinsics=train_dataset.K)
@@ -124,25 +122,22 @@ class Trainer:
         # self.optm_ckpt = tf.train.Checkpoint(optimizer=self.optimizer)
 
         # Init inverse-warping helpers
-        # for scale in range(self.opt.num_scales):
         self.back_project_dict[self.opt.src_scale] = BackProjDepth(self.shape_scale0, self.opt.src_scale)
         self.project_3d_dict[self.opt.src_scale] = Project3D(self.shape_scale0, self.opt.src_scale)
 
-        self.min_errors = {'de/abs_rel': 0.14,
-                           'de/sq_rel': 1.,
-                           'de/rms': 4.8,
-                           'da/a1': 0.83}
-
     def load_models(self):
         if self.opt.from_scratch:
-            print('\ttraining from scratch, no ImageNet-pretrained weights for encoder...')
+            print('\ttraining completely from scratch, no ImageNet-pretrained weights for encoder...')
         else:
-            # todo: should have pretrained ResNet-18 available for the first epoch, will accelerate convergence
             print('\tloading pretrained weights')
+            weights_dir = 'logs/weights/pretrained_resnet18'    # in case no weights folder provided
             for m_name in self.opt.models_to_load:
-                self.models[m_name].load_weights(
-                    os.path.join(self.opt.weights_dir, m_name + '.h5')
-                )
+                if self.opt.weights_dir != '':
+                    weights_dir = self.opt.weights_dir
+                    self.models[m_name].load_weights(os.path.join(weights_dir, m_name + '.h5'))
+                else:
+                    if 'enc' in m_name:
+                        self.models[m_name].load_weights(os.path.join(weights_dir, m_name + '.h5'))
 
     # ----- For process_batch() -----
     def get_smooth_loss(self, disp, img):
@@ -324,38 +319,7 @@ class Trainer:
                 outputs[("color", f_i, scale)] = res
 
         if self.opt.debug_mode:
-            for i in range(self.opt.batch_size):
-                print(i)
-                fig = plt.figure(figsize=(3, 2))
-                fig.add_subplot(3, 2, 1)
-                tgt = input_imgs[('color', 0, 0)][i].numpy()
-                # tgt = inputs_imp[('color', 0, 0)][i]
-                # tgt = np.transpose(tgt, [1,2,0])
-                plt.imshow(tgt)
-
-                fig.add_subplot(3, 2, 3)
-                src0 = input_imgs[('color_aug', -1, 0)][i].numpy()
-                # src0 = inputs_imp[('color_aug', -1, 0)][i]
-                # src0 = np.transpose(src0, [1,2,0])
-                print(np.max(np.max(src0)), np.min(np.min(src0)))
-                plt.imshow(src0)
-
-                fig.add_subplot(3, 2, 4)
-                src1 = input_imgs[('color_aug', 1, 0)][i].numpy()
-                # src1 = inputs_imp[('color_aug', 1, 0)][i]
-                # src1 = np.transpose(src1, [1, 2, 0])
-                print(np.max(np.max(src1)), np.min(np.min(src1)))
-                plt.imshow(src1)
-
-                fig.add_subplot(3, 2, 5)
-                out0 = outputs[("color", -1, 0)][i].numpy()
-                print(np.max(np.max(out0)), np.min(np.min(out0)))
-                plt.imshow(out0)
-                fig.add_subplot(3, 2, 6)
-                out1 = outputs[("color", 1, 0)][i].numpy()
-                print(np.max(np.max(out1)), np.min(np.min(out1)))
-                plt.imshow(out1)
-                plt.show()
+            show_images(self.opt.batch_size, input_imgs, outputs)
 
     def predict_poses(self, input_imgs, outputs):
         """Use pose enc-dec to calculate camera's angles and translations"""
@@ -422,17 +386,12 @@ class Trainer:
         # 2. Pose
         # -------------
         outputs.update(self.predict_poses(input_imgs, outputs))
+
         # -------------
         # 3. Generate Reprojection from 1, 2
         # -------------
-        # self.generate_images_pred(input_imgs, input_K_mulscale, outputs)
         self.generate_images_pred(input_imgs, input_Ks, outputs)
 
-        # -------------
-        # 4. Compute Losses from 3.
-        # - Conducted in training procecss, here just for better understanding
-        # self.compute_losses(input_imgs, outputs)
-        # -------------
         return outputs
 
     def start_training(self):
@@ -445,28 +404,23 @@ class Trainer:
             self.optimizer.lr = self.lr_fn(epoch)     # learning rate 15:1e-4; >16:1e-5
             print("\tlearning rate - epoch %d: " % epoch, self.optimizer.get_config()['learning_rate'])
 
-            for i in tqdm(range(self.train_loader.steps_per_epoch),
+            for _ in tqdm(range(self.train_loader.steps_per_epoch),
                           desc='Epoch%d/%d' % (epoch+1, self.opt.num_epochs)):
-                self.batch_idx.assign(i)
                 # data preparation
                 batch = self.train_iter.get_next()
                 input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
 
                 # training
-                # grads = self.grad(input_imgs, input_Ks, trainable_weights_all)
-                trainable_weights_all = self.get_trainable_weights()
-                grads, self.train_loss = self.grad(input_imgs, input_Ks,
-                                                   trainable_weights_all, global_step=self.global_step)
-                self.optimizer.apply_gradients(zip(grads, trainable_weights_all))
-                # self.global_step.assign_add(1)
-                self.global_step += 1
+                trainable_weights = self.get_trainable_weights()
+                grads, losses = self.grad(input_imgs, input_Ks,
+                                          trainable_weights, global_step=self.global_step)
+                self.optimizer.apply_gradients(zip(grads, trainable_weights))
 
-                if not self.opt.debug_mode:
-                    if self.is_time_to('save_model', self.global_step):
-                        self.save_models()
-                    if self.is_time_to('validate', self.global_step):
-                        # self.train_loss = total_loss_train
-                        self.validate()
+                if self.is_time_to('validate', self.global_step):
+                    self.train_loss = losses['loss/total']
+                    self.validate_miniset()
+
+                self.global_step += 1
 
     @tf.function    # turn off to debug, e.g. with plt
     def grad(self, input_imgs, input_Ks, trainables, global_step):
@@ -479,7 +433,7 @@ class Trainer:
                 tf.print("loss: ", total_loss, output_stream=sys.stdout)
                 print("colleting data in step ", global_step)
                 self.collect_summary('train', losses, input_imgs, outputs, global_step)
-        return grads, total_loss
+        return grads, losses
 
     def get_trainable_weights(self):
         trainable_weights_all = []
@@ -510,56 +464,59 @@ class Trainer:
 
     @tf.function
     def compute_batch_losses(self, input_imgs, input_Ks):
+        """@tf.function enables graph computation, allowing larger batch size
+        """
         outputs = self.process_batch(input_imgs, input_Ks)
         losses = self.compute_losses(input_imgs, outputs)
         return outputs, losses
 
-    def start_validating(self, input_imgs, input_Ks, global_step):
-        outputs, losses = self.compute_batch_losses(input_imgs, input_Ks)
+    def start_validating(self, global_step, num_run=20):
+        """run mini-set to see if should store current-best weights"""
+        losses_all = defaultdict(list)
+        for i in range(num_run):
+            batch = self.val_iter.get_next()
+            input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+            outputs, losses = self.compute_batch_losses(input_imgs, input_Ks)
+            if ('depth_gt', 0) in input_imgs.keys():
+                losses.update(
+                    self.compute_depth_losses(input_imgs, outputs))
+            for metric, loss in losses.items():
+                losses_all[metric].append(loss)
+        # mean of mini val-set
+        for metric, loss in losses_all.items():
+            losses_all[metric] = tf.reduce_mean(loss)
 
-        if ('depth_gt', 0) in input_imgs.keys():
-            losses.update(
-                self.compute_depth_losses(input_imgs, outputs))
         # ----------
         # log val losses and delete
         # ----------
         if self.opt.recording:
             print('-> Writing loss/metrics...')
+            # only record last batch
             self.collect_summary('val', losses, input_imgs, outputs, global_step=global_step)
 
         print('-> Validating losses by depth ground-truth: ')
         val_loss_str = ''
-        for k in list(losses):
+        val_loss_min_str= ''
+        for k in list(losses_all):
             if k in self.depth_metric_names:
-                val_loss_str = ''.join([val_loss_str, '{}: {} | '.format(k, losses[k])])
-        val_loss_str = ''.join([val_loss_str, 'val loss: {}'.format(losses['loss/total'])])
-        tf.print('\t', val_loss_str, output_stream=sys.stdout)
+                val_loss_str = ''.join([val_loss_str, '{}: {:.4f} | '.format(k, losses_all[k])])
+                if k in self.val_losses_min:
+                    val_loss_min_str = ''.join([val_loss_min_str, '{}: {:.4f} | '.format(k, self.val_losses_min[k])])
+        val_loss_str = ''.join([val_loss_str, 'val loss: {:.4f}'.format(losses_all['loss/total'])])
+        val_loss_min_str = ''.join([val_loss_min_str, 'val loss: {:.4f}'.format(self.val_losses_min['loss/total'])])
+        tf.print('\t current val loss: ', val_loss_str, output_stream=sys.stdout)
+        tf.print('\t previous min loss:', val_loss_min_str, output_stream=sys.stdout)
+        return losses_all
 
-        return losses
-
-    def should_save_model(self, val_losses):
-        """save model when val loss hits new low"""
-        # skip when loss is not the new low
-        if self.val_losses_min['da/a1'] == 10 or \
-                val_losses['loss/total'] > self.val_losses_min['loss/total']:
-            return False
-
-        # if the loss is the new low, should at least 2 another metrics
-        num_pass = 0
-        for metric in self.min_errors:
-            if val_losses[metric] < self.val_losses_min[metric]:
-                self.val_losses_min[metric] = val_losses[metric]
-                num_pass += 1
-        return num_pass > 1
-
-    def early_stopping(self, losses, patience=2):
+    def early_stopping(self, losses, patience=3):
+        """mean val_loss_metrics are good enough to stop early"""
         early_stop = False
-        for metric in self.min_errors:
+        for metric in self.min_errors_thresh:
             self.early_stopping_losses[metric].append(losses[metric])
             mean_error = np.mean(self.early_stopping_losses[metric][-patience:])
-            if losses[metric] > self.min_errors[metric]:
+            if losses[metric] > self.min_errors_thresh[metric]:
                 print('* early stopping ready')
-            if mean_error > self.min_errors[metric]:
+            if mean_error > self.min_errors_thresh[metric]:
                 return early_stop
 
         if self.train_loss < 0.11:
@@ -567,33 +524,27 @@ class Trainer:
 
         return early_stop
 
-    def validate(self):
-        batch = self.val_iter.get_next()
-        input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
-        # if type(batch) == tuple:
-        #     input_imgs, input_Ks = self.batch_processor.prepare_batch_val(batch[0], batch[1])
-        # else:
-        #     input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
-        val_losses = self.start_validating(input_imgs, input_Ks, self.global_step)
+    def validate_miniset(self):
+        val_losses = self.start_validating(self.global_step)
 
-        if self.should_save_model(val_losses):
+        # save models if needed
+        is_lowest, self.val_losses_min = is_val_loss_lowest(val_losses,
+                                                            self.val_losses_min, self.min_errors_thresh)
+        if is_lowest:
             self.save_models()
-
-        # early stopping
         if self.early_stopping(val_losses):
             self.save_models()
             quit()
 
-        for k in self.depth_metric_names:
-            del val_losses[k]
+        del val_losses  # delete tmp
 
     def save_models(self, not_saved=()):
         # - delete previous weights
         del_files(self.opt.save_model_path)
 
         # - save new weights
-        weights_name = '_'.join(['weights', str(self.val_losses_min['loss/total'])[2:4],
-                                str(self.val_losses_min['da/a1'])[2:4]])
+        weights_name = '_'.join(['weights', str(self.val_losses_min['loss/total'].numpy())[2:4],
+                                str(self.val_losses_min['da/a1'].numpy())[2:4]])
         print('-> Saving weights with new low loss:\n', self.val_losses_min)
         weights_path = os.path.join(self.opt.save_model_path, weights_name)
         if not os.path.isdir(weights_path):
@@ -637,10 +588,6 @@ class Trainer:
                 tf.summary.image('scale0_automask_image',
                                  outputs[('automask', 0)][:2], step=self.epoch_cnt)
 
-            # poses
-            # axis_names = ['tx', 'ty', 'tz', 'rx', 'ry', 'rz']
-            # for i in range(len(axis_names)):
-            #     tf.summary.histogram(axis_names[i], self.pred_poses[:, :, :, i], step=self.epoch_cnt)
         writer.flush()
 
     def compute_depth_losses(self, input_imgs, outputs):
@@ -680,8 +627,11 @@ class Trainer:
         return losses
 
     def is_time_to(self, event, global_step):
+        if self.opt.debug_mode:
+            return False
+
         is_time = False
-        events = {0: 'print_loss', 1: 'save_model', 2: 'validate'}
+        events = {0: 'print_loss', 1: 'validate'}
         if event not in events.values():
             raise NotImplementedError
 
@@ -690,10 +640,9 @@ class Trainer:
             late_phase = global_step % 1000 == 0
             if early_phase or late_phase:
                 is_time = True
-        elif event == events[1] and (global_step + 1) % (self.train_loader.steps_per_epoch // 2) == 0:
+        elif event == events[1] and global_step % (self.train_loader.steps_per_epoch // self.opt.val_num_per_epoch) == 0:
             is_time = True
-        elif event == events[2] and (global_step + 1) % (self.train_loader.steps_per_epoch // 50) == 0:
-            is_time = True
+
         return is_time
 
 
