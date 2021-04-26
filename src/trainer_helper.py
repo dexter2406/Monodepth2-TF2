@@ -288,7 +288,7 @@ def back_proj_depth(depth, inv_K, shape, scale):
     return cam_points
 
 
-def bilinear_sampler(img, coords):
+def bilinear_sampler(img, coords, padding='border'):
     """ TF-version Bilinear Sampler
     Performs bilinear sampling of the input images according to the
     normalized coordinates provided by the sampling grid. Note that
@@ -333,22 +333,25 @@ def bilinear_sampler(img, coords):
 
     H = tf.shape(img)[1]
     W = tf.shape(img)[2]
+    # rescale x and y to [0, W-1/H-1]
     max_y = tf.cast(H - 1, 'int32')
     max_x = tf.cast(W - 1, 'int32')
-
-    # zero = tf.zeros([], dtype='int32')    #o
-    zero = tf.zeros([1], dtype=tf.int32)     #t
-    eps = tf.constant([0.5], 'float32')    #t
-
-    # rescale x and y to [0, W-1/H-1]
     x, y = coords[:, ..., 0], coords[:, ..., 1]
     x = tf.cast(x, 'float32')
     y = tf.cast(y, 'float32')
+    x = 0.5 * ((x + 1.0) * tf.cast(max_x - 1, 'float32'))
+    y = 0.5 * ((y + 1.0) * tf.cast(max_y - 1, 'float32'))
 
-    x = 0.5 * ((x + 1.0) * tf.cast(max_x - 1, 'float32')) #o
-    y = 0.5 * ((y + 1.0) * tf.cast(max_y - 1, 'float32')) #o
-    x = tf.clip_by_value(x, eps, tf.cast(max_x, tf.float32) - eps)   #t
-    y = tf.clip_by_value(y, eps, tf.cast(max_y, tf.float32) - eps)   #t
+    if padding == 'zeros':
+        zero = tf.zeros([], dtype='int32')
+        # x = tf.clip_by_value(x, tf.cast(zero, tf.float32), tf.cast(max_x, tf.float32))
+        # y = tf.clip_by_value(y, tf.cast(zero, tf.float32), tf.cast(max_y, tf.float32))
+
+    elif padding == 'border':
+        zero = tf.zeros([1], dtype=tf.int32)
+        eps = tf.constant([0.5], tf.float32)
+        x = tf.clip_by_value(x, eps, tf.cast(max_x, tf.float32) - eps)   # t+
+        y = tf.clip_by_value(y, eps, tf.cast(max_y, tf.float32) - eps)   # t+
 
     # grab 4 nearest corner points for each (x_i, y_i)
     x0 = tf.cast(tf.floor(x), 'int32')
@@ -529,35 +532,35 @@ def make_intrinsics_matrix(fx, fy, cx, cy):
     return intrinsics
 
 
-def show_images(batch_size, input_imgs, outputs):
+def show_images(batch_size, input_imgs, outputs, nrow=3, ncol=2):
     for i in range(batch_size):
         print(i)
-        fig = plt.figure(figsize=(3, 2))
-        fig.add_subplot(3, 2, 1)
+        fig = plt.figure(figsize=(nrow, ncol))
+        fig.add_subplot(nrow, ncol, 1)
         tgt = input_imgs[('color', 0, 0)][i].numpy()
         # tgt = inputs_imp[('color', 0, 0)][i]
         # tgt = np.transpose(tgt, [1,2,0])
         plt.imshow(tgt)
 
-        fig.add_subplot(3, 2, 3)
-        src0 = input_imgs[('color_aug', -1, 0)][i].numpy()
+        fig.add_subplot(nrow, ncol, 3)
+        src0 = input_imgs[('color', -1, 0)][i].numpy()
         # src0 = inputs_imp[('color_aug', -1, 0)][i]
         # src0 = np.transpose(src0, [1,2,0])
         print(np.max(np.max(src0)), np.min(np.min(src0)))
         plt.imshow(src0)
 
-        fig.add_subplot(3, 2, 4)
-        src1 = input_imgs[('color_aug', 1, 0)][i].numpy()
+        fig.add_subplot(nrow, ncol, 4)
+        src1 = input_imgs[('color', 1, 0)][i].numpy()
         # src1 = inputs_imp[('color_aug', 1, 0)][i]
         # src1 = np.transpose(src1, [1, 2, 0])
         print(np.max(np.max(src1)), np.min(np.min(src1)))
         plt.imshow(src1)
 
-        fig.add_subplot(3, 2, 5)
+        fig.add_subplot(nrow, ncol, 5)
         out0 = outputs[("color", -1, 0)][i].numpy()
         print(np.max(np.max(out0)), np.min(np.min(out0)))
         plt.imshow(out0)
-        fig.add_subplot(3, 2, 6)
+        fig.add_subplot(nrow, ncol, 6)
         out1 = outputs[("color", 1, 0)][i].numpy()
         print(np.max(np.max(out1)), np.min(np.min(out1)))
         plt.imshow(out1)
