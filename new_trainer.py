@@ -37,7 +37,7 @@ class Trainer:
         self.tgt_image_aug = None
         self.avg_reprojection = False
 
-        self.train_loss = 0.
+        self.train_loss_tmp = []
         self.losses = {}
         self.early_stopping_losses = defaultdict(list)
         self.global_step = tf.constant(0, dtype=tf.int64)
@@ -130,15 +130,16 @@ class Trainer:
         if self.opt.from_scratch:
             print('\ttraining completely from scratch, no ImageNet-pretrained weights for encoder...')
         else:
-            print('\tloading pretrained weights for encoders')
             weights_dir = 'logs/weights/pretrained_resnet18'    # in case no weights folder provided
             for m_name in self.opt.models_to_load:
                 if self.opt.weights_dir != '':
                     weights_dir = self.opt.weights_dir
                     self.models[m_name].load_weights(os.path.join(weights_dir, m_name + '.h5'))
                 else:
+                    print('\tloading pretrained weights for encoders')
                     if 'enc' in m_name:
                         self.models[m_name].load_weights(os.path.join(weights_dir, m_name + '.h5'))
+            print('weights loaded from ', weights_dir)
 
     # ----- For process_batch() -----
     def get_smooth_loss(self, disp, img):
@@ -157,14 +158,18 @@ class Trainer:
 
         return tf.reduce_mean(smoothness_x) + tf.reduce_mean(smoothness_y)
 
-    def compute_reproject_loss(self, proj_image, tgt_image):
-        l1_loss = tf.reduce_mean(tf.math.abs(proj_image - tgt_image), axis=3, keepdims=True)
-        ssim_loss = tf.reduce_mean(SSIM(proj_image, tgt_image), axis=3, keepdims=True)
+    def compute_reproject_loss(self, proj_image, tgt_image, sampler_mask=None):
+        abs_diff = tf.math.abs(proj_image - tgt_image)
+        ssim_diff = SSIM(proj_image, tgt_image)
+        if sampler_mask is not None:
+            abs_diff = abs_diff * sampler_mask
+            ssim_diff = ssim_diff * sampler_mask
+        l1_loss = tf.reduce_mean(abs_diff, axis=3, keepdims=True)
+        ssim_loss = tf.reduce_mean(ssim_diff, axis=3, keepdims=True)
         loss = self.opt.ssim_ratio * ssim_loss + (1 - self.opt.ssim_ratio) * l1_loss
         return loss
 
     def reset_losses(self):
-        self.train_loss = 0.
         self.losses = {'pixel_loss': 0, 'smooth_loss': 0}
 
     def compute_losses(self, input_imgs, outputs):
@@ -179,9 +184,10 @@ class Trainer:
             # -------------------
             reproject_losses = []
             for i, f_i in enumerate(self.opt.frame_idx[1:]):
+                sampler_mask = outputs[('sampler_mask', f_i, scale)]
                 proj_image = outputs[('color', f_i, scale)]
                 assert proj_image.shape[2] == tgt_image.shape[2] == self.opt.width
-                reproject_losses.append(self.compute_reproject_loss(proj_image, tgt_image))
+                reproject_losses.append(self.compute_reproject_loss(proj_image, tgt_image, sampler_mask))
                 # to collect
                 if scale == 0:
                     proj_error = tf.math.abs(proj_image - tgt_image)
@@ -203,8 +209,9 @@ class Trainer:
             else:
                 identity_reprojection_losses = []
                 for f_i in self.opt.frame_idx[1:]:
+                    sampler_mask = outputs[('sampler_mask', f_i, 0)]
                     proj_image = input_imgs[('color', f_i, sourec_scale)]
-                    identity_reprojection_losses.append(self.compute_reproject_loss(proj_image, tgt_image))
+                    identity_reprojection_losses.append(self.compute_reproject_loss(proj_image, tgt_image, sampler_mask))
 
                 identity_reprojection_losses = tf.concat(identity_reprojection_losses, axis=3)
 
@@ -307,11 +314,26 @@ class Trainer:
                 # input_tf = inputs_imp[("color", f_i, self.opt.src_scale)]
                 # input_tf = np.transpose(input_tf, [0,2,3,1])
                 # ------------
-                res = bilinear_sampler(input_tf, outputs[("sample", f_i, scale)])
-
+                res = bilinear_sampler(input_tf, outputs[("sample", f_i, scale)],
+                                       padding='zeros')
                 outputs[("color", f_i, scale)] = res
+                if self.opt.mask_border:
+                    sampler_mask = tf.cast(res * 255 > 1., tf.float32)
+                else:
+                    sampler_mask = None
+                outputs[('sampler_mask', f_i, scale)] = sampler_mask
 
         if self.opt.debug_mode:
+            f_i = 1
+            input_tf = input_imgs[('color', 0, 0)].numpy()[0]
+            res = outputs[("color", f_i, 0)].numpy()[0]
+            sampler_mask = outputs[('sampler_mask', f_i, 0)].numpy()[0]
+            fig = plt.figure(figsize=(2, 1))
+            fig.add_subplot(2, 1, 1)
+            plt.imshow(sampler_mask)
+            fig.add_subplot(2, 1, 2)
+            plt.imshow(tf.cast(res[..., 0] == input_tf[..., 0], tf.float32).numpy())
+            plt.show()
             show_images(self.opt.batch_size, input_imgs, outputs)
 
     def predict_poses(self, input_imgs, outputs):
@@ -399,9 +421,14 @@ class Trainer:
             grads, losses = self.grad(input_imgs, input_Ks,
                                       trainable_weights, global_step=self.global_step)
             self.optimizer.apply_gradients(zip(grads, trainable_weights))
+            self.train_loss_tmp.append(losses['loss/total'])
+
+            if self.is_time_to('log', self.global_step):
+                mean_loss = np.mean(self.train_loss_tmp)
+                self.train_loss_tmp = []
+                print("loss: ", mean_loss)
 
             if self.is_time_to('validate', self.global_step):
-                self.train_loss = losses['loss/total']
                 self.validate_miniset()
 
             self.global_step += 1
@@ -424,20 +451,19 @@ class Trainer:
             # Set new weights_folder for next epoch
             save_root = os.path.join(*self.opt.save_model_path.split('\\')[:-1])
             current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-            self.opt.save_model_path = os.path.join(save_root, current_time)
+            self.opt.save_model_path = os.path.join(save_root, 'logs/weights', current_time)
             print('-> New weights will be saved in %s...' % self.opt.save_model_path)
             if os.path.isdir(self.opt.save_model_path):
                 os.makedirs(self.opt.save_model_path)
 
-    @tf.function    # turn off to debug, e.g. with plt
+    # @tf.function    # turn off to debug, e.g. with plt
     def grad(self, input_imgs, input_Ks, trainables, global_step):
         with tf.GradientTape() as tape:
             outputs = self.process_batch(input_imgs, input_Ks)
             losses = self.compute_losses(input_imgs, outputs)
             total_loss = losses['loss/total']
             grads = tape.gradient(total_loss, trainables)
-            if self.is_time_to('print_loss', global_step):
-                tf.print("loss: ", total_loss, output_stream=sys.stdout)
+            if self.is_time_to('log', global_step):
                 print("colleting data in step ", global_step)
                 self.collect_summary('train', losses, input_imgs, outputs, global_step)
         return grads, losses
@@ -468,7 +494,7 @@ class Trainer:
         print("->Start training...")
         self.start_training()
 
-    @tf.function
+    # @tf.function
     def compute_batch_losses(self, input_imgs, input_Ks):
         """@tf.function enables graph computation, allowing larger batch size
         """
@@ -527,7 +553,7 @@ class Trainer:
             if mean_error > self.min_errors_thresh[metric]:
                 return early_stop
 
-        if self.train_loss < 0.11:
+        if np.mean(self.train_loss_tmp) < 0.11:
             early_stop = True
 
         return early_stop
@@ -588,9 +614,9 @@ class Trainer:
 
             # images
             tf.summary.image('tgt_image', input_imgs[('color', 0, 0)][:2], step=global_step)
-            # tf.summary.image('scale0_disp_color', colorize(outputs[('disp', 0)], cmap='plasma'), step=global_step)
-            tf.summary.image('scale0_disp_gray',
-                             normalize_image(outputs[('disp', 0)][:2]), step=global_step)
+            tf.summary.image('scale0_disp_color', colorize(outputs[('disp', 0)], cmap='plasma'), step=global_step)
+            # tf.summary.image('scale0_disp_gray',
+            #                  normalize_image(outputs[('disp', 0)][:2]), step=global_step)
 
             for f_i in self.opt.frame_idx[1:]:
                 tf.summary.image('scale0_proj_{}'.format(f_i),
@@ -645,7 +671,7 @@ class Trainer:
             return False
 
         is_time = False
-        events = {0: 'print_loss', 1: 'validate'}
+        events = {0: 'log', 1: 'validate'}
         if event not in events.values():
             raise NotImplementedError
 
