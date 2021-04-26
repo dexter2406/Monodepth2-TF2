@@ -1,6 +1,10 @@
 # Monodepth2-TF2
 It's a monodepth2 model implemented in TF2.x, original paper《Digging into Self-Supervised Monocular Depth Prediction》.
 
+- Here is the result after training for 13 epochs (without fine-tuning).
+
+![image](https://github.com/dexter2406/Monodepth2-TF2/blob/main/asset/test_epoch_13.jpg)
+
 ### Dependencies
 ```
 tensorflow==2.3.1
@@ -65,7 +69,6 @@ python simple_run.py --weights_dir --data_path --save_result_to --save_concat_im
 - save_concat_image: optional, show concatenated images with original image for comparison
 
 Next move:
-- training. For now I only train the model for 7 epoch. It's getting better but remains to be seen. Hope I could restore the official results.
 - try new stuff in similar papers, e.g. *struct2dpeth*
 
 ---
