@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 
 def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
     """save model when val loss hits new low"""
-    # just update val_loss_min, but not save model
-    if val_losses_min['da/a1'] == 10:
+    # just update val_loss_min for the first time, do not save model
+    if val_losses_min['loss/total'] == 10:
         print('initialize self.val_loss_min, doesn\'t count')
         skip = True
         val_losses_min['loss/total'] = val_losses['loss/total']
@@ -16,23 +16,30 @@ def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
     else:
         # directly skip when loss is not low enough
         # if the loss is the new low, should at least 2 another metrics
-        if val_losses['loss/total'] < max(0.1, val_losses_min['loss/total']):
-            val_losses_min['loss/total'] = val_losses['loss/total']
-            num_pass = 0
-            for metric in min_errors_thresh:
-                if metric == 'da/a1':
-                    print('--- a1 ---')
-                    if val_losses[metric] > val_losses_min[metric]:
-                        val_losses_min[metric] = val_losses[metric]
-                        num_pass += 1
-                else:
-                    if val_losses[metric] < val_losses_min[metric]:
-                        val_losses_min[metric] = val_losses[metric]
-                        num_pass += 1
-            skip = num_pass < 2
-            if not skip: print('val loss hits new low!')
-        else:
+        if val_losses['loss/total'] > max(0.1, val_losses_min['loss/total']):
             skip = True
+        else:
+            skip = False
+            # If has depth_gt, do some additional checks
+            if len(min_errors_thresh) != 0:
+                num_pass = 0
+                for metric in min_errors_thresh:
+                    if metric == 'da/a1':
+                        # for 'da/a1', argmax
+                        if val_losses[metric] > val_losses_min[metric]:
+                            num_pass += 1
+                    else:
+                        # for other metric, argmin
+                        if val_losses[metric] < val_losses_min[metric]:
+                            num_pass += 1
+                skip = num_pass < 1  # if no metric exceeds, decision will be override
+
+            if not skip:
+                print('val loss hits new low!')
+                val_losses_min['loss/total'] = val_losses['loss/total']
+                for metric in min_errors_thresh:
+                    val_losses_min[metric] = val_losses[metric]
+
     return not skip, val_losses_min
 
 
