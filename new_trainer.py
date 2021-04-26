@@ -29,7 +29,7 @@ class Trainer:
         self.models = {}
         self.num_frames_per_batch = len(self.opt.frame_idx)
         self.train_loader: DataLoader = None
-        self.val_loader: DataLoader = None
+        self.mini_val_loader: DataLoader = None
         self.shape_scale0 = [self.opt.batch_size, self.opt.height, self.opt.width, 3]
 
         self.tgt_image = None
@@ -37,23 +37,14 @@ class Trainer:
         self.tgt_image_aug = None
         self.avg_reprojection = False
 
-        self.tgt_image_all = []
-        self.src_image_stack_all = []
-        self.proj_image_stack_all = []
-        self.proj_error_stack_all = []
-        self.pred_auto_masks = []
-
         self.train_loss = 0.
         self.losses = {}
         self.early_stopping_losses = defaultdict(list)
-        # self.global_step = tf.Variable(0, dtype=tf.int32, trainable=False)
         self.global_step = tf.constant(0, dtype=tf.int64)
-        self.epoch_cnt = tf.Variable(0, dtype=tf.int64, trainable=False)
-        self.depth_metric_names = [
-            "de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms", "da/a1", "da/a2", "da/a3"]
+        self.depth_metric_names = []
         self.min_errors_thresh = {}
-        self.val_losses_min = defaultdict(lambda:10)    # random number as initiation
-        self.val_iter = None
+        self.val_losses_min = defaultdict(lambda: 10)    # random number as initiation
+        self.mini_val_iter = None
         self.train_iter = None
         self.batch_processor: DataProcessor = None
         self.lr_fn = None
@@ -82,35 +73,46 @@ class Trainer:
         train_file = 'train_files.txt'
         val_file = 'val_files.txt'
 
-        # train dataset & loader
+        # Train dataset & loader
         train_dataset = dataset_choices[self.opt.dataset](
             split_folder, train_file, data_path=self.opt.data_path)
         self.train_loader = DataLoader(train_dataset, self.opt.num_epochs,
                                        self.opt.batch_size, self.opt.frame_idx)
         self.train_iter = self.train_loader.build_train_dataset()
-        # if available, validation dataset & loader
+
+        # Validation dataset & loader
+        # - mini-val during the epoch
+        mini_val_dataset = dataset_choices[self.opt.dataset](
+            split_folder, val_file, data_path=self.opt.data_path)
+        self.mini_val_loader = DataLoader(mini_val_dataset, num_epoch=self.opt.num_epochs,
+                                          batch_size=4, frame_idx=self.opt.frame_idx)
+        self.mini_val_iter = self.mini_val_loader.build_val_dataset(include_depth=self.train_loader.has_depth,
+                                                                    buffer_size=300)
+        # - Val after one epoch
+        val_dataset = dataset_choices[self.opt.dataset](
+            split_folder, val_file, data_path=self.opt.data_path)
+        self.val_loader = DataLoader(val_dataset, num_epoch=self.opt.num_epochs,
+                                     batch_size=4, frame_idx=self.opt.frame_idx)
+        self.val_iter = self.val_loader.build_val_dataset(include_depth=self.train_loader.has_depth,
+                                                          buffer_size=self.opt.batch_size)
         if self.train_loader.has_depth:
-            val_dataset = dataset_choices[self.opt.dataset](
-                split_folder, val_file, data_path=self.opt.data_path)
-            self.val_loader = DataLoader(val_dataset, num_epoch=2,
-                                         batch_size=4, frame_idx=self.opt.frame_idx)
-            self.val_iter = self.val_loader.build_val_dataset()
-            # validation metrics
+            # Val metrics only when depth_gt available
             self.min_errors_thresh = {'de/abs_rel': 0.14, 'de/sq_rel': 1.,
                                       'de/rms': 4.8, 'da/a1': 0.83}
+            self.depth_metric_names = ["de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms",
+                                       "da/a1", "da/a2", "da/a3"]
 
-        # batch data preprocessor
+        # Batch data preprocessor
         self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx, intrinsics=train_dataset.K)
 
         # Init models
         self.models['depth_enc'] = ResNet18_new([2, 2, 2, 2])
         self.models['depth_dec'] = DepthDecoder_full()
         self.models['pose_enc'] = ResNet18_new([2, 2, 2, 2])
-        shapes = [(1, 96, 320, 64), (1, 48, 160, 64), (1, 24, 80, 128), (1, 12, 40, 256), (1, 6, 20, 512)]
-        inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
         self.models['pose_dec'] = PoseDecoder(num_ch_enc=[64, 64, 128, 256, 512])
-        _ = self.models['pose_dec'].predict(inputs)
-
+        # shapes = [(1, 96, 320, 64), (1, 48, 160, 64), (1, 24, 80, 128), (1, 12, 40, 256), (1, 6, 20, 512)]
+        # inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
+        # _ = self.models['pose_dec'].predict(inputs)
         build_models(self.models, show_summary=False, check_outputs=False)
         self.load_models()
 
@@ -118,8 +120,7 @@ class Trainer:
         boundaries = [self.opt.lr_step_size, self.opt.lr_step_size*2]           # [15, 30]
         values = [self.opt.learning_rate * scale for scale in [1, 0.1, 0.01]]   # [1e-4, 1e-5, 1e-6]
         self.lr_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate = self.lr_fn(self.epoch_cnt))
-        # self.optm_ckpt = tf.train.Checkpoint(optimizer=self.optimizer)
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.lr_fn(0))
 
         # Init inverse-warping helpers
         self.back_project_dict[self.opt.src_scale] = BackProjDepth(self.shape_scale0, self.opt.src_scale)
@@ -129,7 +130,7 @@ class Trainer:
         if self.opt.from_scratch:
             print('\ttraining completely from scratch, no ImageNet-pretrained weights for encoder...')
         else:
-            print('\tloading pretrained weights')
+            print('\tloading pretrained weights for encoders')
             weights_dir = 'logs/weights/pretrained_resnet18'    # in case no weights folder provided
             for m_name in self.opt.models_to_load:
                 if self.opt.weights_dir != '':
@@ -229,7 +230,6 @@ class Trainer:
             else:
                 to_optimise = combined
             reprojection_loss = tf.reduce_mean(to_optimise)
-            # self.pixel_losses += reprojection_loss
             self.losses['pixel_loss'] += reprojection_loss
 
             # -------------------
@@ -238,7 +238,7 @@ class Trainer:
             disp_s = outputs[('disp', scale)]
             tgt_image_s = input_imgs['color', 0, scale]
             smooth_loss_raw = self.get_smooth_loss(disp_s, tgt_image_s)
-            smooth_loss = self.opt.smoothness_ratio * smooth_loss_raw / 2 ** scale
+            smooth_loss = self.opt.smoothness_ratio * smooth_loss_raw / (2 ** scale)
 
             # ------------------
             # 5. Overall Loss, accumulate scale-wise
@@ -249,14 +249,8 @@ class Trainer:
             # ------------------
             # Optional: Collect results for summary
             # ------------------
-            # self.smooth_losses += smooth_loss
             self.losses['smooth_loss'] += smooth_loss
             # self.losses['loss/%d' % scale] = total_loss_tmp
-            if scale == 0:
-                src_image_stack_aug = tf.concat([input_imgs[('color_aug', -1, 0)],
-                                                 input_imgs[('color_aug', -1, 0)]], axis=3)
-                self.src_image_stack_all.append(src_image_stack_aug)
-                self.tgt_image_all.append(tgt_image)
 
         self.losses['pixel_loss'] /= self.opt.num_scales
         self.losses['smooth_loss'] /= self.opt.num_scales
@@ -280,7 +274,6 @@ class Trainer:
         # inputs_imp = imported['inputs_imgs_Ks']
         # # outputs_imp = imported['outputs']
         # -----------
-
         for scale in range(self.opt.num_scales):
             # print("===== scale %d ====="%scale)
 
@@ -394,33 +387,47 @@ class Trainer:
 
         return outputs
 
+    def run_epoch(self, epoch):
+        for _ in tqdm(range(self.train_loader.steps_per_epoch),
+                      desc='Epoch%d/%d' % (epoch + 1, self.opt.num_epochs)):
+            # data preparation
+            batch = self.train_iter.get_next()
+            input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+
+            # training
+            trainable_weights = self.get_trainable_weights()
+            grads, losses = self.grad(input_imgs, input_Ks,
+                                      trainable_weights, global_step=self.global_step)
+            self.optimizer.apply_gradients(zip(grads, trainable_weights))
+
+            if self.is_time_to('validate', self.global_step):
+                self.train_loss = losses['loss/total']
+                self.validate_miniset()
+
+            self.global_step += 1
+
     def start_training(self):
         """Custom training loop
         - use @tf.function for self.grad() and self.dataloader.prepare_batch()
             allow larger batch_size GPU utilization.
         """
         for epoch in range(self.opt.num_epochs):
-            self.epoch_cnt.assign(epoch)
             self.optimizer.lr = self.lr_fn(epoch)     # learning rate 15:1e-4; >16:1e-5
             print("\tlearning rate - epoch %d: " % epoch, self.optimizer.get_config()['learning_rate'])
 
-            for _ in tqdm(range(self.train_loader.steps_per_epoch),
-                          desc='Epoch%d/%d' % (epoch+1, self.opt.num_epochs)):
-                # data preparation
-                batch = self.train_iter.get_next()
-                input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+            self.run_epoch(epoch)
 
-                # training
-                trainable_weights = self.get_trainable_weights()
-                grads, losses = self.grad(input_imgs, input_Ks,
-                                          trainable_weights, global_step=self.global_step)
-                self.optimizer.apply_gradients(zip(grads, trainable_weights))
+            print('-> Validating after epoch %d...' % epoch)
+            val_losses = self.start_validating(self.global_step, num_run=self.val_loader.steps_per_epoch)
+            self.save_models(val_losses, del_prev=False)
 
-                if self.is_time_to('validate', self.global_step):
-                    self.train_loss = losses['loss/total']
-                    self.validate_miniset()
-
-                self.global_step += 1
+            # Set new weights_folder for next epoch
+            save_root = os.path.join(*self.opt.save_model_path.split('\\')[:-1])
+            current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+            self.opt.save_model_path = os.path.join(save_root, current_time)
+            print('-> New weights will be saved in %s...' % self.opt.save_model_path)
+            if os.path.isdir(self.opt.save_model_path):
+                os.makedirs(self.opt.save_model_path)
 
     @tf.function    # turn off to debug, e.g. with plt
     def grad(self, input_imgs, input_Ks, trainables, global_step):
@@ -454,9 +461,8 @@ class Trainer:
         if self.opt.recording:
             train_log_dir = os.path.join(self.opt.record_summary_path, self.opt.model_name, 'train')
             self.summary_writer['train'] = tf.summary.create_file_writer(train_log_dir)
-            if self.train_loader.has_depth:
-                val_log__dir = os.path.join(self.opt.record_summary_path, self.opt.model_name, 'val')
-                self.summary_writer['val'] = tf.summary.create_file_writer(val_log__dir)
+            val_log__dir = os.path.join(self.opt.record_summary_path, self.opt.model_name, 'val')
+            self.summary_writer['val'] = tf.summary.create_file_writer(val_log__dir)
             print('\tSummary will be stored in %s ' % train_log_dir)
 
         print("->Start training...")
@@ -474,7 +480,7 @@ class Trainer:
         """run mini-set to see if should store current-best weights"""
         losses_all = defaultdict(list)
         for i in range(num_run):
-            batch = self.val_iter.get_next()
+            batch = self.mini_val_iter.get_next()
             input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
             outputs, losses = self.compute_batch_losses(input_imgs, input_Ks)
             if ('depth_gt', 0) in input_imgs.keys():
@@ -484,8 +490,10 @@ class Trainer:
                 losses_all[metric].append(loss)
         # mean of mini val-set
         for metric, loss in losses_all.items():
-            losses_all[metric] = tf.reduce_mean(loss)
-
+            med_range = [int(num_run*0.1), int(num_run*0.9)]
+            losses_all[metric] = tf.reduce_mean(
+                tf.sort(loss)[med_range[0]: med_range[1]]
+            )
         # ----------
         # log val losses and delete
         # ----------
@@ -496,7 +504,7 @@ class Trainer:
 
         print('-> Validating losses by depth ground-truth: ')
         val_loss_str = ''
-        val_loss_min_str= ''
+        val_loss_min_str = ''
         for k in list(losses_all):
             if k in self.depth_metric_names:
                 val_loss_str = ''.join([val_loss_str, '{}: {:.4f} | '.format(k, losses_all[k])])
@@ -531,20 +539,26 @@ class Trainer:
         is_lowest, self.val_losses_min = is_val_loss_lowest(val_losses,
                                                             self.val_losses_min, self.min_errors_thresh)
         if is_lowest:
-            self.save_models()
+            self.save_models(del_prev=True)
         if self.early_stopping(val_losses):
-            self.save_models()
-            quit()
+            self.save_models(val_losses, del_prev=False)
 
         del val_losses  # delete tmp
 
-    def save_models(self, not_saved=()):
+    def save_models(self, val_losses=None, del_prev=True, not_saved=()):
+        """save models in 1) during epoch val_loss hits new low, 2) after one epoch"""
         # - delete previous weights
-        del_files(self.opt.save_model_path)
+        if del_prev:
+            del_files(self.opt.save_model_path)
 
-        # - save new weights
-        weights_name = '_'.join(['weights', str(self.val_losses_min['loss/total'].numpy())[2:4],
-                                str(self.val_losses_min['da/a1'].numpy())[2:4]])
+        # - save new weightspy
+        if val_losses is None:
+            val_losses = self.val_losses_min
+        if self.train_loader.has_depth:
+            weights_name = '_'.join(['weights', str(val_losses['loss/total'].numpy())[2:5],
+                                    str(val_losses['da/a1'].numpy())[2:4]])
+        else:
+            weights_name = '_'.join(['weights', str(val_losses['loss/total'].numpy())[2:5]])
         print('-> Saving weights with new low loss:\n', self.val_losses_min)
         weights_path = os.path.join(self.opt.save_model_path, weights_name)
         if not os.path.isdir(weights_path):
@@ -586,7 +600,7 @@ class Trainer:
 
             if self.opt.do_automasking:
                 tf.summary.image('scale0_automask_image',
-                                 outputs[('automask', 0)][:2], step=self.epoch_cnt)
+                                 outputs[('automask', 0)][:2], step=global_step)
 
         writer.flush()
 
