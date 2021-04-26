@@ -14,6 +14,7 @@ from models.encoder_creater import ResNet18_new
 from new_trainer import build_models
 from absl import app, flags
 import datetime
+from src.trainer_helper import colorize
 
 # tf.keras.backend.set_floatx('float16')
 CMAP_DEFAULT = 'plasma'
@@ -22,14 +23,15 @@ physical_devices = tf.config.experimental.list_physical_devices('GPU')
 assert len(physical_devices) > 0, "Not enough GPU hardware devices available"
 config = tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
-FLAGS = flags.FLAGS
-flags.DEFINE_string('data_path', r'D:\MA\Struct2Depth\KITTI_odom_02\seq2.mp4', 'path to a video or an image file')
-flags.DEFINE_string('weights_dir', 'logs/weights/trained_odom', 'load weights from')
-flags.DEFINE_string('save_result_to', '', 'if set, results will be saved to that path')
-flags.DEFINE_bool('save_concat_image', False, 'if set True, result will include original image')
-flags.mark_flag_as_required('data_path')
-
 current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+
+FLAGS = flags.FLAGS
+flags.DEFINE_string('data_path', 'assets/test_image.jpg', 'path to a video or an image file')
+flags.DEFINE_string('weights_dir', 'logs/weights/epoch_13/weights_090_79', 'load weights from')
+flags.DEFINE_string('save_result_to', 'outputs', 'if set, results will be saved to that path')
+flags.DEFINE_bool('save_concat_image', True, 'if set True, result will include original image')
+flags.mark_flag_as_required('data_path')
+flags.mark_flag_as_required('weights_dir')
 
 
 def main(_):
@@ -49,11 +51,12 @@ def detect_image(opt):
 
     print('-> Run detection on image...')
     scaled_size = (640, 192)
-    input_data, _ = prepare_image(image, as_tensor=True, feed_size=scaled_size)
+    input_data, _ = prepare_image(image, as_tensor=True, feed_size=scaled_size, image_type='normal')
     disp_raw = models['depth_dec'](models['depth_enc'](input_data))
 
     disp = disp_raw['output_0']
     output, colormapped_small = visualize(disp, original_width=orig_w, original_height=orig_h)
+    # output = colorize(disp, cmap='plasma')
 
     if opt.save_concat_image:
         output = np.concatenate([output, image], axis=0)
@@ -61,7 +64,8 @@ def detect_image(opt):
         save_path = os.path.join(opt.save_result_to,
                                  'test_image{}.jpg'.format(current_time))
         print('-> Saveing image to', save_path)
-        cv.imwrite(save_path, img=output)
+        cv.imwrite(save_path, output)
+        # plt.savefig(save_path)
     plt.imshow(output), plt.show()
 
 
@@ -89,7 +93,7 @@ def detect_video(opt):
         t0 = time.perf_counter() * 1000.
 
         t1 = time.perf_counter() * 1000.
-        input_data, _ = prepare_image(image, as_tensor=True, feed_size=scaled_size)
+        input_data, _ = prepare_image(image, as_tensor=True, feed_size=scaled_size, image_type='normal')
         features = models['depth_enc'](input_data)
         timers['encoder'] = time.perf_counter() * 1000. - t1
 
@@ -169,7 +173,7 @@ def visualize(outputs, original_width, original_height, channel_first=False):
     # im = pil.fromarray(colormapped_im)
     # im.save("{}_disp.jpeg".format(output_name))
     colormapped_normal = cv.resize(colormapped_small, (original_width, original_height))
-
+    colormapped_normal = cv.cvtColor(colormapped_normal, cv.COLOR_BGR2RGB)
     return colormapped_normal, colormapped_small
 
 
