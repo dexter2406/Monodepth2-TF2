@@ -46,15 +46,13 @@ The models (transferred from official Pytorch model, trained on KITTI-Odometry d
 Note：It's trained on *Odometry* split, so if applied on *Raw* data, the results won't be perfect.
 
 ### TODO
-- [X] implement the encoder-decoder model in TF2.x, just for singlet depth estimation. 
-- [X] Pose encoder: multi-image-input version of the encoder
-- [X] Pose decoder
+- [X] Depth and Pose encoder-decoder
+- [X] TF2 data loader for KITTI dataset (*KITTI_Raw* and *KITTI_Odom*)
 - [X] training code
-- [X] validation code in training
-- [X] modify data loader to accept more dataset (*KITTI_Raw* and *KITTI_Odom*)
-- [X] evluation code
-- [X] simple test code
-- [ ] try new stuff in similar papers, e.g. *struct2dpeth*
+- [X] evluation code for depth and pose
+- [ ] Add new stuff from *Unsupervised Monocular Depth Learning in Dynamic Scenes* and *Depth from Videos in the Wild*
+    - [ ] implement Motion-Field model, to replace (rot, trans) with (rot, trans, trans_residual, intrinsics) for more information
+    - [ ] construct corresponding losses: rgbd and motion consistency losses
 
 ### Note up-to-date
 First, Evaluation code, i.e. `eval_depth.py` and `eval_pose.py` is finished.
