@@ -11,10 +11,9 @@ from collections import defaultdict
 from utils import *
 from models.depth_decoder_creater import DepthDecoder_full
 from models.encoder_creater import ResNet18_new
-from new_trainer import build_models
+from src.trainer_helper import build_models, colorize
 from absl import app, flags
 import datetime
-from src.trainer_helper import colorize
 
 # tf.keras.backend.set_floatx('float16')
 CMAP_DEFAULT = 'plasma'
