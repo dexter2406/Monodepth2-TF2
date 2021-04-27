@@ -132,12 +132,13 @@ class Trainer:
         else:
             weights_dir = 'logs/weights/pretrained_resnet18'    # in case no weights folder provided
             for m_name in self.opt.models_to_load:
+                print('\tloading', m_name)
                 if self.opt.weights_dir != '':
                     weights_dir = self.opt.weights_dir
                     self.models[m_name].load_weights(os.path.join(weights_dir, m_name + '.h5'))
                 else:
-                    print('\tloading pretrained weights for encoders')
                     if 'enc' in m_name:
+                        print('\t\tusing pretrained encoders')
                         self.models[m_name].load_weights(os.path.join(weights_dir, m_name + '.h5'))
             print('weights loaded from ', weights_dir)
 
@@ -315,7 +316,7 @@ class Trainer:
                 # input_tf = np.transpose(input_tf, [0,2,3,1])
                 # ------------
                 res = bilinear_sampler(input_tf, outputs[("sample", f_i, scale)],
-                                       padding='zeros')
+                                       padding=self.opt.padding_mode)
                 outputs[("color", f_i, scale)] = res
                 if self.opt.mask_border:
                     sampler_mask = tf.cast(res * 255 > 1., tf.float32)
@@ -414,7 +415,7 @@ class Trainer:
                       desc='Epoch%d/%d' % (epoch + 1, self.opt.num_epochs)):
             # data preparation
             batch = self.train_iter.get_next()
-            input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+            input_imgs, input_Ks = self.batch_processor.prepare_batch(batch, is_train=True)
 
             # training
             trainable_weights = self.get_trainable_weights()
@@ -456,7 +457,7 @@ class Trainer:
             if os.path.isdir(self.opt.save_model_path):
                 os.makedirs(self.opt.save_model_path)
 
-    # @tf.function    # turn off to debug, e.g. with plt
+    @tf.function    # turn off to debug, e.g. with plt
     def grad(self, input_imgs, input_Ks, trainables, global_step):
         with tf.GradientTape() as tape:
             outputs = self.process_batch(input_imgs, input_Ks)
@@ -484,7 +485,7 @@ class Trainer:
             print("Please specify a model to train")
             return
 
-        if self.opt.recording:
+        if self.opt.recording and not self.opt.debug_mode:
             train_log_dir = os.path.join(self.opt.record_summary_path, self.opt.model_name, 'train')
             self.summary_writer['train'] = tf.summary.create_file_writer(train_log_dir)
             val_log__dir = os.path.join(self.opt.record_summary_path, self.opt.model_name, 'val')
@@ -494,7 +495,7 @@ class Trainer:
         print("->Start training...")
         self.start_training()
 
-    # @tf.function
+    @tf.function
     def compute_batch_losses(self, input_imgs, input_Ks):
         """@tf.function enables graph computation, allowing larger batch size
         """
@@ -507,7 +508,7 @@ class Trainer:
         losses_all = defaultdict(list)
         for i in range(num_run):
             batch = self.mini_val_iter.get_next()
-            input_imgs, input_Ks = self.batch_processor.prepare_batch(batch)
+            input_imgs, input_Ks = self.batch_processor.prepare_batch(batch, is_train=False)
             outputs, losses = self.compute_batch_losses(input_imgs, input_Ks)
             if ('depth_gt', 0) in input_imgs.keys():
                 losses.update(
@@ -548,12 +549,10 @@ class Trainer:
         for metric in self.min_errors_thresh:
             self.early_stopping_losses[metric].append(losses[metric])
             mean_error = np.mean(self.early_stopping_losses[metric][-patience:])
-            if losses[metric] > self.min_errors_thresh[metric]:
-                print('* early stopping ready')
             if mean_error > self.min_errors_thresh[metric]:
                 return early_stop
 
-        if np.mean(self.train_loss_tmp) < 0.11:
+        if np.mean(self.train_loss_tmp) < 0.10:
             early_stop = True
 
         return early_stop
@@ -587,7 +586,7 @@ class Trainer:
             weights_name = '_'.join(['weights', str(val_losses['loss/total'].numpy())[2:5]])
         print('-> Saving weights with new low loss:\n', self.val_losses_min)
         weights_path = os.path.join(self.opt.save_model_path, weights_name)
-        if not os.path.isdir(weights_path):
+        if not os.path.isdir(weights_path) and not self.opt.debug_mode:
             os.makedirs(weights_path)
 
         for m_name, model in self.models.items():
@@ -614,7 +613,7 @@ class Trainer:
 
             # images
             tf.summary.image('tgt_image', input_imgs[('color', 0, 0)][:2], step=global_step)
-            tf.summary.image('scale0_disp_color', colorize(outputs[('disp', 0)], cmap='plasma'), step=global_step)
+            tf.summary.image('scale0_disp_color', colorize(outputs[('disp', 0)][:2], cmap='plasma'), step=global_step)
             # tf.summary.image('scale0_disp_gray',
             #                  normalize_image(outputs[('disp', 0)][:2]), step=global_step)
 
@@ -676,7 +675,7 @@ class Trainer:
             raise NotImplementedError
 
         if event == events[0]:
-            early_phase = global_step % self.opt.record_freq == 0 and global_step < 2000
+            early_phase = global_step % self.opt.record_freq == 0 and global_step < 1000
             late_phase = global_step % 1000 == 0
             if early_phase or late_phase:
                 is_time = True
