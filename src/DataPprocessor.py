@@ -7,17 +7,20 @@ import sys
 
 
 class DataProcessor(object):
-    def __init__(self, frame_idx, intrinsics=None, is_train=False, num_scales=4):
-        self.is_train = is_train
+    def __init__(self, frame_idx, intrinsics, num_scales=4):
         self.num_scales = num_scales     # for evaluation, 1
         self.height = 192
         self.width = 640
         self.frame_idx = frame_idx
         self.batch_size = -1
         self.K = intrinsics
+        self.brightness = 0.2
+        self.contrast = 0.2
+        self.saturation = 0.2
+        self.hue = 0.1
 
     @tf.function
-    def prepare_batch(self, batch):
+    def prepare_batch(self, batch, is_train):
         """Apply augmentation
         tgt_batch: ndarray
             - [<Batch>, 192, 640, 3]
@@ -34,23 +37,20 @@ class DataProcessor(object):
         src_image_stack_aug = input_imgs['color_aug', 1:, :]
         tgt_image_pyramid = input_imgs['color, 0, :]
         """
-        # do_color_aug = self.is_train and np.random.random() > 0.5
-        # do_flip = False
-        # tf.print('train shape', batch[0].shape, batch[1].shape)
-        input_imgs, input_Ks = self.process_batch_main(batch)
+        do_color_aug = is_train and np.random.random() > 0.5
+        input_imgs, input_Ks = self.process_batch_main(batch, do_color_aug)
         return input_imgs, input_Ks
 
-    @tf.function
-    def prepare_batch_val(self, batch, depth_batch):
+    def prepare_batch_val(self, batch):
         """duplicate of prepare_batch(), no @tf.function decorator
         For validation OR evaluation
         """
         # tf.print('val shape')
         # tf.print(batch[0].shape, batch[1].shape, output_stream=sys.stdout)
-        input_imgs, input_Ks = self.process_batch_main(batch, depth_batch)
+        input_imgs, input_Ks = self.process_batch_main(batch, do_color_aug=False)
         return input_imgs, input_Ks
 
-    def process_batch_main(self, batch):
+    def process_batch_main(self, batch, do_color_aug=False):
         input_imgs, input_Ks = {}, {}
         if type(batch) == tuple:
             batch_imgs = batch[0]
@@ -67,11 +67,25 @@ class DataProcessor(object):
             for i, f_i in enumerate(self.frame_idx[1:]):
                 input_imgs[('color', f_i, -1)] = src_batch[..., i*3: (i+1)*3]
 
-        input_imgs, input_Ks = self.preprocess(input_imgs, input_Ks)
+        input_imgs, input_Ks = self.preprocess(input_imgs, input_Ks, do_color_aug)
         self.delete_raw_images(input_imgs)
         return input_imgs, input_Ks
 
-    def preprocess(self, input_imgs, input_Ks):
+    def color_aug(self, image, do_color_aug):
+        """Apply augmentation (fixed seed needed)
+        Same aug for each batch (and scales), Note that all images input to the pose network receive the
+        same augmentation.
+        """
+        if not do_color_aug:
+            return image
+        else:
+            image = tf.image.random_brightness(image, self.brightness)
+            image = tf.image.random_saturation(image, 1-self.saturation, 1+self.saturation)
+            image = tf.image.random_contrast(image, 1-self.contrast, 1+self.contrast)
+            image = tf.image.random_hue(image, self.hue)
+        return image
+
+    def preprocess(self, input_imgs, input_Ks, do_color_aug):
         """Make pyramids and augmentations
         - pyramid: use the raw (scale=-=1) to produce scale==[0:4] images
         - augment: correspond to the pyramid source
@@ -88,7 +102,7 @@ class DataProcessor(object):
                                                     (self.height//(2**scale), self.width//(2**scale)),
                                                     antialias=True)
                     input_imgs[(img_type, f_i, scale)] = resized_image
-                    input_imgs[(img_type + '_aug', f_i, scale)] = self.color_aug(resized_image)
+                    input_imgs[(img_type + '_aug', f_i, scale)] = self.color_aug(resized_image, do_color_aug)
 
         for scale in range(self.num_scales):
             # For KITTI. Must *normalize* when using on different scale
@@ -110,12 +124,4 @@ class DataProcessor(object):
     def delete_raw_images(self, input_imgs, scale_to_del=-1):
         for idx in self.frame_idx:
             del input_imgs[('color', self.frame_idx[idx], scale_to_del)]
-
-    def color_aug(self, image):
-        # todo: implement color augmentations
-        """Apply augmentation (fixed seed needed)
-        Same aug for each batch (and scales), Note that all images input to the pose network receive the
-        same augmentation.
-        """
-        return image
 
