@@ -50,6 +50,7 @@ Note：It's trained on *Odometry* split, so if applied on *Raw* data, the result
 - [X] TF2 data loader for KITTI dataset (*KITTI_Raw* and *KITTI_Odom*)
 - [X] training code
 - [X] evluation code for depth and pose
+- [ ] see where to improve: pose net can use `pose = mean(inv(pose), pose)` to put constraint on predicted poses on two frames
 - [ ] Add new stuff from *Unsupervised Monocular Depth Learning in Dynamic Scenes* and *Depth from Videos in the Wild*
     - [ ] implement Motion-Field model, to replace (rot, trans) with (rot, trans, trans_residual, intrinsics) for more information
     - [ ] construct corresponding losses: rgbd and motion consistency losses
