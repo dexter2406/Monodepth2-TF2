@@ -128,13 +128,21 @@ def del_files(root_dir):
 
 
 def check_options(FLAGS):
-    all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_enc']
+    all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_dec']
 
     print("-> Check options...")
     for m in FLAGS.models_to_load:
         if m not in all_models:
             raise ValueError("\t'%s' is not supported model, choose from: " % m, all_models)
     print('\t Using dataset:', FLAGS.split)
+
+    if FLAGS.padding_mode == 'zeros':
+        FLAGS.mask_border = True
+        print('\t zero-padding -> mask_border')
+    elif FLAGS.padding_mode == 'border':
+        FLAGS.mask_border = False
+        print('\tborder-padding -> no masking')
+
     if FLAGS.debug_mode:
         print('\t[debug mode] Check intermediate results. '
               'Models will not be trained or saved even if options are given.')
@@ -162,7 +170,7 @@ def check_options(FLAGS):
             if from_scratch:
                 print("\n\tall models are trained from scratch")
             else:
-                raise ValueError('\tif not from scratch, please specify --weights_dir to load weights')
+                print('\t No weights_dir specified: decoders from scratch, encoders with pretrained weights')
         else:
             not_loaded = [m for m in all_models if m not in FLAGS.models_to_load]
 
