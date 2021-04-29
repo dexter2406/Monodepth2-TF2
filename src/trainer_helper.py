@@ -8,7 +8,7 @@ def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
     """save model when val loss hits new low"""
     # just update val_loss_min for the first time, do not save model
     if val_losses_min['loss/total'] == 10:
-        print('initialize self.val_loss_min, doesn\'t count')
+        print('\tinitialize self.val_loss_min, doesn\'t count')
         skip = True
         val_losses_min['loss/total'] = val_losses['loss/total']
         for metric in min_errors_thresh:
@@ -43,28 +43,36 @@ def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
     return not skip, val_losses_min
 
 
-def build_models(models_dict, check_outputs=False, show_summary=False):
+def build_models(models_dict, check_outputs=False, show_summary=False, rgb_cat_depth=False):
     print("->Building models")
     for k, m in models_dict.items():
         print("\t%s" % k)
         if "depth_enc" == k:
-            inputs = tf.random.uniform(shape=(1, 192, 640, 3))
+            inputs = tf.random.uniform(shape=(2, 192, 640, 3))
             outputs = m(inputs)
         elif "depth_dec" == k:
-            shapes = [(1, 96, 320, 64), (1, 48, 160, 64), (1, 24, 80, 128), (1, 12, 40, 256), (1, 6, 20, 512)]
+            shapes = [(2, 96, 320, 64), (2, 48, 160, 64), (2, 24, 80, 128), (2, 12, 40, 256), (2, 6, 20, 512)]
             inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
             outputs = m(inputs)
         elif "pose_enc" == k:
-            shape = (1, 192, 640, 3)
+            if rgb_cat_depth:
+                shape = (2, 192, 640, 4)
+            else:
+                shape = (2, 192, 640, 3)
             inputs = tf.concat([tf.random.uniform(shape=shape),
                                 tf.random.uniform(shape=shape)], axis=3)
             outputs = m(inputs)
-        elif "pose_dec" == k:
-            shapes = [(1, 96, 320, 64), (1, 48, 160, 64), (1, 24, 80, 128), (1, 12, 40, 256), (1, 6, 20, 512)]
+        elif "pose_enc_concat" == k:
+            shape = (2, 192, 640, 4)
+            inputs = tf.concat([tf.random.uniform(shape=shape),
+                                tf.random.uniform(shape=shape)], axis=3)
+            outputs = m(inputs)
+        elif "pose_dec" in k:
+            shapes = [(2, 96, 320, 64), (2, 48, 160, 64), (2, 24, 80, 128), (2, 12, 40, 256), (2, 6, 20, 512)]
             inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
             outputs = m(inputs)
         else:
-            raise NotImplementedError
+            print('skipping %s'%k)
 
         if check_outputs:
             print(type(outputs))
@@ -406,12 +414,40 @@ def transformation_from_parameters(axisangle, translation, invert=False):
         t *= -1
 
     T = get_translation_matrix(t)
-
+    print(R.shape, T.shape)
     if invert:
         M = tf.matmul(R, T)
     else:
         M = tf.matmul(T, R)
     return M
+
+
+def transformation_loss(axisangles, translations, invert=False):
+    # todo: add this loss to train Pose Decoder
+    """Calculate Difference between two frames
+    For poses of frame 1->2 and 2->1,
+    one transformation (M) should be equal to the inverse of the other
+    Args:
+         axisangle: List of Tensors, each with shape (B, 1, 1, 3)
+         - if only one Tensor, then no loss will be computed (return None in #0)
+         translation: same as axisangle
+     Returns:
+         M: mean of forward-backward transformation
+    """
+
+    M_1 = transformation_from_parameters(axisangles[0][:, 0], translations[0][:, 0], invert)
+    # in case pose_loss is disabled, we only need this
+    if len(axisangles) == 1:
+        return None, M_1
+
+    M_2 = transformation_from_parameters(axisangles[1][:, 0], translations[1][:, 0], not invert)
+
+    # loss
+    pose_loss = tf.reduce_mean(tf.math.square(M_1, M_2))
+
+    # average as the final estimate
+    # M_mean = (M_1 + M_2) * 0.5
+    return pose_loss, M_1
 
 
 def get_translation_matrix(trans_vec):
@@ -543,14 +579,14 @@ def show_images(batch_size, input_imgs, outputs, nrow=3, ncol=2):
         plt.imshow(tgt)
 
         fig.add_subplot(nrow, ncol, 3)
-        src0 = input_imgs[('color', -1, 0)][i].numpy()
+        src0 = input_imgs[('color_aug', -1, 0)][i].numpy()
         # src0 = inputs_imp[('color_aug', -1, 0)][i]
         # src0 = np.transpose(src0, [1,2,0])
         print(np.max(np.max(src0)), np.min(np.min(src0)))
         plt.imshow(src0)
 
         fig.add_subplot(nrow, ncol, 4)
-        src1 = input_imgs[('color', 1, 0)][i].numpy()
+        src1 = input_imgs[('color_aug', 1, 0)][i].numpy()
         # src1 = inputs_imp[('color_aug', 1, 0)][i]
         # src1 = np.transpose(src1, [1, 2, 0])
         print(np.max(np.max(src1)), np.min(np.min(src1)))
