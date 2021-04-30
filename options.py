@@ -8,7 +8,23 @@ current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
 all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_dec']
 FLAGS = flags.FLAGS
 
+# Experimental
+flags.DEFINE_bool('exp_mode', True, 'experiment mode')
+flags.DEFINE_bool('concat_depth_pred', True, 'concat depth_pred to rgb images for pose net input')
+flags.DEFINE_bool('add_pose_loss', True, 'add pose loss to training')
+# todo: hyperparameters
+flags.DEFINE_float('pose_loss_weight', 1, 'weight for pose_loss')
+flags.DEFINE_float('smoothness_ratio', 1e-3, 'ratio to calculate smoothness loss')
+flags.DEFINE_float('ssim_ratio', 0.85, 'ratio to calculate SSIM loss')
+flags.DEFINE_bool('use_depth_consistency', False, 'add depth_consistency to handle occlusion between two frames')
+flags.DEFINE_bool('mask_border', False, 'mask out the region padded by bilinear sampler '
+                                        'when computing losses (only for zero-padding)')
+flags.DEFINE_bool('calc_revserse_transform', True, 'calcualting transformation in reversed temp order, this'
+                                                  'must be true when `add_pose_loss` is activated')
+
 # Pre-settings
+flags.DEFINE_integer('pose_num', 1, 'number of poses produced by pose decoder')
+flags.DEFINE_bool('norm_input', True, 'normalize input -> (-1, 1) for encoders')
 flags.DEFINE_string('weights_dir', '',  'the folder that stores weights files.')
 flags.DEFINE_list('models_to_load', all_models,
                   'load weights for specified models, by default all of them')
@@ -19,8 +35,6 @@ flags.DEFINE_string('save_model_path', '', 'path where weights are saved')
 flags.DEFINE_string('data_path', r'F:\Dataset\kitti_raw', 'path that stores corresponding dataset')
 flags.DEFINE_string('dataset', 'kitti_raw', 'specify a dataset, choices from [\'kitti_raw\', \'kitti_odom\']')
 flags.DEFINE_string('padding_mode', 'border', 'padding mode for bilinear sampler')
-flags.DEFINE_bool('mask_border', False, 'mask out the region padded by bilinear sampler '
-                                        'when computing losses (only for zero-padding)')
 
 # Training
 flags.DEFINE_bool('from_scratch', False, 'whether trained from scratch, coorperate with load_weights_folder')
@@ -34,7 +48,7 @@ flags.DEFINE_integer('num_epochs', 10, 'total number of training epochs')
 flags.DEFINE_integer('batch_size', 6, 'batch size')
 flags.DEFINE_bool('debug_mode', False, 'inspect intermediate results')
 flags.DEFINE_float('learning_rate', 1e-4, 'initial learning rate')
-flags.DEFINE_integer('lr_step_size', 15, 'step size to adapt learning rate (piecewise)')
+flags.DEFINE_integer('lr_step_size', 5, 'step size to adapt learning rate (piecewise)')
 flags.DEFINE_integer('val_num_per_epoch', 10, 'validate how many times per epoch')
 
 # Model-related
@@ -45,8 +59,6 @@ flags.DEFINE_integer('width', 640, 'width of input image')
 flags.DEFINE_list('frame_idx', [0, -1, 1], 'index of target, previous and next frame')
 flags.DEFINE_bool('do_augmentation', True, 'apply image augmentation')
 flags.DEFINE_bool('do_automasking', True, 'apply auto masking')
-flags.DEFINE_float('ssim_ratio', 0.85, 'ratio to calculate SSIM loss')
-flags.DEFINE_float('smoothness_ratio', 1e-3, 'ratio to calculate smoothness loss')
 flags.DEFINE_float('min_depth', 0.1, 'minimum depth when applying scaling/normalizing to depth estimates')
 flags.DEFINE_float('max_depth', 100., 'maximum depth when applying scaling/normalizing to depth estimates')
 
