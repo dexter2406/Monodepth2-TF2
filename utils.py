@@ -136,17 +136,18 @@ def check_options(FLAGS):
             raise ValueError("\t'%s' is not supported model, choose from: " % m, all_models)
     print('\t Using dataset:', FLAGS.split)
 
-    if FLAGS.padding_mode == 'zeros':
-        FLAGS.mask_border = True
-        print('\t zero-padding -> mask_border')
-    elif FLAGS.padding_mode == 'border':
-        FLAGS.mask_border = False
-        print('\tborder-padding -> no masking')
+    if FLAGS.add_pose_loss:
+        print('calc_reverse_transform automatically set `True`, because `add_pose_loss` requires it')
+        FLAGS.calc_reverse_transform = True
+
+    if (FLAGS.padding_mode == 'zeros' and not FLAGS.mask_border) or \
+        (FLAGS.padding_mode == 'border' and FLAGS.mask_border):
+        print('either `zero_padding - masking`, or `border_padding - no_masking` ')
 
     if FLAGS.debug_mode:
         print('\t[debug mode] Check intermediate results. '
               'Models will not be trained or saved even if options are given.')
-        FLAGS.batch_size = 1
+        FLAGS.batch_size = 2
         print("\t[debug mode] batch_size is reset to %d\n" % FLAGS.batch_size)
 
     else:
