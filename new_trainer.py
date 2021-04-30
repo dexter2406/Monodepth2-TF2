@@ -1,7 +1,7 @@
 import tensorflow as tf
 from models.depth_decoder_creater import DepthDecoder_full
 from models.encoder_creater import ResNet18_new
-from models.posenet_decoder_creator import PoseDecoder
+from models.posenet_decoder_creator import PoseDecoder_exp
 
 from utils import disp_to_depth, del_files
 from src.trainer_helper import *
@@ -85,7 +85,7 @@ class Trainer:
         mini_val_dataset = dataset_choices[self.opt.dataset](
             split_folder, val_file, data_path=self.opt.data_path)
         self.mini_val_loader = DataLoader(mini_val_dataset, num_epoch=self.opt.num_epochs,
-                                          batch_size=4, frame_idx=self.opt.frame_idx)
+                                          batch_size=2, frame_idx=self.opt.frame_idx)
         self.mini_val_iter = self.mini_val_loader.build_val_dataset(include_depth=self.train_loader.has_depth,
                                                                     buffer_size=300)
         # - Val after one epoch
@@ -106,13 +106,10 @@ class Trainer:
         self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx, intrinsics=train_dataset.K)
 
         # Init models
-        self.models['depth_enc'] = ResNet18_new([2, 2, 2, 2])
+        self.models['depth_enc'] = ResNet18_new(norm_inp=self.opt.norm_input)
         self.models['depth_dec'] = DepthDecoder_full()
-        self.models['pose_enc'] = ResNet18_new([2, 2, 2, 2])
-        if self.opt.pose_num == 1:
-            self.models['pose_dec'] = PoseDecoder(num_frames_to_predict_for=1)
-        else:
-            self.models['pose_dec'] = PoseDecoder()
+        self.models['pose_enc'] = ResNet18_new(norm_inp=self.opt.norm_input)
+        self.models['pose_dec'] = PoseDecoder_exp(num_frames_to_predict_for=self.opt.pose_num)
 
         print('* concat depth_pred?', self.opt.concat_depth_pred)
         build_models(self.models, rgb_cat_depth=self.opt.concat_depth_pred)
@@ -134,7 +131,7 @@ class Trainer:
             weights_name = m_name
             if m_name == 'pose_enc' and self.opt.concat_depth_pred:
                 weights_name = m_name + '_concat'
-            elif m_name == 'pose_dec' and self.opt.pose_num==1:
+            elif m_name == 'pose_dec' and self.opt.pose_num == 1:
                 weights_name = m_name + '_one_out'
             return weights_name
 
@@ -152,7 +149,7 @@ class Trainer:
                 else:
                     if 'enc' in m_name:
                         weights_name = get_weights_name()
-                        print('\t\tusing pretrained encoders')
+                        print('\t\tusing pretrained encoders: ', weights_name)
                         self.models[m_name].load_weights(os.path.join(weights_dir, weights_name + '.h5'))
             print('weights loaded from ', weights_dir)
 
@@ -176,9 +173,11 @@ class Trainer:
     def compute_reproject_loss(self, proj_image, tgt_image, sampler_mask=None):
         abs_diff = tf.math.abs(proj_image - tgt_image)
         ssim_diff = SSIM(proj_image, tgt_image)
+        print('ssim before:', tf.reduce_mean(ssim_diff))
         if sampler_mask is not None:
             abs_diff = abs_diff * sampler_mask
             ssim_diff = ssim_diff * sampler_mask
+            print('ssim after:', tf.reduce_mean(ssim_diff))
         l1_loss = tf.reduce_mean(abs_diff, axis=3, keepdims=True)
         ssim_loss = tf.reduce_mean(ssim_diff, axis=3, keepdims=True)
         loss = self.opt.ssim_ratio * ssim_loss + (1 - self.opt.ssim_ratio) * l1_loss
@@ -252,6 +251,8 @@ class Trainer:
             else:
                 to_optimise = combined
             reprojection_loss = tf.reduce_mean(to_optimise)
+            print("reprojection loss:", reprojection_loss)
+            # exit('xx')
             self.losses['pixel_loss'] += reprojection_loss
 
             # -------------------
@@ -278,13 +279,14 @@ class Trainer:
         self.losses['smooth_loss'] /= self.opt.num_scales
         total_loss /= self.opt.num_scales
         if self.opt.add_pose_loss:
-            total_loss += self.losses['pixel_loss']
+            total_loss += outputs[('pose_loss',)]
+            self.losses['pose_loss'] = outputs[('pose_loss',)]
 
         self.losses['loss/total'] = total_loss
 
         if self.opt.debug_mode:
             colormapped_normal = colorize(outputs[('disp', 0, 0)], cmap='plasma')
-            print("disp map shape", colormapped_normal.shape)
+            # print("disp map shape", colormapped_normal.shape)
             if colormapped_normal.shape[0] > 1:
                 colormapped_normal = colormapped_normal[0]
             plt.imshow(colormapped_normal.numpy()), plt.show()
@@ -295,61 +297,129 @@ class Trainer:
         """Generate the warped (reprojected) color images for a minibatch.
         Generated images are saved into the `outputs` dictionary.
         """
+
         for scale in range(self.opt.num_scales):
-            # print("===== scale %d ====="%scale)
-
-            # -----------------------------
-            disp_tf = outputs[('disp', 0, scale)]
-            # -----------------------------
-
-            disp = tf.image.resize(disp_tf, (self.opt.height, self.opt.width))
-            _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
+            disp_tgt_s = tf.image.resize(outputs[('disp', 0, scale)], (self.opt.height, self.opt.width))
+            _, depth_tgt_s = disp_to_depth(disp_tgt_s, self.opt.min_depth, self.opt.max_depth)
             if scale == 0:
-                outputs[('depth', 0, 0)] = depth
+                outputs[('depth', 0, 0)] = depth_tgt_s  # for collection
 
             for i, f_i in enumerate(self.opt.frame_idx[1:]):
-                T = outputs[("cam_T_cam", 0, f_i)]
+                T = outputs[("cam_T_cam", f_i, 0)][0]
 
-                cam_points = self.back_project_dict[self.opt.src_scale].run_func(
-                    depth, input_Ks[("inv_K", self.opt.src_scale)])
-                pix_coords = self.project_3d_dict[self.opt.src_scale].run_func(
-                    cam_points, input_Ks[("K", self.opt.src_scale)], T)
+                if self.opt.use_depth_consistency and scale == 0:
+                    disp_src_s0 = tf.image.resize(outputs[('disp', f_i, 0)], (self.opt.height, self.opt.width))
+                    _, depth_src_s0 = disp_to_depth(disp_src_s0, self.opt.min_depth, self.opt.max_depth)
+                    outputs[('depth_warp', f_i, 's2t')], _ = self.inverse_warp(depth_tgt_s, depth_src_s0, input_Ks, T)
+                    outputs[('depth', f_i, 0)] = depth_src_s0
 
+                src_image = input_imgs[('color', f_i, self.opt.src_scale)]
+                image_resamp, pix_coords = self.inverse_warp(depth_tgt_s, src_image, input_Ks, T)
                 outputs[("sample", f_i, scale)] = pix_coords
+                outputs[('color', f_i, scale)] = image_resamp
 
-                # -----------
-                input_tf = input_imgs[('color', f_i, self.opt.src_scale)]
-                # input_tf = inputs_imp[('color', f_i, self.opt.src_scale)]
-                # input_tf = np.transpose(input_tf, [0,2,3,1])
-                # ------------
-                res = bilinear_sampler(input_tf, outputs[("sample", f_i, scale)],
-                                       padding=self.opt.padding_mode)
-                outputs[('color', f_i, scale)] = res
                 if self.opt.mask_border:
-                    sampler_mask = tf.cast(res * 255 > 1., tf.float32)
+                    sampler_mask = tf.cast(image_resamp * 255 > 1., tf.float32)
                 else:
                     sampler_mask = None
                 outputs[('sampler_mask', f_i, scale)] = sampler_mask
 
+        if self.opt.use_depth_consistency:
+            outputs.update(self.get_occlu_aware_mask(outputs, input_Ks))
+
         if self.opt.debug_mode:
-            # f_i = 1
-            # input_tf = input_imgs[('color', 0, 0)].numpy()[0]
-            # res = outputs[('color', f_i, 0)].numpy()[0]
-            # sampler_mask = outputs[('sampler_mask', f_i, 0)].numpy()[0]
-            # fig = plt.figure(figsize=(2, 1))
-            # fig.add_subplot(2, 1, 1)
-            # plt.imshow(sampler_mask)
-            # fig.add_subplot(2, 1, 2)
-            # plt.imshow(tf.cast(res[..., 0] == input_tf[..., 0], tf.float32).numpy())
-            # plt.show()
-            show_images(self.opt.batch_size, input_imgs, outputs)
+            # ---
+            src_image = input_imgs[('color', 0, 0)].numpy()[0]
+            res = outputs[('color', 1, 0)].numpy()[0]
+            sampler_mask = outputs[('sampler_mask', 1, 0)].numpy()[0]
+            # ---
+            disp_orig = outputs[('disp', self.opt.frame_idx[0], 0)][0]
+            # disp_resamp1 = tf.expand_dims(outputs[('rgbd', self.opt.frame_idx[1], 0)][0, ..., -1], 2)
+            # disp_resamp2 = tf.expand_dims(outputs[('rgbd', self.opt.frame_idx[2], 0)][0, ..., -1], 2)
+            # ---
+            mask1 = tf.cast(tf.expand_dims(outputs[('occlu_aware_mask', -1, 0)][0], axis=2), dtype=tf.float32)
+            mask2 = tf.cast(tf.expand_dims(outputs[('occlu_aware_mask', 1, 0)][0], axis=2), dtype=tf.float32)
+            print('mask perc', tf.reduce_mean(sampler_mask), tf.reduce_mean(sampler_mask))
+            inps = [
+                disp_orig,
+                mask1,
+                mask2,
+                sampler_mask,
+            ]
+            num_inps = len(inps)
+            fig = plt.figure(figsize=(num_inps, 1))
+            for i in range(num_inps):
+                fig.add_subplot(num_inps, 1, i+1)
+                plt.imshow(inps[i])
+            plt.show()
+            # show_images(self.opt.batch_size, input_imgs, outputs)
+
+    def get_occlu_aware_mask(self, outputs, input_Ks):
+        """Produce occlusion-arware between 2 frames
+        This will be use along with "sampler_mask", to only apply on non-border region
+        Note that "minimal_projection" put constraint of occlusion between 3 frames
+        """
+        def delete_tmps(f_i):
+            """Free memory, only `outputs[('occlu_aware_mask', f_i, 0)]` is needed """
+            del outputs[('depth_warp', f_i, 's2t')]
+            del outputs[('depth_warp', f_i, 't2s')]
+            del outputs[('depth', f_i, 0)]
+
+        depth_tgt = outputs[('depth', 0, 0)]
+        for f_i in self.opt.frame_idx[1:]:
+            # inverse-warp the target_depth -> source_depth
+            outputs[('occlu_aware_mask', f_i, 0)] = []
+            T = outputs[('cam_T_cam', f_i, 0)][1]
+            disp_src = tf.image.resize(outputs[('disp', f_i, 0)], (self.opt.height, self.opt.width))
+            _, depth_src = disp_to_depth(disp_src, self.opt.min_depth, self.opt.max_depth)
+            outputs[('depth_warp', f_i, 't2s')], _ = self.inverse_warp(depth_src, depth_src, input_Ks, T)
+
+            # ---------------------------
+            # Compare: real source VS. from-tgt-transformed source depth map
+            # ---------------------------
+            depth_src = outputs[('depth', f_i, 0)]
+            depth_tgt_warped = outputs[('depth_warp', f_i, 't2s')]
+            depth_src_warped = outputs[('depth_warp', f_i, 's2t')]
+            if f_i == -1:
+                # Zr' <= Zl for normal order, where camera closer at tgt-frame / frame==0
+                mask_1 = depth_tgt_warped <= depth_src
+                mask_2 = depth_src_warped <= depth_tgt
+            else:
+                # vice versa, where camera is closer at src-frame / frame==1
+                mask_1 = depth_tgt_warped >= depth_src
+                mask_2 = depth_src_warped >= depth_tgt
+            outputs[('occlu_aware_mask', f_i, 0)].append(
+                tf.logical_and(mask_1, mask_2)
+            )
+            delete_tmps(f_i)
+        return outputs
+
+    def inverse_warp(self, depth, src_data, input_Ks, T):
+        """inverse-warping: transfer src_data -> resamp_data
+        Args:
+            depth: depth of target (represented by depth & T together)
+            src_data: source data to be resampled, can be image or depth map
+            T: transformation `source -> target` data
+        Returns:
+            resamp_data: resampled src_data (in target position)
+            pix_coords: target grid coordinates for source data
+        """
+        cam_points = self.back_project_dict[self.opt.src_scale].run_func(
+            depth, input_Ks[("inv_K", self.opt.src_scale)]
+        )
+        pix_coords = self.project_3d_dict[self.opt.src_scale].run_func(
+            cam_points, input_Ks[("K", self.opt.src_scale)], T
+        )
+        resamp_data = bilinear_sampler(src_data, pix_coords, padding=self.opt.padding_mode)
+
+        return resamp_data, pix_coords
 
     def predict_poses(self, input_imgs, outputs):
         """Use pose enc-dec to calculate camera's angles and translations"""
         pose_inps = {f_i: input_imgs[("color_aug", f_i, 0)] for f_i in self.opt.frame_idx}
         if self.opt.concat_depth_pred:
             for f_i in self.opt.frame_idx:
-                # Concat rgb-image and disp-pred for pose prediction
+                # Get RGB-D, by concat rgb-image and disp-pred for pose prediction
                 pose_inps[f_i] = tf.concat(
                     [pose_inps[f_i], outputs[('disp', f_i, 0)]], axis=-1
                 )
@@ -376,13 +446,18 @@ class Trainer:
                 translations.append(pred_pose_backward['translations'])
 
             # Invert the matrix if the frame id is negative
-            loss, outputs[("cam_T_cam", 0, f_i)] = transformation_loss(axisangles, translations, invert=(f_i < 0))
+            loss, M, M_inv = transformation_loss(axisangles, translations,
+                                                 invert=(f_i < 0), calc_reverse=self.opt.calc_revserse_transform)
+            outputs[("cam_T_cam", f_i, 0)] = [M]
+            if self.opt.calc_revserse_transform:
+                outputs[("cam_T_cam", f_i, 0)].apppend(M_inv)
             if self.opt.add_pose_loss:
                 pose_loss += loss
 
         if self.opt.add_pose_loss:
-            self.losses['pixel_loss'] = pose_loss / len(self.opt.frame_idx[1:]) * self.opt.pose_loss_weight
-            print("pixel_loss: ", self.losses['pixel_loss'])
+            # todo: store 'pose_loss' in `outputs` instead of `self.loseses` maybe confusing
+            # but it's an easy workaround to utilize @tf.function
+            outputs[('pose_loss',)] = pose_loss / len(self.opt.frame_idx[1:]) * self.opt.pose_loss_weight
         return outputs
 
     def process_batch(self, input_imgs, input_Ks):
@@ -471,7 +546,7 @@ class Trainer:
             if os.path.isdir(self.opt.save_model_path):
                 os.makedirs(self.opt.save_model_path)
 
-    @tf.function    # turn off to debug, e.g. with plt
+    # @tf.function    # turn off to debug, e.g. with plt
     def grad(self, input_imgs, input_Ks, trainables, global_step):
         with tf.GradientTape() as tape:
             outputs = self.process_batch(input_imgs, input_Ks)
@@ -509,7 +584,7 @@ class Trainer:
         print("->Start training...")
         self.start_training()
 
-    @tf.function
+    # @tf.function
     def compute_batch_losses(self, input_imgs, input_Ks):
         """@tf.function enables graph computation, allowing larger batch size
         """
@@ -517,7 +592,7 @@ class Trainer:
         losses = self.compute_losses(input_imgs, outputs)
         return outputs, losses
 
-    def start_validating(self, global_step, num_run=20):
+    def start_validating(self, global_step, num_run=30):
         """run mini-set to see if should store current-best weights"""
         losses_all = defaultdict(list)
         for i in range(num_run):
