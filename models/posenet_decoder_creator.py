@@ -4,20 +4,14 @@ import numpy as np
 
 
 class PoseDecoder(tf.keras.Model):
-    def __init__(self, num_ch_enc, num_input_features=1, num_frames_to_predict_for=2, stride=1):
+    def __init__(self, num_ch_enc=(64, 64, 128, 256, 512),
+                 num_input_features=1, num_frames_to_predict_for=2, stride=1):
         super(PoseDecoder, self).__init__()
         # (64, 64, 128, 256, 512)
         self.num_ch_enc = num_ch_enc
         self.num_input_features = num_input_features
         self.pose_scale = 0.01
-
-        self.angles = None
-        self.translations = None
-
-        if num_frames_to_predict_for is None:
-            num_frames_to_predict_for = num_input_features - 1
         self.num_frames_to_predict_for = num_frames_to_predict_for
-
         self.relu = tf.keras.activations.relu
 
         self.convs_squeeze = Conv2D(filters=256, kernel_size=1, name='Conv_squeeze')
@@ -32,7 +26,6 @@ class PoseDecoder(tf.keras.Model):
         output: [Batch, 2, 3] for angles and translations, respectively,
         - output[:, 0] is current->previous; output[:,1] for current->next
         """
-
         last_features = input_features[-1]
         out = self.convs_squeeze(last_features)
         out = self.relu(out)
@@ -44,12 +37,95 @@ class PoseDecoder(tf.keras.Model):
                 out = self.relu(out)
         out = tf.reduce_mean(out, [1, 2], keepdims=True)
         out = tf.reshape(out, [-1, self.num_frames_to_predict_for, 1, 6])
-        out = tf.cast(self.pose_scale, dtype=tf.float32) * out
+        out = out * tf.cast(self.pose_scale, dtype=tf.float32)
 
-        self.angles = out[..., 3:]
-        self.translations = out[..., :3]
+        # todo: angles=out[... 3:] ??
+        angles = out[..., 3:]
+        translations = out[..., :3]
 
-        return {"angles": self.angles, "translations": self.translations}
+        return {"angles": angles, "translations": translations}
+
+
+class PoseDecoder_new(tf.keras.Model):
+    """num_frames_to_predict=2, i.e. only frame 1->2, no 2->1"""
+    def __init__(self, num_frames_to_predict_for, num_ch_enc=(64, 64, 128, 256, 512),
+                 num_input_features=1, stride=1, include_intrinsics=False):
+        super(PoseDecoder_new, self).__init__()
+        # (64, 64, 128, 256, 512)
+        self.num_ch_enc = num_ch_enc
+        self.num_input_features = num_input_features
+        self.pose_scale = 0.01
+        self.num_frames_to_predict_for = num_frames_to_predict_for
+        self.include_intrinsics = include_intrinsics
+
+        self.relu = tf.keras.activations.relu
+
+        self.convs_squeeze = Conv2D(filters=256, kernel_size=1, name='Conv_squeeze')
+
+        pose_0_nopad = Conv2D(256, kernel_size=3, strides=stride, padding="valid", name='Conv_pose_0')
+        pose_1_nopad = Conv2D(256, kernel_size=3, strides=stride, padding='valid', name='Conv_pose_1')
+        pose_2_nopad = Conv2D(6*self.num_frames_to_predict_for, kernel_size=1, strides=1, name='Conv_pose_2')
+        self.convs_pose = [pose_0_nopad, pose_1_nopad, pose_2_nopad]
+
+        conv_prop = {'filters': 2, 'kernel_size': [1, 1], 'strides': 1, 'padding': 'same'}
+        self.conv_intrinsics = [
+            Conv2D(**conv_prop, activation=tf.nn.softplus, name='Conv_foci'),
+            Conv2D(**conv_prop, use_bias=False, name='Conv_offsets')
+        ]
+
+    def call(self, input_features, training=None, mask=None):
+        """ pass encoder-features pairwise
+        output: [Batch, 2, 3] for angles and translations, respectively,
+        - output[:, 0] is current->previous; output[:,1] for current->next
+        """
+        last_features = input_features[-1]
+        out = self.convs_squeeze(last_features)
+        out = self.relu(out)
+        for i in range(3):
+            if i != 2:
+                out = tf.pad(out, [[0, 0], [1, 1], [1, 1], [0, 0]], mode='CONSTANT')
+            out = self.convs_pose[i](out)
+            if i != 2:
+                out = self.relu(out)
+        out = tf.reduce_mean(out, [1, 2], keepdims=True)
+        out = tf.reshape(out, [-1, self.num_frames_to_predict_for, 1, 6])
+        out = out * tf.cast(self.pose_scale, dtype=tf.float32)
+
+        # todo: angles=out[... 3:] ??
+        angles = out[..., :3]
+        translations = out[..., 3:]
+        intrinsics_mat = tf.constant(0)
+        if self.include_intrinsics:
+            intrinsics_mat = self.add_intrinsics_head(last_features)
+        return {"angles": angles, "translations": translations, "K": intrinsics_mat}
+
+    def add_intrinsics_head(self, bottleneck, image_height=192, image_width=640):
+        # todo: Image height and width - Original/Scaled?
+        """Adds a head the preficts camera intrinsics.
+        Args:
+          bottleneck: A tf.Tensor of shape [B, 1, 1, C]
+          image_height: A scalar tf.Tensor or an python scalar, the image height in pixels.
+          image_width: the image width
+
+        image_height and image_width are used to provide the right scale for the focal
+        length and the offest parameters.
+
+        Returns:
+          a tf.Tensor of shape [B, 3, 3], and type float32, where the 3x3 part is the
+          intrinsic matrix: (fx, 0, x0), (0, fy, y0), (0, 0, 1).
+        """
+        image_size = tf.constant([[image_width, image_height]], dtype=tf.float32)
+        focal_lens = self.conv_intrinsics[0](bottleneck)
+        focal_lens = tf.squeeze(focal_lens, axis=(1, 2)) * image_size
+
+        offsets = self.conv_intrinsics[1](bottleneck)
+        offsets = (tf.squeeze(offsets, axis=(1, 2)) + 0.5) * image_size
+
+        foc_inv = tf.linalg.diag(focal_lens)
+        intrinsic_mat = tf.concat([foc_inv, tf.expand_dims(offsets, -1)], axis=2)
+        last_row = tf.cast(tf.tile([[[0.0, 0.0, 1.0]]], [bottleneck.shape[0], 1, 1]), dtype=tf.float32)
+        intrinsic_mat = tf.concat([intrinsic_mat, last_row], axis=1)
+        return intrinsic_mat
 
 
 def build_posenet():
@@ -59,6 +135,7 @@ def build_posenet():
     pose_decoder = PoseDecoder(num_ch_enc, num_input_features=1, num_frames_to_predict_for=1, stride=1)
     outputs = pose_decoder.predict(dummy_inputs)
     return pose_decoder, dummy_inputs, outputs
+
 
 def combine_pose_params(pred_pose_raw, curr2prev=False, curr2next=False):
     """Combine pose angles and translations, from raw dictionary"""
