@@ -11,30 +11,21 @@ import time
 
 
 class MotionFieldNet(Model):
-    def __init__(self, do_automassk=False):
-        """Predict object-motion vectors from a stack of frames or embeddings.
-        Args:
-          images: Input tensor with shape [B, h, w, 2c], containing two
-            depth-concatenated images.
-          weight_reg: A float scalar, the amount of weight regularization.
-          align_corners: align_corners in resize_bilinear. Only used in version 2.
-          auto_mask: True to automatically masking out the residual translations
+    def __init__(self, do_automassk=False, weight_reg=0.0):
+        """Predict object-motion vectors from a stack of frames.
+        auto_mask: True to automatically masking out the residual translations
             by thresholding on their mean values.
-
-        Returns:
-          A tuple of 3 tf.Tensors:
-          rotation: [B, 3], global rotation angles.
-          background_translation: [B, 1, 1, 3], global translation vectors.
-          residual_translation: [B, h, w, 3], residual translation vector field. The
-            overall translation field is "background_translation + residual_translation".
+        weight_reg: A float scalar, the amount of weight regularization.
         """
         super(MotionFieldNet, self).__init__()
-        conv_prop_0 = {'kernel_size': 3, 'strides': 2, 'activation': 'relu', 'padding': 'same'}
+        conv_prop_0 = {'kernel_size': 3, 'strides': 2, 'activation': 'relu', 'padding': 'same',
+                       'kernel_regularizer': tf.keras.regularizers.L2(weight_reg)}
         conv_prop_1 = {'kernel_size': 1, 'strides': 1, 'use_bias': False, 'padding': 'same'}
         self.do_automask = do_automassk
         self.conv_encoder = []
         self.conv_intrinsics = []
-        self.rot_scale, self.trans_scale = self.create_scales()
+        self.rot_scale = tf.constant(0.01)
+        self.trans_scale = tf.constant(0.01)
 
         num_conv_enc = 7
         channels = [6]  # input stacked image
@@ -67,63 +58,57 @@ class MotionFieldNet(Model):
         ]
 
     def call(self, x, training=None):
-        conv1 = self.conv_encoder[0](x)
-        conv2 = self.conv_encoder[1](conv1)
-        conv3 = self.conv_encoder[2](conv2)
-        conv4 = self.conv_encoder[3](conv3)
-        conv5 = self.conv_encoder[4](conv4)
-        conv6 = self.conv_encoder[5](conv5)
-        conv7 = self.conv_encoder[6](conv6)
+        """
+        Args:
+          x: Input tensor with shape [B, h, w, 2c], `c` can be rgb or rgb-d.
 
-        bottleneck = tf.reduce_mean(conv7, axis=[1, 2], keepdims=True)
+        Returns:
+          A tuple of 3 tf.Tensors:
+          rotation: [B, 3], global rotation angles.
+          background_translation: [B, 1, 1, 3], global translation vectors.
+          residual_translation: [B, h, w, 3], residual translation vector field. The
+            overall translation field is "background_translation + residual_translation".
+        """
+        features = [x]
+        for i in range(len(self.conv_encoder)):
+            features.append(self.conv_encoder[i](x))
+
+        bottleneck = tf.reduce_mean(features[-1], axis=[1, 2], keepdims=True)
         background_motion = self.conv_backgrd_motion(bottleneck)
 
-        t1 = time.perf_counter()
         residual_trans = self.conv_res_motion(background_motion)
-        print(residual_trans.shape, conv7.shape, "%.2fms"%((time.perf_counter()-t1)*1000))
-        residual_trans = self._refine_motion_field(residual_trans, conv7, idx=7)
-        print(residual_trans.shape, conv6.shape, "%.2fms"%((time.perf_counter()-t1)*1000))
+        lite_mode_idx = list(range(0, 6))  # 0->5 uses lite_mode to save computation
+        for i in range(len(features) - 1, -1, -1):  # 7->0
+            t1 = time.perf_counter()
+            use_lite_mode = i in lite_mode_idx
+            print('idx=%d uses lite_mode' % i)
+            residual_trans = self._refine_motion_field(residual_trans, features[i],
+                                                       idx=i, lite_mode=use_lite_mode)
+            print(residual_trans.shape, features[i].shape, "%.2fms" % ((time.perf_counter() - t1) * 1000))
 
-        residual_trans = self._refine_motion_field(residual_trans, conv6, idx=6)
-        print(residual_trans.shape, conv5.shape, "%.2fms"%((time.perf_counter()-t1)*1000))
+        residual_trans *= self.trans_scale
+        if self.do_automask:
+            residual_trans = self.apply_automask_to_res_trans(residual_trans)
 
-        residual_trans = self._refine_motion_field(residual_trans, conv5, idx=5, lite_mode=True)
-        print(residual_trans.shape, conv4.shape, "%.2fms"%((time.perf_counter()-t1)*1000))
-
-        residual_trans = self._refine_motion_field(residual_trans, conv4, idx=4, lite_mode=True)
-        print(residual_trans.shape, conv3.shape, "%.2fms"%((time.perf_counter()-t1)*1000))
-
-        residual_trans = self._refine_motion_field(residual_trans, conv3, idx=3, lite_mode=True)
-        print(residual_trans.shape, conv2.shape, "%.2fms"%((time.perf_counter()-t1)*1000))
-
-        residual_trans = self._refine_motion_field(residual_trans, conv2, idx=2, lite_mode=True)
-        print(residual_trans.shape, conv1.shape, "%.2fms"%((time.perf_counter()-t1)*1000))
-
-        residual_trans = self._refine_motion_field(residual_trans, conv1, idx=1, lite_mode=True)
-        print(residual_trans.shape, x.shape, "%.2fms"%((time.perf_counter()-t1)*1000))
-        residual_trans = self._refine_motion_field(residual_trans, x,  idx=0, lite_mode=True)
-        print('================================')
-
-        # residual_trans *= self.trans_scale
         rotation = background_motion[:, 0, 0, :3] * self.rot_scale
         backgrd_trans = background_motion[:, :, :, 3:] * self.trans_scale
-
-        if self.do_automask:
-            sq_residual_trans = tf.sqrt(
-                tf.reduce_sum(residual_trans ** 2, axis=3, keepdims=True))
-            mean_sq_residual_trans = tf.reduce_mean(
-                sq_residual_trans, axis=[0, 1, 2])
-            # A mask of shape [B, h, w, 1]
-            mask_residual_translation = tf.cast(
-                sq_residual_trans > mean_sq_residual_trans, residual_trans.dtype
-            )
-            residual_trans *= mask_residual_translation
 
         image_height, image_width = x.shape[1:3]
         intrinsic_mat = self.add_intrinsics_head(bottleneck, image_height, image_width)
         return rotation, backgrd_trans, residual_trans, intrinsic_mat
-        # return rotation, backgrd_trans, residual_trans
-        # return rotation, backgrd_trans
+
+    def apply_automask_to_res_trans(self, residual_trans):
+        """Masking out the residual translations by thresholding on their mean values."""
+        sq_residual_trans = tf.sqrt(
+            tf.reduce_sum(residual_trans ** 2, axis=3, keepdims=True))
+        mean_sq_residual_trans = tf.reduce_mean(
+            sq_residual_trans, axis=[0, 1, 2])
+        # A mask of shape [B, h, w, 1]
+        mask_residual_translation = tf.cast(
+            sq_residual_trans > mean_sq_residual_trans, residual_trans.dtype
+        )
+        residual_trans *= mask_residual_translation
+        return residual_trans
 
     def _refine_motion_field(self, motion_field, conv, idx, lite_mode=False):
         """Refine residual motion map"""
@@ -135,33 +120,19 @@ class MotionFieldNet(Model):
             conv_inp = self.conv_refine_motion[i][1](conv_inp)
             output_2 = self.conv_refine_motion[i][2](conv_inp)
             conv_inp = tf.concat([output_1, output_2], axis=-1)
+        else:
+            # use lite mode to save computation
+            conv_inp = self.conv_refine_motion[i][0](conv_inp)
         output = self.conv_refine_motion[i][3](conv_inp)
         output = upsamp_motion_field + output
         return output
 
-    def create_scales(self, constraint_min=0.001):
-        """Creates variables representing rotation and translation scaling factors.
-        Args:
-          constraint_min: minimum value for the variable
-        Returns:
-          Two scalar variables, rotation and translation scale.
-        """
-        def constraint(x):
-            return tf.nn.relu(x - constraint_min) + constraint_min
-
-        rot_scale = tf.Variable(initial_value=0.01, constraint=constraint, dtype=tf.float32)
-        trans_scale = tf.Variable(initial_value=0.01, constraint=constraint, dtype=tf.float32)
-        return rot_scale, trans_scale
-
     def add_intrinsics_head(self, bottleneck, image_height, image_width):
         """Adds a head the preficts camera intrinsics.
         Args:
-          bottleneck: A tf.Tensor of shape [B, 1, 1, C], typically the bottlenech
-            features of a netrowk.
-          image_height: A scalar tf.Tensor or an python scalar, the image height in
-            pixels.
-          image_width: A scalar tf.Tensor or an python scalar, the image width in
-            pixels.
+          bottleneck: A tf.Tensor of shape [B, 1, 1, C]
+          image_height: A scalar tf.Tensor or an python scalar, the image height in pixels.
+          image_width: the image width
 
         image_height and image_width are used to provide the right scale for the focal
         length and the offest parameters.
@@ -182,6 +153,32 @@ class MotionFieldNet(Model):
         last_row = tf.cast(tf.tile([[[0.0, 0.0, 1.0]]], [bottleneck.shape[0], 1, 1]), dtype=tf.float32)
         intrinsic_mat = tf.concat([intrinsic_mat, last_row], axis=1)
         return intrinsic_mat
+
+
+class EgoMotionNet(Model, MotionFieldNet):
+    def __init__(self, add_intrinsics):
+        """A child of MotionField Net only for egomotion
+        - no residual_translation included
+        - optional add_intrinsics_head
+        """
+        super().__init__()
+        self.addintrinscs = add_intrinsics
+
+    def call(self, x):
+        features = [x]
+        for i in range(len(self.conv_encoder)):
+            features.append(self.conv_encoder[i](x))
+
+        bottleneck = tf.reduce_mean(features[-1], axis=[1, 2], keepdims=True)
+        background_motion = self.conv_backgrd_motion(bottleneck)
+        rotation = background_motion[:, 0, 0, :3] * self.rot_scale
+        backgrd_trans = background_motion[:, :, :, 3:] * self.trans_scale
+
+        intrinsic_mat = tf.constant(0)
+        if self.addintrinscs:
+            image_height, image_width = x.shape[1:3]
+            intrinsic_mat = self.add_intrinsics_head(bottleneck, image_height, image_width)
+        return rotation, backgrd_trans, intrinsic_mat
 
 
 # @tf.function
