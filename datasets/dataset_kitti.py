@@ -20,6 +20,8 @@ class KITTIDataset:
 
 class KITTIRaw(KITTIDataset):
     """KITTi Raw dataset"""
+    name = 'KITTI_Raw'
+
     def __init__(self, split_folder, split_name, data_path="F:\\Dataset\\kitti_raw", *args, **kwargs):
         super(KITTIRaw, self).__init__(*args, **kwargs)
         self.data_path = data_path
@@ -38,6 +40,8 @@ class KITTIRaw(KITTIDataset):
 
 class KITTIOdom(KITTIDataset):
     """KITTi Odometry dataset"""
+    name = 'KITTI_Odom'
+
     def __init__(self, split_folder, split_name, data_path="F:\\Dataset\\kitti_odom", *args, **kwargs):
         super(KITTIOdom, self).__init__(*args, **kwargs)
         self.data_path = data_path
