@@ -1,5 +1,5 @@
 import tensorflow as tf
-from tensorflow.keras.layers import Conv2D, BatchNormalization, Activation, MaxPool2D, Dropout, Flatten, Dense
+from tensorflow.keras.layers import Conv2D, BatchNormalization, Activation
 
 
 class BasicBlock_pad(tf.keras.layers.Layer):
@@ -43,8 +43,8 @@ class BasicBlock_pad(tf.keras.layers.Layer):
         # ----- PADDING -----
         out = tf.pad(out, **self.pad_1)
         # -------------------
-        out = self.conv2(out, training=training)
-        out = self.bn2(out)
+        out = self.conv2(out)
+        out = self.bn2(out, training=training)
 
         identity = self.downsample(x)
 
@@ -195,8 +195,8 @@ class BasicBlock_nopad(tf.keras.layers.Layer):
         out = self.conv1(x)
         out = self.bn1(out, training=training)
         out = self.a1(out)
-        out = self.conv2(out, training=training)
-        out = self.bn2(out)
+        out = self.conv2(out)
+        out = self.bn2(out, training=training)
 
         identity = self.downsample(x)
 
@@ -206,8 +206,9 @@ class BasicBlock_nopad(tf.keras.layers.Layer):
 
 
 class ResNet18_new(tf.keras.Model):
-    def __init__(self, block_list=(2, 2, 2, 2), initial_filters=64, padding_mode='constant'):
+    def __init__(self, block_list=(2, 2, 2, 2), initial_filters=64, padding_mode='constant', norm_inp=False):
         super(ResNet18_new, self).__init__()
+        self.norm_inp = norm_inp
         padding = 'valid' if padding_mode != 'same' else 'same'
         padding_options = {'reflect': {'mode': 'CONSTANT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]},
                            'constant': {'mode': 'CONSTANT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]}}
@@ -239,6 +240,8 @@ class ResNet18_new(tf.keras.Model):
         return res_block
 
     def call(self, inputs, training=None, mask=None):
+        if self.norm_inp:
+            inputs = (inputs - 0.5) * 2
         outputs = []
         # ----- PADDING -----
         x = tf.pad(inputs, **self.pad_3)
