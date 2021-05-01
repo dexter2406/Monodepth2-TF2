@@ -15,9 +15,8 @@ class DataProcessor(object):
         self.batch_size = -1
         self.K = intrinsics
         self.brightness = 0.2
-        self.contrast = 0.2
-        self.saturation = 0.2
-        self.hue = 0.1
+        self.sature_contrast = 0.2
+        self.hue = 0.05
 
     @tf.function
     def prepare_batch(self, batch, is_train):
@@ -71,18 +70,24 @@ class DataProcessor(object):
         self.delete_raw_images(input_imgs)
         return input_imgs, input_Ks
 
-    def color_aug(self, image, do_color_aug):
+    def generate_aug_params(self):
+        brightness = np.random.uniform(0, self.brightness)
+        hue = np.random.uniform(0, self.hue)
+        saturation, contrast = np.random.uniform(1 - self.sature_contrast, 1 + self.sature_contrast, size=2)
+        return brightness, saturation, contrast, hue
+
+    def color_aug(self, image, aug_params):
         """Apply augmentation (fixed seed needed)
         Same aug for each batch (and scales), Note that all images input to the pose network receive the
         same augmentation.
         """
-        if not do_color_aug:
+        if aug_params is None:
             return image
         else:
-            image = tf.image.random_brightness(image, self.brightness)
-            image = tf.image.random_saturation(image, 1-self.saturation, 1+self.saturation)
-            image = tf.image.random_contrast(image, 1-self.contrast, 1+self.contrast)
-            image = tf.image.random_hue(image, self.hue)
+            image = tf.image.adjust_brightness(image, aug_params[0])
+            image = tf.image.adjust_saturation(image, aug_params[1])
+            image = tf.image.adjust_contrast(image, aug_params[2])
+            image = tf.image.adjust_hue(image, aug_params[3])
         return image
 
     def preprocess(self, input_imgs, input_Ks, do_color_aug):
@@ -90,7 +95,10 @@ class DataProcessor(object):
         - pyramid: use the raw (scale=-=1) to produce scale==[0:4] images
         - augment: correspond to the pyramid source
         """
-        # print("\t preprocessing batch...")
+        aug_params = None
+        if do_color_aug is not None:
+            # generate one set of random aug factor for one batch, making that same pair has same aug effects
+            aug_params = self.generate_aug_params()
         for k in list(input_imgs):
             if 'depth_gt' in k:
                 continue
@@ -102,7 +110,7 @@ class DataProcessor(object):
                                                     (self.height//(2**scale), self.width//(2**scale)),
                                                     antialias=True)
                     input_imgs[(img_type, f_i, scale)] = resized_image
-                    input_imgs[(img_type + '_aug', f_i, scale)] = self.color_aug(resized_image, do_color_aug)
+                    input_imgs[(img_type + '_aug', f_i, scale)] = self.color_aug(resized_image, aug_params)
 
         for scale in range(self.num_scales):
             # For KITTI. Must *normalize* when using on different scale
