@@ -19,7 +19,7 @@ flags.DEFINE_float('ssim_ratio', 0.85, 'ratio to calculate SSIM loss')
 flags.DEFINE_bool('use_depth_consistency', False, 'add depth_consistency to handle occlusion between two frames')
 flags.DEFINE_bool('mask_border', False, 'mask out the region padded by bilinear sampler '
                                         'when computing losses (only for zero-padding)')
-flags.DEFINE_bool('calc_revserse_transform', True, 'calcualting transformation in reversed temp order, this'
+flags.DEFINE_bool('calc_reverse_transform', True, 'calcualting transformation in reversed temp order, this'
                                                   'must be true when `add_pose_loss` is activated')
 
 # Pre-settings
