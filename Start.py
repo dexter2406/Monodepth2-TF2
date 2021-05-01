@@ -1,4 +1,5 @@
-from new_trainer_v1 import Trainer
+from trainer import Trainer as Trainer
+from new_trainer import Trainer as Trainer_new
 from utils import check_options
 from options import get_options
 from absl import app
@@ -10,7 +11,7 @@ def main(_):
     options = get_options()
     if options.run_mode == 'train':
         check_options(options)
-        start_train(options)
+        start_train(options, exp_mode=options.exp_mode)
 
     elif options.run_mode == 'eval_depth':
         start_eval_depth(options)
@@ -26,8 +27,11 @@ def print_args(opts):
     print(opts.batch_size)
 
 
-def start_train(options):
-    trainer = Trainer(options)
+def start_train(options, exp_mode=False):
+    if not exp_mode:
+        trainer = Trainer(options)
+    else:
+        trainer = Trainer_new(options)
     trainer.train()
 
 
