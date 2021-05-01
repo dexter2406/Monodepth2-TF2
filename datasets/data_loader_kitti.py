@@ -138,7 +138,7 @@ class DataLoader(object):
             folder, file_idx, side = line.split()
             folder = folder.replace('/', '\\')
             path = self.dataset.get_image_path(folder, int(file_idx), side)
-            path = path.replace('/', '\\')
+            path = '/' + os.path.join(*(path.replace('/', '\\').split('\\')))
             file_path_all[i] = path
         if not os.path.isfile(file_path_all[0]):
             raise ValueError("file path wrong, e.g. {} doesn't exit".format(file_path_all[0]))
@@ -157,7 +157,7 @@ class DataLoader(object):
                 "velodyne_points\\data\\{:010d}.bin".format(int(file_idx)),
                 side
             )
-            velo_filename= velo_filename.replace('/', '\\')
+            velo_filename = '/' + os.path.join(*(velo_filename.replace('/', '\\').split('\\')))
             file_path_all[i] = velo_filename
         return file_path_all
 
@@ -184,7 +184,7 @@ class DataLoader(object):
             self.data_path,
             scene_name,
             "velodyne_points\\data\\{:010d}.bin".format(int(frame_index)))
-        velo_filename = velo_filename.replace('/', '\\')
+        velo_filename = '/' + os.path.join(*(velo_filename.replace('/', '\\').split('\\')))
         return os.path.isfile(velo_filename)
 
     def print_info(self):
