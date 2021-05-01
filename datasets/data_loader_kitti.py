@@ -14,8 +14,7 @@ root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 class DataLoader(object):
     def __init__(self, dataset,
-                 num_epoch, batch_size, frame_idx,
-                 dataset_for='train'):
+                 num_epoch, batch_size, frame_idx):
         self.dataset = dataset
         self.num_epoch = num_epoch
         self.batch_size = batch_size
@@ -30,62 +29,57 @@ class DataLoader(object):
         self.include_depth = None
         self.has_depth = self.has_depth_file()
 
-    def print_info(self):
-        if 'odom' in self.dataset.data_path:
-            print('\tLoading KITTI-Odometry dataset, no depth gt available')
-        elif 'raw' in self.dataset.data_path:
-            print('\tLoading KITTI-Raw dataset, depth gt should be available')
-
     def read_filenames(self):
         split_path = os.path.join(self.dataset.split_folder, self.dataset.split_name)   # e.g. splits\\eigen_zhou\\train.txt
         self.filenames = readlines(split_path)
         self.num_items = len(self.filenames)
         self.steps_per_epoch = self.num_items // self.batch_size
 
-    def collect_image_files(self):
-        """extract info from split, converted to file path"""
-        self.read_filenames()
-        file_path_all = [''] * self.num_items
-        for i, line in enumerate(self.filenames):
-            folder, file_idx, side = line.split()
-            folder = folder.replace('/', '\\')
-            path = self.dataset.get_image_path(folder, int(file_idx), side)
-            path = path.replace('/','\\')
-            file_path_all[i] = path
-        if not os.path.isfile(file_path_all[0]):
-            raise ValueError("file path wrong, e.g. {} doesn't exit".format(file_path_all[0]))
-        return file_path_all
+    def build_train_dataset(self):
+        return self.build_combined_dataset(include_depth=False, num_repeat=self.num_epoch)
 
-    def collect_depth_files(self):
-        if not self.has_depth_file():
-            return None
-        file_path_all = [''] * self.num_items
-        for i, line in enumerate(self.filenames):
-            folder, file_idx, side = line.split()
-            folder = folder.replace('/', '\\')
-            velo_filename = os.path.join(
-                self.data_path,
-                folder,
-                "velodyne_points\\data\\{:010d}.bin".format(int(file_idx)),
-                side
-            )
-            velo_filename = velo_filename.replace('/','\\')
-            file_path_all[i] = velo_filename
-        return file_path_all
+    def build_val_dataset(self, include_depth, buffer_size):
+        return self.build_combined_dataset(include_depth=include_depth, num_repeat=None,
+                                           buffer_size=buffer_size)
 
-    def derive_depth_path_from_img(self, img_str):
-        """Derive the path of depth values acoording to the image path
-        E.g. F:\\Dataset\\kitti_raw\\2011_10_03\\2011_10_03_drive_0034_sync\\image_02\\data\0000003025.jpg
-        ->  F:\\Dataset\\kitti_raw\\2011_10_03\\2011_10_03_drive_0034_sync\\velodyne_points\\data\\0000003025.bin
-        """
-        img_str_split = img_str.split('\\')
-        file_idx = img_str_split[-1].split('.')[0]
-        folder_path = os.path.join(*img_str_split[-5:-3])  # 2011_10_03\2011_10_03_drive_0034_sync
-        side = self.dataset.side_map[img_str_split[-3][-1]]
-        file_path = "velodyne_points\\data\\{:010d}.bin".format(int(file_idx))
-        depth_full_path = os.path.join(self.data_path, folder_path, file_path)
-        calib_path = os.path.join(self.data_path, img_str_split[-5])
-        return calib_path, depth_full_path, side
+    def build_eval_dataset(self):
+        # todo: verify file numbers, num_repeat=??
+        return self.build_combined_dataset(include_depth=False, num_repeat=self.num_epoch,
+                                           shuffle=False, drop_last=False)
+
+    def build_combined_dataset(self, include_depth, num_repeat,
+                               drop_last=True, shuffle=True, buffer_size=None):
+        # Data path
+        data = self.collect_image_files()
+        dataset = tf.data.Dataset.from_tensor_slices(data)
+        # ----------
+        # Generate dataset by file paths.
+        # - if include depth, generate dataset giving (images, depths), other wise only images
+        # - can be manually turned off
+        self.include_depth = include_depth
+        if include_depth and not self.has_depth:
+            self.include_depth = False
+            warnings.warn('Will not use depth gt, because no available depth file found')
+        # the outputs are implicitly handled by 'out_maps'
+        out_maps = [tf.float32, tf.float32] if self.include_depth else tf.float32
+        dataset = dataset.map(lambda x: tf.py_function(self.parse_func_combined, [x], Tout=out_maps),
+                              num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        # ----------
+        if shuffle:
+            buffer_size = self.buffer_size if buffer_size is None else buffer_size  # override if provided
+            dataset = dataset.shuffle(buffer_size=buffer_size, reshuffle_each_iteration=shuffle)
+
+        dataset = dataset.batch(self.batch_size, drop_remainder=drop_last)
+
+        dataset = dataset.repeat(num_repeat)
+        dataset = dataset.prefetch(1)
+        data_iter = iter(dataset)
+        return data_iter
+
+    def parse_helper_test_sequence(self, filepath):
+        full_path = bytes.decode(filepath.numpy())
+        file_root, file_name = os.path.split(full_path)
+        return tf.constant(file_name)
 
     def parse_helper_get_depth(self, tgt_path):
         """Get depth gt, helper for parse_func_combined()"""
@@ -136,46 +130,50 @@ class DataLoader(object):
 
         return output_imgs, depth_gt
 
-    def build_train_dataset(self):
-        return self.build_combined_dataset(is_train=True, include_depth=False)
+    def collect_image_files(self):
+        """extract info from split, converted to file path"""
+        self.read_filenames()
+        file_path_all = [''] * self.num_items
+        for i, line in enumerate(self.filenames):
+            folder, file_idx, side = line.split()
+            folder = folder.replace('/', '\\')
+            path = self.dataset.get_image_path(folder, int(file_idx), side)
+            path = path.replace('/', '\\')
+            file_path_all[i] = path
+        if not os.path.isfile(file_path_all[0]):
+            raise ValueError("file path wrong, e.g. {} doesn't exit".format(file_path_all[0]))
+        return file_path_all
 
-    def build_val_dataset(self):
-        return self.build_combined_dataset(is_train=False, include_depth=True)
+    def collect_depth_files(self):
+        if not self.has_depth_file():
+            return None
+        file_path_all = [''] * self.num_items
+        for i, line in enumerate(self.filenames):
+            folder, file_idx, side = line.split()
+            folder = folder.replace('/', '\\')
+            velo_filename = os.path.join(
+                self.data_path,
+                folder,
+                "velodyne_points\\data\\{:010d}.bin".format(int(file_idx)),
+                side
+            )
+            velo_filename= velo_filename.replace('/', '\\')
+            file_path_all[i] = velo_filename
+        return file_path_all
 
-    def build_eval_dataset(self):
-        # todo: verify file numbers
-        return self.build_combined_dataset(is_train=False, include_depth=False,
-                                           shuffle=False, drop_last=False)
-
-    def build_combined_dataset(self, is_train, include_depth, drop_last=True, shuffle=True):
-        # Data path
-        data = self.collect_image_files()
-        dataset = tf.data.Dataset.from_tensor_slices(data)
-        # ----------
-        # Generate dataset by file paths.
-        # - if include depth, generate dataset giving (images, depths), other wise only images
-        # - can be manually turned off
-        self.include_depth = include_depth
-        if include_depth and not self.has_depth:
-            self.include_depth = False
-            warnings.warn('Will not use depth gt, because no available depth file found')
-        # the outputs are implicitly handled by 'out_maps'
-        out_maps = [tf.float32, tf.float32] if self.include_depth else tf.float32
-        dataset = dataset.map(lambda x: tf.py_function(self.parse_func_combined, [x], Tout=out_maps),
-                              num_parallel_calls=tf.data.experimental.AUTOTUNE)
-        # ----------
-        if shuffle:
-            buffer_size = self.buffer_size if is_train else 200
-            dataset = dataset.shuffle(buffer_size=buffer_size, reshuffle_each_iteration=is_train)
-
-        dataset = dataset.batch(self.batch_size, drop_remainder=drop_last)
-
-        if is_train:
-            dataset = dataset.repeat(self.num_epoch)
-        dataset = dataset.prefetch(1)
-        data_iter = iter(dataset)
-        return data_iter
-
+    def derive_depth_path_from_img(self, img_str):
+        """Derive the path of depth values acoording to the image path
+        E.g. F:\\Dataset\\kitti_raw\\2011_10_03\\2011_10_03_drive_0034_sync\\image_02\\data\0000003025.jpg
+        ->  F:\\Dataset\\kitti_raw\\2011_10_03\\2011_10_03_drive_0034_sync\\velodyne_points\\data\\0000003025.bin
+        """
+        img_str_split = img_str.split('\\')
+        file_idx = img_str_split[-1].split('.')[0]
+        folder_path = os.path.join(*img_str_split[-5:-3])  # 2011_10_03\2011_10_03_drive_0034_sync
+        side = self.dataset.side_map[img_str_split[-3][-1]]
+        file_path = "velodyne_points\\data\\{:010d}.bin".format(int(file_idx))
+        depth_full_path = os.path.join(self.data_path, folder_path, file_path)
+        calib_path = os.path.join(self.data_path, img_str_split[-5])
+        return calib_path, depth_full_path, side
 
     def has_depth_file(self):
         line = self.filenames[0].split()
@@ -186,10 +184,21 @@ class DataLoader(object):
             self.data_path,
             scene_name,
             "velodyne_points\\data\\{:010d}.bin".format(int(frame_index)))
+        velo_filename = velo_filename.replace('/', '\\')
         return os.path.isfile(velo_filename)
 
+    def print_info(self):
+        if 'odom' in self.dataset.data_path:
+            print('\tLoading KITTI-Odometry dataset, no depth gt available')
+        elif 'raw' in self.dataset.data_path:
+            print('\tLoading KITTI-Raw dataset, depth gt should be available')
 
     """ For experiments
+    
+    def build_test_sequence(self):
+        # check if the sequence is correct
+        return self.build_combined_dataset(is_train=True, include_depth=False, drop_last=False, shuffle=False)
+
     def parse_func_depth(self, filepath):
         #  F:\\Dataset\\kitti_data\\2011_09_26\\2011_09_26_drive_0001_sync\\velodyne_points\\data\\xxx.bin\\<side>
         filepath = bytes.decode(filepath.numpy())
