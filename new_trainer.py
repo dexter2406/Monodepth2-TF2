@@ -447,10 +447,10 @@ class Trainer:
 
             # Invert the matrix if the frame id is negative
             loss, M, M_inv = transformation_loss(axisangles, translations,
-                                                 invert=(f_i < 0), calc_reverse=self.opt.calc_revserse_transform)
+                                                 invert=(f_i < 0), calc_reverse=self.opt.calc_reverse_transform)
             outputs[("cam_T_cam", f_i, 0)] = [M]
-            if self.opt.calc_revserse_transform:
-                outputs[("cam_T_cam", f_i, 0)].apppend(M_inv)
+            if self.opt.calc_reverse_transform:
+                outputs[("cam_T_cam", f_i, 0)].append(M_inv)
             if self.opt.add_pose_loss:
                 pose_loss += loss
 
@@ -546,7 +546,7 @@ class Trainer:
             if os.path.isdir(self.opt.save_model_path):
                 os.makedirs(self.opt.save_model_path)
 
-    # @tf.function    # turn off to debug, e.g. with plt
+    @tf.function    # turn off to debug, e.g. with plt
     def grad(self, input_imgs, input_Ks, trainables, global_step):
         with tf.GradientTape() as tape:
             outputs = self.process_batch(input_imgs, input_Ks)
@@ -584,7 +584,7 @@ class Trainer:
         print("->Start training...")
         self.start_training()
 
-    # @tf.function
+    @tf.function
     def compute_batch_losses(self, input_imgs, input_Ks):
         """@tf.function enables graph computation, allowing larger batch size
         """
