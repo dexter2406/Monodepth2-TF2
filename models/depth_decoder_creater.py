@@ -3,6 +3,7 @@ import cv2 as cv
 from collections import OrderedDict
 from tensorflow.keras.layers import Conv2D
 import numpy as np
+import time
 
 
 class DepthDecoder_full(tf.keras.Model):
@@ -61,7 +62,6 @@ class DepthDecoder_full(tf.keras.Model):
             padding = 'same'
         conv = Conv2D(filters=filter_num, kernel_size=3, activation=activate_type,
                       strides=1, padding=padding, use_bias=True, name=name)
-
         return conv
 
     """
@@ -99,7 +99,7 @@ class DepthDecoder_one_output(tf.keras.Model):
         super(DepthDecoder_one_output, self).__init__()
         self.num_ch_enc = [64, 64, 128, 256, 512]
         self.num_ch_dec = [16, 32, 64, 128, 256]
-        self.scales = [0,1,2,3]  # range(4)
+        self.scales = [0, 1, 2, 3]  # range(4)
         self.num_output_channels = 1
 
         self.convs_0 = [None]*len(self.num_ch_dec)
@@ -175,11 +175,9 @@ class DepthDecoder_one_output(tf.keras.Model):
                 x = tf.pad(x, [[0, 0], [1, 1], [1, 1], [0, 0]], mode='REFLECT')
                 x = self.dispconv[i](x)
                 outputs.append(tf.math.sigmoid(x))
-        # x = tf.pad(x, [[0, 0], [1, 1], [1, 1], [0, 0]], mode='REFLECT')
-        # x = self.dispconv_0(x)
-        # disp0 = tf.math.sigmoid(x)
 
         return outputs
+
 
 def decoder_load_weights(decoder,
                          weights_path=None):
@@ -297,14 +295,19 @@ if __name__ == '__main__':
               tf.random.uniform(shape=(1,24, 80, 128)),
               tf.random.uniform(shape=(1,12, 40, 256)),
               tf.random.uniform(shape=(1,6, 20, 512))]
-
-    decoder = build_model(inputs, model_type='keras', verbose=True)
-    weights_path_disp = r"D:\MA\Recources\monodepth2-torch\models\depthdecoder_weights_full_outs.pkl"
-    saved_model_path = r"D:\MA\Recources\monodepth2-torch\models\depth_decoder_singlet"
-    loaded_layer_record = []
-    decoder = add_dispconv_weights(decoder, weights_path_disp, loaded_layer_record)
-    decoder = add_otherconvs_weights(decoder, saved_model_path, loaded_layer_record)
-    print("loaded layers are: ")
-    print(loaded_layer_record)
-
-    tf.keras.models.save_model(decoder, 'models/decoder_full-test')
+    decoder = DepthDecoder_full()
+    # decoder = build_model(inputs, model_type='keras', verbose=True)
+    for i in range(100):
+        t1 = time.perf_counter()
+        outputs = decoder(inputs)
+        print(time.perf_counter()-t1)
+        print('==========================')
+    # weights_path_disp = r"D:\MA\Recources\monodepth2-torch\models\depthdecoder_weights_full_outs.pkl"
+    # saved_model_path = r"D:\MA\Recources\monodepth2-torch\models\depth_decoder_singlet"
+    # loaded_layer_record = []
+    # decoder = add_dispconv_weights(decoder, weights_path_disp, loaded_layer_record)
+    # decoder = add_otherconvs_weights(decoder, saved_model_path, loaded_layer_record)
+    # print("loaded layers are: ")
+    # print(loaded_layer_record)
+    #
+    # tf.keras.models.save_model(decoder, 'models/decoder_full-test')
