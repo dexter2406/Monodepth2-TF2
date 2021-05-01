@@ -414,7 +414,6 @@ def transformation_from_parameters(axisangle, translation, invert=False):
         t *= -1
 
     T = get_translation_matrix(t)
-    print(R.shape, T.shape)
     if invert:
         M = tf.matmul(R, T)
     else:
@@ -422,32 +421,39 @@ def transformation_from_parameters(axisangle, translation, invert=False):
     return M
 
 
-def transformation_loss(axisangles, translations, invert=False):
+def transformation_loss(axisangles, translations, invert=False, calc_reverse=False):
     # todo: add this loss to train Pose Decoder
     """Calculate Difference between two frames
     For poses of frame 1->2 and 2->1,
     one transformation (M) should be equal to the inverse of the other
     Args:
-         axisangle: List of Tensors, each with shape (B, 1, 1, 3)
+         axisangles: List of Tensors, each with shape (B, 1, 1, 3)
          - if only one Tensor, then no loss will be computed (return None in #0)
-         translation: same as axisangle
+         translations: same as axisangle
+         invert: calculate cam2cam transform in inverse temporal order
+         include_loss: whether to calculate loss, return None if not.
      Returns:
+         loss: scaler of None. if include_loss, the "inversed cam2cam transform between inverse-order image pair"
+            will be compared, which they should be identical.
          M: mean of forward-backward transformation
     """
-
+    # in case pose_loss is disabled, we only need M_1
     M_1 = transformation_from_parameters(axisangles[0][:, 0], translations[0][:, 0], invert)
-    # in case pose_loss is disabled, we only need this
-    if len(axisangles) == 1:
-        return None, M_1
+    M_2 = None
+    if not calc_reverse:
+        return None, M_1, M_2
 
     M_2 = transformation_from_parameters(axisangles[1][:, 0], translations[1][:, 0], not invert)
 
-    # loss
-    pose_loss = tf.reduce_mean(tf.math.square(M_1, M_2))
+    # average the error along batch dim, then sum
+    # todo: other loss, e.g. squared_difference?
+    pose_loss = tf.reduce_sum(tf.reduce_mean(
+        tf.math.abs(M_1 - M_2), axis=0)
+    )
 
     # average as the final estimate
     # M_mean = (M_1 + M_2) * 0.5
-    return pose_loss, M_1
+    return pose_loss, M_1, M_2
 
 
 def get_translation_matrix(trans_vec):
