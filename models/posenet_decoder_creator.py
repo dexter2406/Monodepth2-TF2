@@ -46,11 +46,11 @@ class PoseDecoder(tf.keras.Model):
         return {"angles": angles, "translations": translations}
 
 
-class PoseDecoder_new(tf.keras.Model):
+class PoseDecoder_exp(tf.keras.Model):
     """num_frames_to_predict=2, i.e. only frame 1->2, no 2->1"""
     def __init__(self, num_frames_to_predict_for, num_ch_enc=(64, 64, 128, 256, 512),
                  num_input_features=1, stride=1, include_intrinsics=False):
-        super(PoseDecoder_new, self).__init__()
+        super(PoseDecoder_exp, self).__init__()
         # (64, 64, 128, 256, 512)
         self.num_ch_enc = num_ch_enc
         self.num_input_features = num_input_features
