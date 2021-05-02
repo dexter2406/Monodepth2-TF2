@@ -16,8 +16,10 @@ def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
     else:
         # directly skip when loss is not low enough
         # if the loss is the new low, should at least 2 another metrics
-        diff = val_losses_min['loss/total'] - val_losses['loss/total']
-        if val_losses['loss/total'] > val_losses_min['loss/total'] and diff > 0.01:
+        diff = val_losses['loss/total'] - val_losses_min['loss/total']
+        tolerance = 0.01
+        num_pass_min = 2
+        if diff > tolerance:
             skip = True
         else:
             skip = False
@@ -33,7 +35,7 @@ def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
                         # for other metric, argmin
                         if val_losses[metric] < val_losses_min[metric]:
                             num_pass += 1
-                skip = num_pass < 1  # if no metric exceeds, decision will be override
+                skip = num_pass < num_pass_min  # if no metric exceeds, decision will be override
 
             if not skip:
                 print('val loss hits new low!')
@@ -424,7 +426,7 @@ def transformation_from_parameters(axisangle, translation, invert=False):
     return M
 
 
-def transformation_loss(axisangles, translations, invert=False, calc_reverse=False):
+def transformation_loss(axisangles, translations, invert=False, calc_reverse=False, include_res_trans_loss=False):
     # todo: add this loss to train Pose Decoder
     """Calculate Difference between two frames
     For poses of frame 1->2 and 2->1,
@@ -434,29 +436,70 @@ def transformation_loss(axisangles, translations, invert=False, calc_reverse=Fal
          - if only one Tensor, then no loss will be computed (return None in #0)
          translations: same as axisangle
          invert: calculate cam2cam transform in inverse temporal order
-         include_loss: whether to calculate loss, return None if not.
+         calc_reverse: whether to calculate reverse transformation (and calculate loss)
      Returns:
          loss: scaler of None. if include_loss, the "inversed cam2cam transform between inverse-order image pair"
             will be compared, which they should be identical.
          M: mean of forward-backward transformation
     """
     # in case pose_loss is disabled, we only need M_1
-    M_1 = transformation_from_parameters(axisangles[0][:, 0], translations[0][:, 0], invert)
-    M_2 = None
+    M_12 = transformation_from_parameters(axisangles[0][:, 0], translations[0][:, 0], invert)
+    M_21 = None
     if not calc_reverse:
-        return None, M_1, M_2
+        return None, M_12, M_21
 
-    M_2 = transformation_from_parameters(axisangles[1][:, 0], translations[1][:, 0], not invert)
+    M_21 = transformation_from_parameters(axisangles[1][:, 0], translations[1][:, 0], not invert)
+
+    # calculate pose loss (actually it's consistency loss.. in struct2depth)
+    pose_loss, _ = pose_losses(M_12, M_21, include_res_trans_loss)
 
     # average the error along batch dim, then sum
-    # todo: other loss, e.g. squared_difference?
-    pose_loss = tf.reduce_sum(tf.reduce_mean(
-        tf.math.abs(M_1 - M_2), axis=0)
-    )
+    # pose_loss = tf.reduce_sum(tf.reduce_mean(
+    #     tf.math.abs(M_12 - M_21), axis=0)
+    # )
 
     # average as the final estimate
     # M_mean = (M_1 + M_2) * 0.5
-    return pose_loss, M_1, M_2
+    return pose_loss, M_12, M_21
+
+
+def pose_losses(M_12, M_21, include_trans_loss=False):
+    """calculate pose losses
+    Total transformation between two frames should be reverse to each other for pure egomtion
+    But if there's moving objects, this fails. But not entirely:
+    -> Rotation: the objects' doesn't rotate significantly, so it's reasonable to constraint.
+    reversed rotations.
+    -> Translation: the main motion of objects, which deviates from background egomotion
+        if we put constraint on this part, we need to mask out the region with moving objects
+    Note: actually it's consistency loss.. in struct2depth
+
+    [ R2,  t2 ]    [ R1,  t1 ]     [ R2R1,  R2t1 + t2 ]
+    [         ]  . [         ]  =  [                  ]
+    [ 000, 1  ]    [ 000,  1 ]     [ 000,       1     ]
+    """
+    def norm(x):
+        return tf.reduce_sum(tf.square(x), axis=-1)
+
+    R_12, R_21 = M_12[:, :3, :3], M_21[:, :3, :3]
+    T_12, T_21 = M_12[:, :3, -1], M_21[:, :3, -1]
+    R_unit = tf.matmul(R_21, R_12)    # R2R1, shape (B,3,3)
+    R2T1 = tf.matmul(R_21, tf.expand_dims(T_12, axis=-1))      # (B,3,1)
+    T_zero = R2T1 + tf.expand_dims(T_21,axis=-1)             # (B,3,1)
+
+    eye = tf.eye(3, batch_shape=R_12.shape[:1])
+    rot_error = R_unit - eye
+    rot_error = tf.reduce_mean(tf.square(rot_error), axis=(1, 2))
+    rot_scale_1 = tf.reduce_mean(tf.square(R_12 - eye), axis=(1, 2))
+    rot_scale_2 = tf.reduce_mean(tf.square(R_21 - eye), axis=(1, 2))
+    rot_consis_loss = tf.reduce_mean(
+        rot_error / (1e-24 + rot_scale_1 + rot_scale_2)
+    )
+    trans_consis_loss = None
+
+    # todo: translation loss with "residual_reanslation" map
+    if include_trans_loss:
+        pass
+    return rot_consis_loss, trans_consis_loss
 
 
 def get_translation_matrix(trans_vec):
