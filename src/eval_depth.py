@@ -25,7 +25,7 @@ def evaluate_depth(opt):
     MIN_DEPTH = 1e-3
     MAX_DEPTH = 80
 
-    if opt.use_ext_res is not None:
+    if not opt.use_ext_res:
         # ----------
         # Prepare models
         # ----------
@@ -79,8 +79,8 @@ def evaluate_depth(opt):
 
     # todo: use imported disp to eval
     else:
-        print("-> Loading predictions from {}".format(opt.ext_disp_to_eval))
-        pred_disps = np.load(opt.ext_disp_to_eval)
+        print("-> Loading predictions from {}".format(opt.ext_res_path))
+        pred_disps = np.load(opt.ext_res_path)
 
         if opt.eval_eigen_to_benchmark:
             eigen_to_benchmark_ids = np.load(
