@@ -16,7 +16,8 @@ def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
     else:
         # directly skip when loss is not low enough
         # if the loss is the new low, should at least 2 another metrics
-        if val_losses['loss/total'] > max(0.1, val_losses_min['loss/total']):
+        diff = val_losses_min['loss/total'] - val_losses['loss/total']
+        if val_losses['loss/total'] > val_losses_min['loss/total'] and diff > 0.01:
             skip = True
         else:
             skip = False
@@ -360,6 +361,8 @@ def bilinear_sampler(img, coords, padding='border'):
         eps = tf.constant([0.5], tf.float32)
         x = tf.clip_by_value(x, eps, tf.cast(max_x, tf.float32) - eps)   # t+
         y = tf.clip_by_value(y, eps, tf.cast(max_y, tf.float32) - eps)   # t+
+    else:
+        raise NotImplementedError('only zeros / border padding is supported')
 
     # grab 4 nearest corner points for each (x_i, y_i)
     x0 = tf.cast(tf.floor(x), 'int32')
@@ -599,11 +602,11 @@ def show_images(batch_size, input_imgs, outputs, nrow=3, ncol=2):
         plt.imshow(src1)
 
         fig.add_subplot(nrow, ncol, 5)
-        out0 = outputs[("color", -1, 0)][i].numpy()
+        out0 = outputs[('color', -1, 0)][i].numpy()
         print(np.max(np.max(out0)), np.min(np.min(out0)))
         plt.imshow(out0)
         fig.add_subplot(nrow, ncol, 6)
-        out1 = outputs[("color", 1, 0)][i].numpy()
+        out1 = outputs[('color', 1, 0)][i].numpy()
         print(np.max(np.max(out1)), np.min(np.min(out1)))
         plt.imshow(out1)
         plt.show()
