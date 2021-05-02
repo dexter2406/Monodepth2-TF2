@@ -159,8 +159,10 @@ class Trainer:
         grad_disp_x = tf.math.abs(norm_disp[:, :-1, :, :] - norm_disp[:, 1:, :, :])
         grad_disp_y = tf.math.abs(norm_disp[:, :, :-1, :] - norm_disp[:, :, 1:, :])
 
-        grad_img_x = tf.math.abs(img[:, :-1, :, :] - img[:, 1:, :, :])
-        grad_img_y = tf.math.abs(img[:, :, :-1, :] - img[:, :, 1:, :])
+        # grad_img_x = tf.math.abs(img[:, :-1, :, :] - img[:, 1:, :, :])
+        # grad_img_y = tf.math.abs(img[:, :, :-1, :] - img[:, :, 1:, :])
+        grad_img_x = tf.math.abs(img - tf.roll(img, shift=1, axis=1))
+        grad_img_y = tf.math.abs(img - tf.roll(img, shift=1, axis=2))
 
         weight_x = tf.math.exp(-tf.reduce_mean(grad_img_x, 3, keepdims=True))
         weight_y = tf.math.exp(-tf.reduce_mean(grad_img_y, 3, keepdims=True))
@@ -200,21 +202,24 @@ class Trainer:
         total_loss = 0.
 
         if self.opt.use_cycle_consistency:
-            # doesn't use depth for now
+            idx_map = {-1: 1, 1: 0}     # for frame=-1, use the second(reversed) data.
+            cycle_loss = 0.
             for f_i in self.opt.frame_idx[1:]:
                 mask = outputs[('occlu_aware_mask', f_i, 0)]
-                data_warped = outputs[('warped_multi_s', f_i, 0)][..., :3]
+                idx = idx_map[f_i]
+                data_warped = outputs[('warped_multi_s', f_i, 0)][idx][..., :3]  # doesn't use depth for now
                 data_orig = input_imgs[('color', f_i, 0)]
                 if self.opt.use_RGBD:
-                    data_warped = outputs[('warped_multi_s', f_i, 0)]
+                    data_warped = outputs[('warped_multi_s', f_i, 0)][idx]
                     data_orig = tf.concat([
                         data_orig, outputs[('disp', f_i, 0)]
                     ])
                 mask = tf.concat([mask] * data_orig.shape[-1], axis=-1)
-                cycle_loss = tf.reduce_mean(tf.boolean_mask(
-                    tf.math.abs(data_warped - data_orig), mask)
-                )
-                self.losses['cycle_loss'] = cycle_loss * self.opt.cycle_loss_weight
+                cycle_loss += tf.reduce_mean(tf.boolean_mask(
+                    tf.math.abs(data_warped - data_orig), mask)) * self.opt.cycle_loss_weight
+
+            self.losses['cycle_loss'] = cycle_loss / len(self.opt.frame_idx[1:])
+            print("cycle_loss:", self.losses['cycle_loss'])
 
         for scale in range(self.opt.num_scales):
             # -------------------
@@ -302,9 +307,13 @@ class Trainer:
         self.losses['pixel_loss'] /= self.opt.num_scales
         self.losses['smooth_loss'] /= self.opt.num_scales
         total_loss /= self.opt.num_scales
+
         if self.opt.add_pose_loss:
             total_loss += outputs[('pose_loss',)]  # must use `tuple`, otherwise fail in @tf.function
             self.losses['pose_loss'] = outputs[('pose_loss',)]
+            print("pose loss:",self.losses['pose_loss'])
+        if self.opt.use_cycle_consistency:
+            total_loss += self.losses['cycle_loss']
 
         self.losses['loss/total'] = total_loss
 
@@ -391,7 +400,7 @@ class Trainer:
             # ---
             src_data = input_imgs[('color', 0, 0)].numpy()[0]
             res = outputs[('warped_multi_s', 1, 0)][0].numpy()[0]
-            sampler_mask = outputs[('sampler_mask', 1, 0)][0]
+            sampler_mask = outputs[('sampler_mask', 1, 0)][1]
             # ---
             disp_orig = outputs[('disp', self.opt.frame_idx[0], 0)][0]
             # disp_resamp1 = tf.expand_dims(outputs[('rgbd', self.opt.frame_idx[1], 0)][0, ..., -1], 2)
@@ -434,7 +443,6 @@ class Trainer:
 
         def delete_tmps(f_i):
             """Free memory, only `outputs[('occlu_aware_mask', f_i, 0)]` is needed """
-            print('delete disp_warp', f_i)
             del outputs[('disp_warp', f_i, 0)]
 
         disp_tgt = outputs[('disp', 0, 0)]
@@ -451,7 +459,6 @@ class Trainer:
             # ---------------------------
             disp_src = outputs[('disp', f_i, 0)]
             disp_src_warped, disp_tgt_warped = outputs[('disp_warp', f_i, 0)]
-            print('disp_src_warped,',disp_src_warped.shape,'\tdisp_tgt_warped',disp_tgt_warped.shape)
             if f_i == -1:
                 # Zr' <= Zl for normal order, where camera closer at tgt-frame / frame==0
                 mask_1 = disp_tgt_warped >= disp_src
@@ -504,17 +511,22 @@ class Trainer:
 
             pose_features = self.models["pose_enc"](tf.concat(pose_inputs, axis=-1), training=self.opt.train_pose)
             pred_pose_forward = self.models["pose_dec"](pose_features, training=self.opt.train_pose)
-            axisangles.append(pred_pose_forward['angles'])  # B,1,1,3
-            translations.append(pred_pose_forward['translations'])
+            # for experiments, some modes outputs have shape (B,2,1,3), sp it's a workaround to adapt to different shape
+            angle = tf.expand_dims(pred_pose_forward['angles'][:, 0, ...], 1)
+            translation = tf.expand_dims(pred_pose_forward['translations'][:, 0, ...], 1)
+            axisangles.append(angle)  # B,1,1,3
+            translations.append(translation)
 
             # -------------------------
             # Test: pose loss. Forward and backward frames should produce inverse movements.
-            if self.opt.add_pose_loss:
+            if self.opt.calc_reverse_transform:
                 pose_features = self.models["pose_enc"](tf.concat(pose_inputs[::-1], axis=-1),
                                                         training=self.opt.train_pose)
                 pred_pose_backward = self.models["pose_dec"](pose_features, training=self.opt.train_pose)
-                axisangles.append(pred_pose_backward['angles'])
-                translations.append(pred_pose_backward['translations'])
+                angles = tf.expand_dims(pred_pose_backward['angles'][:, 0, ...], 1)
+                translations = tf.expand_dims(pred_pose_backward['translations'][:, 0, ...], 1)
+                axisangles.append(angle)
+                translations.append(translation)
 
             # Invert the matrix if the frame id is negative
             loss, M, M_inv = transformation_loss(axisangles, translations,
