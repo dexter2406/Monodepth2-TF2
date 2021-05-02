@@ -3,7 +3,39 @@ import pickle
 import numpy as np
 import tensorflow as tf
 
+from models.depth_decoder_creater import DepthDecoder_full
+from models.encoder_creater import ResNet18_new
+from models.posenet_decoder_creator import PoseDecoder
+from src.trainer_helper import build_models
+
 rootdir = os.path.dirname(__file__)
+
+
+def get_models(weights_dir, exp=True):
+    models = {
+        'depth_enc': ResNet18_new(norm_inp=True),
+        'depth_dec': DepthDecoder_full(),
+        'pose_enc': ResNet18_new(norm_inp=True),
+        'pose_dec': PoseDecoder(num_frames_to_predict_for=1 if exp else 2)
+    }
+    build_models(models, rgb_cat_depth=True if exp else False)
+
+    if weights_dir == '':
+        weights_dir = 'logs/weights/pretrained_resnet18'
+
+    for m_name, model in models.items():
+        weights_name = m_name
+        if exp:
+            if m_name == 'pose_dec':
+                weights_name = m_name + '_one_out'
+            if m_name == 'pose_enc':
+                weights_name = m_name + '_concat'
+        path = os.path.join(weights_dir, weights_name+'.h5')
+        if not os.path.isfile(path):
+            print('%s not found, skipping' % path)
+            continue
+        models[m_name].load_weights(path)
+    return models
 
 
 def disp_to_depth(disp, min_depth, max_depth):
