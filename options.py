@@ -9,18 +9,24 @@ all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_dec']
 FLAGS = flags.FLAGS
 
 # Experimental
-flags.DEFINE_bool('exp_mode', True, 'experiment mode')
+flags.DEFINE_bool('exp_mode', None, 'experiment mode')
 flags.DEFINE_bool('concat_depth_pred', True, 'concat depth_pred to rgb images for pose net input')
-flags.DEFINE_bool('add_pose_loss', True, 'add pose loss to training')
-# todo: hyperparameters
-flags.DEFINE_float('pose_loss_weight', 1, 'weight for pose_loss')
-flags.DEFINE_float('smoothness_ratio', 1e-3, 'ratio to calculate smoothness loss')
-flags.DEFINE_float('ssim_ratio', 0.85, 'ratio to calculate SSIM loss')
-flags.DEFINE_bool('use_depth_consistency', False, 'add depth_consistency to handle occlusion between two frames')
+flags.DEFINE_bool('use_cycle_consistency', False, 'add depth_consistency to handle occlusion between two frames')
 flags.DEFINE_bool('mask_border', False, 'mask out the region padded by bilinear sampler '
                                         'when computing losses (only for zero-padding)')
-flags.DEFINE_bool('calc_reverse_transform', True, 'calcualting transformation in reversed temp order, this'
+flags.DEFINE_bool('add_pose_loss', True, 'add pose loss to training')
+flags.DEFINE_bool('calc_reverse_transform', True, 'calculate transformation in reversed temp order, this'
                                                   'must be true when `add_pose_loss` is activated')
+# NIU: additional depth doesn't seem to help to improve
+flags.DEFINE_bool('use_RGBD', False, 'use RGB-D instead RGB in reprojection error calculation')
+
+# todo: Hyper-parameters
+flags.DEFINE_float('smoothness_ratio', 1e-3, 'ratio to calculate smoothness loss')
+flags.DEFINE_float('ssim_ratio', 0.85, 'ratio to calculate SSIM loss')
+flags.DEFINE_float('reproj_loss_weight', 1.5, 'reprojection loss weight')
+flags.DEFINE_float('cycle_loss_weight', 1., 'weight for cycle-consistency loss')
+flags.DEFINE_float('pose_loss_weight', 1e-1, 'weight for pose_loss')
+flags.DEFINE_float('learning_rate', 1e-4, 'initial learning rate')
 
 # Pre-settings
 flags.DEFINE_integer('pose_num', 1, 'number of poses produced by pose decoder')
@@ -45,9 +51,8 @@ flags.DEFINE_bool('recording', True, 'whether to write results by tf.summary')
 flags.DEFINE_string('record_summary_path', 'logs/gradient_tape/', 'root path to write summary')
 flags.DEFINE_integer('record_freq', 250, 'frequency to record')
 flags.DEFINE_integer('num_epochs', 10, 'total number of training epochs')
-flags.DEFINE_integer('batch_size', 6, 'batch size')
+flags.DEFINE_integer('batch_size', 4, 'batch size')
 flags.DEFINE_bool('debug_mode', False, 'inspect intermediate results')
-flags.DEFINE_float('learning_rate', 1e-4, 'initial learning rate')
 flags.DEFINE_integer('lr_step_size', 5, 'step size to adapt learning rate (piecewise)')
 flags.DEFINE_integer('val_num_per_epoch', 10, 'validate how many times per epoch')
 
@@ -70,10 +75,12 @@ flags.DEFINE_float('pred_depth_scale_factor', 1., 'additional depth scaling fact
 flags.DEFINE_bool('use_median_scaling', True, 'use median filter to calculate scaling ratio')
 flags.DEFINE_string('eval_split', 'eigen', 'evaluation split, choose from: '
                                            '["eigen", "eigen_benchmark", "benchmark", "odom_9", "odom_10"]')
-flags.DEFINE_string('use_ext_res', None, 'use imported disparity predictions for evaluation, '
-                                         'instead of generating them now')
-flags.mark_flag_as_required('run_mode')
+flags.DEFINE_bool('use_ext_res', False, 'use imported disparity predictions for evaluation'
+                                        'instead of generating them now')
+flags.DEFINE_string('ext_res_path', '', 'if use_ext_res==True, specify the path to load external result for evaluation')
 
+flags.mark_flag_as_required('run_mode')
+flags.mark_flag_as_required('exp_mode')
 
 def get_options():
     return FLAGS
