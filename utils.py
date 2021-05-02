@@ -154,7 +154,7 @@ def check_options(FLAGS):
         print("\tTURN ON @tf.function for grad() and DataProcessor!")
         save_dir = FLAGS.save_model_path
         if FLAGS.save_model_path == '':
-            save_dir = os.path.join(rootdir, 'logs/weights/')
+            save_dir = os.path.join(rootdir, 'logs\\weights')
             print('\tno save_model_path specified, use %s instead' % FLAGS.save_model_path)
 
         save_path = os.path.join(save_dir, FLAGS.model_name)
