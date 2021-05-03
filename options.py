@@ -11,21 +11,23 @@ FLAGS = flags.FLAGS
 # Experimental
 flags.DEFINE_bool('exp_mode', None, 'experiment mode')
 flags.DEFINE_bool('concat_depth_pred', True, 'concat depth_pred to rgb images for pose net input')
-flags.DEFINE_bool('use_cycle_consistency', False, 'add depth_consistency to handle occlusion between two frames')
-flags.DEFINE_bool('mask_border', False, 'mask out the region padded by bilinear sampler '
-                                        'when computing losses (only for zero-padding)')
-flags.DEFINE_bool('add_pose_loss', True, 'add pose loss to training')
+flags.DEFINE_bool('use_cycle_consistency', True, 'add depth_consistency to handle occlusion between two frames')
+flags.DEFINE_bool('mask_border', True, 'mask out the region padded by bilinear sampler '
+                                       'when computing losses (only for zero-padding)')
+flags.DEFINE_bool('add_pose_loss', False, 'add pose loss to training')
 flags.DEFINE_bool('calc_reverse_transform', True, 'calculate transformation in reversed temp order, this'
                                                   'must be true when `add_pose_loss` is activated')
 # NIU: additional depth doesn't seem to help to improve
 flags.DEFINE_bool('use_RGBD', False, 'use RGB-D instead RGB in reprojection error calculation')
+flags.DEFINE_bool('use_res_trans_loss', False, 'residual translation error')
+flags.DEFINE_bool('learn_intrinsics', True, 'learn intrinsics matrix')
 
 # todo: Hyper-parameters
 flags.DEFINE_float('smoothness_ratio', 1e-3, 'ratio to calculate smoothness loss')
 flags.DEFINE_float('ssim_ratio', 0.85, 'ratio to calculate SSIM loss')
-flags.DEFINE_float('reproj_loss_weight', 1.5, 'reprojection loss weight')
-flags.DEFINE_float('cycle_loss_weight', 1., 'weight for cycle-consistency loss')
-flags.DEFINE_float('pose_loss_weight', 1e-1, 'weight for pose_loss')
+flags.DEFINE_float('reproj_loss_weight', 1., 'reprojection loss weight')
+flags.DEFINE_float('cycle_loss_weight', 1e-2, 'weight for cycle-consistency loss')
+flags.DEFINE_float('pose_loss_weight', 1e-2, 'weight for pose_loss')
 flags.DEFINE_float('learning_rate', 1e-4, 'initial learning rate')
 
 # Pre-settings
