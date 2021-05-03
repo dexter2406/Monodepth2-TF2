@@ -225,6 +225,16 @@ class Trainer:
             self.losses['cycle_loss'] = cycle_loss / len(self.opt.frame_idx[1:])
             print("cycle_loss:", self.losses['cycle_loss'])
 
+        print('train_pose', self.opt.train_pose)
+        print('train_depth', self.opt.train_depth)
+        print('add_pose_losee', self.opt.add_pose_loss)
+        print('padding_mode', self.opt.padding_mode)
+        print('learn intrinsics', self.opt.learn_intrinsics)
+        print('mask_border', self.opt.mask_border)
+        print('do_automasking', self.opt.do_automasking)
+        print('cycle w', self.opt.cycle_loss_weight)
+        print('poss_w', self.opt.pose_loss_weight)
+
         for scale in range(self.opt.num_scales):
             # -------------------
             # 1. Reprojection / warping loss
@@ -240,6 +250,8 @@ class Trainer:
                 # if scale == 0:
                     # proj_error = tf.math.abs(proj_data - tgt_data)    # to collect
                     # outputs[('proj_error', f_i, scale)] = proj_error
+
+            # print('sampler mean', tf.reduce_mean(sampler_mask))
 
             reproject_losses = tf.concat(reproject_losses, axis=3)
 
@@ -263,6 +275,7 @@ class Trainer:
                     identity_reprojection_losses.append(
                         self.compute_reproject_loss(src_image, tgt_image, sampler_mask)
                     )
+
                 identity_reprojection_losses = tf.concat(identity_reprojection_losses, axis=3)
 
                 # if use average reprojection loss
@@ -282,13 +295,12 @@ class Trainer:
 
             # -------------------
             # 3. Final reprojection loss -> as pixel loss
-            if combined.shape[-1] != 1:
-                to_optimise = tf.reduce_min(combined, axis=3)
+
+            if self.opt.use_minimal_projection_loss and combined.shape[-1] != 1:
+                to_optimise = tf.reduce_min(combined)
             else:
                 to_optimise = combined
             reprojection_loss = tf.reduce_mean(to_optimise) * self.opt.reproj_loss_weight
-            print("reprojection loss:", reprojection_loss)
-            # exit('xx')
             self.losses['pixel_loss'] += reprojection_loss
 
             # -------------------
@@ -367,7 +379,7 @@ class Trainer:
                 if self.opt.use_cycle_consistency and scale == 0:
                     disp_src_s0 = outputs[('disp', f_i, 0)]
                     # _, depth_src_s0 = self.disp_to_depth(disp_src_s0)
-                    warped_data, _ = self.inverse_warp(depth_tgt_s, disp_src_s0, inputs, T)
+                    warped_data, _ = self.inverse_warp(depth_tgt_s, disp_src_s0, outputs, T)
                     # difference between `depth_warp` and `warped_multi_s`: it only includes scale==0
                     outputs[('disp_warp', f_i, 0)] = [warped_data]
 
@@ -376,7 +388,7 @@ class Trainer:
                 if self.opt.use_RGBD:
                     disp_src = outputs[('disp', f_i, 0)]
                     src_data = tf.concat([src_data, disp_src], axis=-1)     # B,H,W,4
-                data_resamp, pix_coords = self.inverse_warp(depth_tgt_s, src_data, inputs, T)
+                data_resamp, pix_coords = self.inverse_warp(depth_tgt_s, src_data, outputs, T)
 
                 outputs[('warped_multi_s', f_i, scale)] = [data_resamp]     # B,H,W,3or4
                 # outputs[('sample', f_i, scale)] = pix_coords
@@ -396,16 +408,16 @@ class Trainer:
             tgt_image = inputs[('color', f_i, 0)]
             T = outputs[('cam_T_cam', f_i, 0)][1]
             outputs[('warped_multi_s', f_i, 0)].append(
-                self.inverse_warp(depth_src, tgt_image, inputs, T)[0]  # for reprojection
+                self.inverse_warp(depth_src, tgt_image, outputs, T)[0]  # for reprojection
             )
-            outputs.update(self.get_occlu_aware_mask(outputs, inputs))
+            outputs.update(self.get_occlu_aware_mask(outputs))
 
         if self.opt.debug_mode:
             # ---
             src_data = inputs[('color', 0, 0)].numpy()[0]
             warped_n = outputs[('warped_multi_s', 1, 0)][0].numpy()[0]
             warped_p = outputs[('warped_multi_s', -1, 0)][0].numpy()[0]
-            sampler_mask = outputs[('sampler_mask', 1, 0)][1]
+            # sampler_mask = outputs[('sampler_mask', 1, 0)][1]
             # ---
             disp_orig = outputs[('disp', self.opt.frame_idx[0], 0)][0]
             # disp_resamp1 = tf.expand_dims(outputs[('rgbd', self.opt.frame_idx[1], 0)][0, ..., -1], 2)
@@ -413,7 +425,7 @@ class Trainer:
             # ---
             # mask1 = tf.cast(outputs[('occlu_aware_mask', -1, 0)], dtype=tf.float32)[0]
             # mask2 = tf.cast(outputs[('occlu_aware_mask', 1, 0)], dtype=tf.float32)[0]
-            print('mask perc', tf.reduce_mean(sampler_mask))
+            # print('mask perc', tf.reduce_mean(sampler_mask))
             inps = [
                 warped_p,
                 src_data,
@@ -439,7 +451,7 @@ class Trainer:
         sampler_mask = tf.expand_dims(tf.cast(data_resamp[..., 0] * 255 > 1., tf.float32), axis=3)  # B,H,W
         return sampler_mask
 
-    def get_occlu_aware_mask(self, outputs, input_Ks):
+    def get_occlu_aware_mask(self, outputs):
         """Produce occlusion-arware between 2 frames
         This will be use along with "sampler_mask", to only apply on non-border region
         Note that "minimal_projection" put constraint of occlusion between 3 frames
@@ -456,7 +468,7 @@ class Trainer:
             disp_src = tf.image.resize(outputs[('disp', f_i, 0)], (self.opt.height, self.opt.width))
             _, depth_src = self.disp_to_depth(disp_src)
             outputs[('disp_warp', f_i, 0)].append(
-                self.inverse_warp(depth_src, disp_tgt, input_Ks, T)[0]
+                self.inverse_warp(depth_src, disp_tgt, outputs, T)[0]
             )
             # ---------------------------
             # Compare: real source VS. from-tgt-transformed source depth map
@@ -496,7 +508,7 @@ class Trainer:
 
         return resamp_data, pix_coords
 
-    def _generate_poses_and_Ks(self, pose_inputs, axisangles, translations, input_Ks):
+    def _generate_poses_and_Ks(self, pose_inputs, axisangles, translations, input_Ks_list):
         pose_features = self.models['pose_enc'](tf.concat(pose_inputs, axis=-1), training=self.opt.train_pose)
         pred_pose = self.models['pose_dec'](pose_features, training=self.opt.train_pose)
         # for experiments, some modes outputs have shape (B,2,1,3), sp it's a workaround to adapt to different shape
@@ -508,9 +520,9 @@ class Trainer:
         if 'intrinsics_head' in self.models:
             Ks = self.models['intrinsics_head'](pose_features[-1])
             Ks = make_hom_intrinsics(Ks, same_video=True)
-            input_Ks.append(self.batch_processor.make_K_pyramid(Ks))
+            input_Ks_list.append(self.batch_processor.make_K_pyramid(Ks))
 
-        return axisangles, translations, input_Ks
+        return axisangles, translations, input_Ks_list
 
     def predict_poses(self, inputs, outputs):
         """Use pose enc-dec to calculate camera's angles and translations"""
@@ -530,24 +542,24 @@ class Trainer:
             else:
                 pose_inputs = [pose_inps[0], pose_inps[f_i]]
 
-            input_Ks = []
-            axisangles, translations, input_Ks = self._generate_poses_and_Ks(
-                pose_inputs, axisangles, translations, input_Ks
+            Ks_list = []
+            axisangles, translations, Ks_list = self._generate_poses_and_Ks(
+                pose_inputs, axisangles, translations, Ks_list
             )
             if self.opt.calc_reverse_transform:
                 pose_inputs = pose_inputs[::-1]
-                axisangles, translations, input_Ks = self._generate_poses_and_Ks(
-                    pose_inputs, axisangles,translations, input_Ks
+                axisangles, translations, Ks_list = self._generate_poses_and_Ks(
+                    pose_inputs, axisangles,translations, Ks_list
                 )
 
             # Intrinsics for fwd and bwd frames should be identical
             # todo: impose a loss to learn identical intrinsics for swapped frames
             if 'intrinsics_head' in self.models:
-                for k in input_Ks[0].keys():
+                for k in Ks_list[0].keys():
                     if self.opt.calc_reverse_transform:
-                        inputs[k] = (input_Ks[0][k] + input_Ks[1][k]) * 0.5
+                        outputs[k] = (Ks_list[0][k] + Ks_list[1][k]) * 0.5
                     else:
-                        inputs[k] = input_Ks[0][k]
+                        outputs[k] = Ks_list[0][k]
 
             # Invert the matrix if the frame id is negative
             loss, M, M_inv = transformation_loss(axisangles, translations,
@@ -574,6 +586,11 @@ class Trainer:
         """
         # tgt_image_aug = inputs[('color_aug', 0, 0)]
         outputs = {}
+        if not self.opt.learn_intrinsics:
+            for k in inputs:
+                for scale in range(self.opt.num_scales):
+                    if ('K', scale) == k or ('K_inv', scale):
+                        outputs[k] = inputs[k]
 
         # ------ collecting disp and depth ------
         # - for f_i==0, collect disp in all scales, to calculate smooth loss
@@ -644,6 +661,7 @@ class Trainer:
 
             # Set new weights_folder for next epoch
             print("save_model path:", self.opt.save_model_path)
+            self.opt.save_model_path.replace('\\', '/')
             save_root = os.path.join(self.opt.save_model_path.rsplit('\\')[0])
             current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
             self.opt.save_model_path = os.path.join(save_root, current_time)
@@ -667,17 +685,25 @@ class Trainer:
         trainable_weights_all = []
         for m_name, model in self.models.items():
             if self.opt.train_pose and "pose" in m_name:
-                # print("Training %s ..."%m_name)
+                print("Training %s ..." % m_name)
                 trainable_weights_all.extend(model.trainable_weights)
+            else:
+                model.trainable = False
             if self.opt.train_depth and 'depth' in m_name:
-                # print("Training %s ..."%m_name)
+                print("Training %s ..." % m_name)
                 trainable_weights_all.extend(model.trainable_weights)
+            else:
+                model.trainable = False
+            if self.opt.learn_intrinsics and 'intrinsics_head' in m_name:
+                print("Training %s ..." % m_name)
+                trainable_weights_all.extend(model.trainable_weights)
+            else:
+                model.trainable = False
         return trainable_weights_all
 
     def train(self):
         if not self.opt.train_pose and not self.opt.train_depth:
-            print("Please specify a model to train")
-            return
+            print("Not training pose nor depth")
 
         if self.opt.recording and not self.opt.debug_mode:
             train_log_dir = os.path.join(self.opt.record_summary_path, self.opt.model_name, 'train')
@@ -816,12 +842,11 @@ class Trainer:
                                  outputs[('warped_multi_s', f_i, 0)][0][:2,...,:3], step=global_step)
                 # tf.summary.image('scale0_proj_error_{}'.format(f_i),
                 #                  outputs[('proj_error', f_i, 0)][:2], step=global_step)
-
             if self.opt.learn_intrinsics:
-                tf.summary.scalar('fx', inputs[('K', 0)][0, 0, 0])
-                tf.summary.scalar('fy', inputs[('K', 0)][0, 1, 1])
-                tf.summary.scalar('x0', inputs[('K', 0)][0, 0, 2])
-                tf.summary.scalar('y0', inputs[('K', 0)][0, 1, 2])
+                tf.summary.scalar('fx', outputs[('K', 0)][0, 0, 0], step=global_step)
+                tf.summary.scalar('fy', outputs[('K', 0)][0, 1, 1], step=global_step)
+                tf.summary.scalar('x0', outputs[('K', 0)][0, 0, 2], step=global_step)
+                tf.summary.scalar('y0', outputs[('K', 0)][0, 1, 2], step=global_step)
 
             # if self.opt.do_automasking:
             # tf.summary.image('scale0_automask_image',
