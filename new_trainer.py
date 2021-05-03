@@ -510,10 +510,10 @@ class Trainer:
                 pose_inputs = [pose_inps[0], pose_inps[f_i]]
 
             pose_features = self.models["pose_enc"](tf.concat(pose_inputs, axis=-1), training=self.opt.train_pose)
-            pred_pose_forward = self.models["pose_dec"](pose_features, training=self.opt.train_pose)
+            pred_pose_fwd = self.models["pose_dec"](pose_features, training=self.opt.train_pose)
             # for experiments, some modes outputs have shape (B,2,1,3), sp it's a workaround to adapt to different shape
-            angle = tf.expand_dims(pred_pose_forward['angles'][:, 0, ...], 1)
-            translation = tf.expand_dims(pred_pose_forward['translations'][:, 0, ...], 1)
+            angle = tf.expand_dims(pred_pose_fwd['angles'][:, 0, ...], 1)
+            translation = tf.expand_dims(pred_pose_fwd['translations'][:, 0, ...], 1)
             axisangles.append(angle)  # B,1,1,3
             translations.append(translation)
 
@@ -522,9 +522,9 @@ class Trainer:
             if self.opt.calc_reverse_transform:
                 pose_features = self.models["pose_enc"](tf.concat(pose_inputs[::-1], axis=-1),
                                                         training=self.opt.train_pose)
-                pred_pose_backward = self.models["pose_dec"](pose_features, training=self.opt.train_pose)
-                angles = tf.expand_dims(pred_pose_backward['angles'][:, 0, ...], 1)
-                translations = tf.expand_dims(pred_pose_backward['translations'][:, 0, ...], 1)
+                pred_pose_bwd = self.models["pose_dec"](pose_features, training=self.opt.train_pose)
+                angle = tf.expand_dims(pred_pose_bwd['angles'][:, 0, ...], 1)
+                translation = tf.expand_dims(pred_pose_bwd['translations'][:, 0, ...], 1)
                 axisangles.append(angle)
                 translations.append(translation)
 
