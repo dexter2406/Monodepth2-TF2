@@ -156,8 +156,10 @@ class Trainer:
     # ----- For process_batch() -----
     def get_smooth_loss(self, disp, img):
         norm_disp = disp / (tf.reduce_mean(disp, [1, 2], keepdims=True) + 1e-7)
-        grad_disp_x = tf.math.abs(norm_disp[:, :-1, :, :] - norm_disp[:, 1:, :, :])
-        grad_disp_y = tf.math.abs(norm_disp[:, :, :-1, :] - norm_disp[:, :, 1:, :])
+        # grad_disp_x = tf.math.abs(norm_disp[:, :-1, :, :] - norm_disp[:, 1:, :, :])
+        # grad_disp_y = tf.math.abs(norm_disp[:, :, :-1, :] - norm_disp[:, :, 1:, :])
+        grad_disp_x = tf.math.abs(norm_disp - tf.roll(norm_disp, shift=1, axis=1))
+        grad_disp_y = tf.math.abs(norm_disp - tf.roll(norm_disp, shift=1, axis=2))
 
         # grad_img_x = tf.math.abs(img[:, :-1, :, :] - img[:, 1:, :, :])
         # grad_img_y = tf.math.abs(img[:, :, :-1, :] - img[:, :, 1:, :])
