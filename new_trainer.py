@@ -651,7 +651,7 @@ class Trainer:
             if os.path.isdir(self.opt.save_model_path):
                 os.makedirs(self.opt.save_model_path)
 
-    # @tf.function  # turn off to debug, e.g. with plt
+    @tf.function  # turn off to debug, e.g. with plt
     def grad(self, inputs, trainables, global_step):
         with tf.GradientTape() as tape:
             outputs = self.process_batch(inputs)
@@ -689,7 +689,7 @@ class Trainer:
         print("->Start training...")
         self.start_training()
 
-    # @tf.function
+    @tf.function
     def compute_batch_losses(self, inputs):
         """@tf.function enables graph computation, allowing larger batch size
         """
