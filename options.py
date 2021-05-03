@@ -6,28 +6,33 @@ import datetime
 rootdir = os.path.dirname(__file__)
 current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
 all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_dec']
-FLAGS = flags.FLAGS
 
 # Experimental
-flags.DEFINE_bool('exp_mode', None, 'experiment mode')
-flags.DEFINE_bool('concat_depth_pred', True, 'concat depth_pred to rgb images for pose net input')
-flags.DEFINE_bool('use_cycle_consistency', True, 'add depth_consistency to handle occlusion between two frames')
-flags.DEFINE_bool('mask_border', True, 'mask out the region padded by bilinear sampler '
-                                       'when computing losses (only for zero-padding)')
-flags.DEFINE_bool('add_pose_loss', False, 'add pose loss to training')
-flags.DEFINE_bool('calc_reverse_transform', True, 'calculate transformation in reversed temp order, this'
-                                                  'must be true when `add_pose_loss` is activated')
+flags.DEFINE_bool('do_automasking', False, 'apply auto masking')
+flags.DEFINE_bool('train_depth', False, 'whether to train depth decoder-encoder')
+flags.DEFINE_bool('train_pose', False, 'whether to train pose decoder-encoder')
+flags.DEFINE_boolean('exp_mode', True, 'experiment mode')
+flags.DEFINE_boolean('concat_depth_pred', True, 'concat depth_pred to rgb images for pose net input')
+flags.DEFINE_boolean('use_cycle_consistency', True, 'add depth_consistency to handle occlusion between two frames')
+flags.DEFINE_string('padding_mode', 'border', 'padding mode for bilinear sampler')
+flags.DEFINE_boolean('mask_border', False, 'mask out the region padded by bilinear sampler '
+                                           'when computing losses (only for zero-padding)')
+flags.DEFINE_boolean('add_pose_loss', True, 'add pose loss to training')
+flags.DEFINE_boolean('calc_reverse_transform', True, 'calculate transformation in reversed temp order, this'
+                                                     'must be true when `add_pose_loss` is activated')
+flags.DEFINE_boolean('use_res_trans_loss', False, 'residual translation error')
+flags.DEFINE_boolean('learn_intrinsics', True, 'learn intrinsics matrix')
 # NIU: additional depth doesn't seem to help to improve
-flags.DEFINE_bool('use_RGBD', False, 'use RGB-D instead RGB in reprojection error calculation')
-flags.DEFINE_bool('use_res_trans_loss', False, 'residual translation error')
-flags.DEFINE_bool('learn_intrinsics', True, 'learn intrinsics matrix')
+flags.DEFINE_boolean('use_RGBD', False, 'use RGB-D instead RGB in reprojection error calculation')
+flags.DEFINE_boolean('use_minimal_projection_loss', False, 'use minimal projection loss, not suitable for intrinsics training')
 
 # todo: Hyper-parameters
+flags.DEFINE_integer('batch_size', 4, 'batch size')
 flags.DEFINE_float('smoothness_ratio', 1e-3, 'ratio to calculate smoothness loss')
 flags.DEFINE_float('ssim_ratio', 0.85, 'ratio to calculate SSIM loss')
 flags.DEFINE_float('reproj_loss_weight', 1., 'reprojection loss weight')
-flags.DEFINE_float('cycle_loss_weight', 1e-2, 'weight for cycle-consistency loss')
-flags.DEFINE_float('pose_loss_weight', 1e-2, 'weight for pose_loss')
+flags.DEFINE_float('cycle_loss_weight', 1e-1, 'weight for cycle-consistency loss')
+flags.DEFINE_float('pose_loss_weight', 1e-1, 'weight for pose_loss')
 flags.DEFINE_float('learning_rate', 1e-4, 'initial learning rate')
 
 # Pre-settings
@@ -37,13 +42,11 @@ flags.DEFINE_string('weights_dir', '',  'the folder that stores weights files.')
 flags.DEFINE_list('models_to_load', all_models,
                   'load weights for specified models, by default all of them')
 flags.DEFINE_string('model_name', current_time, 'specify a dirname to collect weights, if not, current time is used')
-flags.DEFINE_bool('train_depth', True, 'whether to train depth decoder-encoder')
-flags.DEFINE_bool('train_pose', True, 'whether to train pose decoder-encoder')
+
 flags.DEFINE_string('save_model_path', '', 'path where weights are saved')
 flags.DEFINE_string('data_path', r'F:\Dataset\kitti_raw', 'path that stores corresponding dataset')
 flags.DEFINE_string('dataset', 'kitti_raw', 'specify a dataset, choices from [\'kitti_raw\', \'kitti_odom\']')
-flags.DEFINE_string('padding_mode', 'border', 'padding mode for bilinear sampler')
-
+flags.DEFINE_string('save_root', '', 'another root path to store logs')
 # Training
 flags.DEFINE_bool('from_scratch', False, 'whether trained from scratch, coorperate with load_weights_folder')
 flags.DEFINE_string('run_mode', 'train', 'choose from [\'train\', \'eval_depth\', \'eval_pose\']')
@@ -53,7 +56,6 @@ flags.DEFINE_bool('recording', True, 'whether to write results by tf.summary')
 flags.DEFINE_string('record_summary_path', 'logs/gradient_tape/', 'root path to write summary')
 flags.DEFINE_integer('record_freq', 250, 'frequency to record')
 flags.DEFINE_integer('num_epochs', 10, 'total number of training epochs')
-flags.DEFINE_integer('batch_size', 4, 'batch size')
 flags.DEFINE_bool('debug_mode', False, 'inspect intermediate results')
 flags.DEFINE_integer('lr_step_size', 5, 'step size to adapt learning rate (piecewise)')
 flags.DEFINE_integer('val_num_per_epoch', 10, 'validate how many times per epoch')
@@ -65,7 +67,6 @@ flags.DEFINE_integer('height', 192, 'height of input image')
 flags.DEFINE_integer('width', 640, 'width of input image')
 flags.DEFINE_list('frame_idx', [0, -1, 1], 'index of target, previous and next frame')
 flags.DEFINE_bool('do_augmentation', True, 'apply image augmentation')
-flags.DEFINE_bool('do_automasking', True, 'apply auto masking')
 flags.DEFINE_float('min_depth', 0.1, 'minimum depth when applying scaling/normalizing to depth estimates')
 flags.DEFINE_float('max_depth', 100., 'maximum depth when applying scaling/normalizing to depth estimates')
 
@@ -81,8 +82,11 @@ flags.DEFINE_bool('use_ext_res', False, 'use imported disparity predictions for 
                                         'instead of generating them now')
 flags.DEFINE_string('ext_res_path', '', 'if use_ext_res==True, specify the path to load external result for evaluation')
 
+FLAGS = flags.FLAGS
+
 flags.mark_flag_as_required('run_mode')
 flags.mark_flag_as_required('exp_mode')
+flags.mark_flag_as_required('use_minimal_projection_loss')
 
 def get_options():
     return FLAGS
