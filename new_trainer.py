@@ -813,7 +813,7 @@ class Trainer:
         white_list = []
         if self.opt.train_depth: white_list.extend(['depth_enc', 'depth_dec'])
         if self.opt.train_pose: white_list.extend(['pose_enc', 'pose_dec'])
-        if self.opt.train_intriniscs: white_list.extend(['intrinsics_head'])
+        if self.opt.learn_intrinsics: white_list.extend(['intrinsics_head'])
         for m_name, model in self.models.items():
             if m_name in white_list:
                 m_path = os.path.join(weights_path, m_name + '.h5')
