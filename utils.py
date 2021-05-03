@@ -11,6 +11,63 @@ from src.trainer_helper import build_models
 rootdir = os.path.dirname(__file__)
 
 
+def assert_valid_hom_intrinsics(intrinsics_mat):
+    shapes = list(intrinsics_mat.shape)
+    if len(shapes) != 3 or shapes[1] != shapes[2] or shapes[2] != 4:
+        raise ValueError('intrinsics shape should be [B,4,4], got {}'.format(shapes))
+
+
+def hom_intrinsics_helper(intrinsics_mat, batch_num):
+    """Pad a [B,2,3] or [2,3] intrinsics to be homogenous"""
+    K_shape = intrinsics_mat.shape
+
+    if K_shape[-2] != 2 or K_shape[-1] not in [3, 4]:
+        raise ValueError('intrinsics shape is wrong: {}'.format(K_shape))
+
+    if len(K_shape) == 2:
+        # in case no batch dim
+        intrinsics_mat = tf.expand_dims(intrinsics_mat, axis=0)
+
+    if K_shape[0] == 1 and K_shape[0] != batch_num:
+        # in case batch_dim=1 but needs more
+        intrinsics_mat = tf.concat([intrinsics_mat]*batch_num, axis=0)
+
+    if K_shape[-1] == 4:
+        # if it's half-way padded [B,2,4], just restore to [B,2,3]
+        intrinsics_mat = intrinsics_mat[..., :3]
+
+    # now K should have shape [B, 3, 3]
+    row_3 = tf.cast(tf.tile([[[0, 0, 1]]], [batch_num, 1, 1]), dtype=tf.float32)
+    row_4 = tf.cast(tf.tile([[[0, 0, 0]]], [batch_num, 1, 1]), dtype=tf.float32)
+    last_col = tf.cast(tf.reshape(tf.tile([[[0, 0, 0, 1]]], [batch_num, 1, 1]), [batch_num, 4, 1]),
+                       dtype=tf.float32)
+    hom_intrinsics = tf.concat([intrinsics_mat, row_3, row_4], axis=1)
+    hom_intrinsics = tf.cast(tf.concat([hom_intrinsics, last_col], axis=2), dtype=tf.float32)
+    return hom_intrinsics
+
+
+def make_hom_intrinsics(intrinsic_mat, same_video):
+    """ Make homogenous intrinsics
+    As input of
+    Args:
+        intrinsic_mat: Tensor, [B, 2, 3]
+            will be padded to be homogenous mat
+        same_video: if True, intrinsics_mat will be averaged as identical ones though batch dimension
+    Returns:
+        hom_intrinsics: Tensor, [B, 4, 4]
+    """
+    batch_size = intrinsic_mat.shape[0]
+    if same_video:
+        intrinsic_mat = tf.reduce_mean(intrinsic_mat, axis=0, keepdims=True)
+        hom_intrinsics = hom_intrinsics_helper(intrinsic_mat, 1)
+        hom_intrinsics = tf.concat([hom_intrinsics] * batch_size, axis=0)
+    else:
+        batch_size = intrinsic_mat.shape[0]
+        hom_intrinsics = hom_intrinsics_helper(intrinsic_mat, batch_size)
+
+    return hom_intrinsics
+
+
 def get_models(weights_dir, exp=True):
     models = {
         'depth_enc': ResNet18_new(norm_inp=True),
@@ -186,7 +243,7 @@ def check_options(FLAGS):
         print("\tTURN ON @tf.function for grad() and DataProcessor!")
         save_dir = FLAGS.save_model_path
         if FLAGS.save_model_path == '':
-            save_dir = os.path.join(rootdir, 'logs\\weights')
+            save_dir = os.path.join(rootdir, 'logs/weights')
             print('\tno save_model_path specified, use %s instead' % FLAGS.save_model_path)
 
         save_path = os.path.join(save_dir, FLAGS.model_name)
