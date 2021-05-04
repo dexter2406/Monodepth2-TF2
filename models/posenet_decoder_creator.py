@@ -1,7 +1,7 @@
 import tensorflow as tf
 from tensorflow.keras.layers import Conv2D
 import numpy as np
-
+import time
 
 class PoseDecoder(tf.keras.Model):
     def __init__(self, num_ch_enc=(64, 64, 128, 256, 512),
@@ -48,120 +48,210 @@ class PoseDecoder(tf.keras.Model):
 
 class PoseDecoder_exp(tf.keras.Model):
     """num_frames_to_predict=2, i.e. only frame 1->2, no 2->1"""
-    def __init__(self, num_frames_to_predict_for, num_ch_enc=(64, 64, 128, 256, 512),
-                 num_input_features=1, stride=1, include_intrinsics=False):
+    def __init__(self, pose_num, has_depth, num_ch_enc=(64, 64, 128, 256, 512),
+                 stride=1, has_residual_trans=False, do_automasking=False):
         super(PoseDecoder_exp, self).__init__()
-        # (64, 64, 128, 256, 512)
         self.num_ch_enc = num_ch_enc
-        self.num_input_features = num_input_features
-        self.pose_scale = 0.01
-        self.num_frames_to_predict_for = num_frames_to_predict_for
-        self.include_intrinsics = include_intrinsics
-
+        input_ch = 8 if has_depth else 6
+        # self.num_ch_dec = [input_ch, 16, 32, 64, 128, 256]
+        self.num_ch_dec = [16, 32, 64, 128, 256]
+        self.pose_scale = tf.cast(0.01, dtype=tf.float32)
+        self.pose_num = pose_num
+        self.include_res_trans = has_residual_trans
+        self.do_automasking = do_automasking
         self.relu = tf.keras.activations.relu
 
         self.convs_squeeze = Conv2D(filters=256, kernel_size=1, name='Conv_squeeze')
 
         pose_0_nopad = Conv2D(256, kernel_size=3, strides=stride, padding="valid", name='Conv_pose_0')
         pose_1_nopad = Conv2D(256, kernel_size=3, strides=stride, padding='valid', name='Conv_pose_1')
-        pose_2_nopad = Conv2D(6*self.num_frames_to_predict_for, kernel_size=1, strides=1, name='Conv_pose_2')
+        filter_num_last = 6 * self.pose_num
+        pose_2_nopad = Conv2D(filter_num_last, kernel_size=1, strides=1, name='Conv_pose_2')
+
         self.convs_pose = [pose_0_nopad, pose_1_nopad, pose_2_nopad]
 
-        conv_prop = {'filters': 2, 'kernel_size': [1, 1], 'strides': 1, 'padding': 'same'}
-        self.conv_intrinsics = [
-            Conv2D(**conv_prop, activation=tf.nn.softplus, name='Conv_foci'),
-            Conv2D(**conv_prop, use_bias=False, name='Conv_offsets')
-        ]
+        # ----------------------------
+        # Experiments: Residual Translation
+        # ----------------------------
+
+        if self.include_res_trans:
+            conv_prop_1 = {'kernel_size': 1, 'strides': 1, 'use_bias': False, 'padding': 'valid'}
+            self.conv_res_motion = Conv2D(input_ch, **conv_prop_1, name='unrefined_res_trans')
+            self.conv_refine_motion = []
+            for i, ch in enumerate(self.num_ch_dec):
+                idx = len(self.num_ch_dec) - i - 1     # 5->0
+                pref = 'Refine%d' % idx
+                conv_prop_2 = {'filters': ch, 'kernel_size': 3, 'strides': 1,
+                               'activation': 'relu', 'padding': 'valid'}
+                tmp = []
+                for j in range(3):
+                    tmp.append(Conv2D(**conv_prop_2, name=pref + 'Conv%d' % (j + 1)))
+                tmp.append(Conv2D(input_ch, [1, 1], strides=1,
+                                  activation=None, use_bias=False, name=pref + 'Conv4'))
+                self.conv_refine_motion.append(tmp)
 
     def call(self, input_features, training=None, mask=None):
         """ pass encoder-features pairwise
-        output: [Batch, 2, 3] for angles and translations, respectively,
-        - output[:, 0] is current->previous; output[:,1] for current->next
         """
-        last_features = input_features[-1]
-        out = self.convs_squeeze(last_features)
-        out = self.relu(out)
-        for i in range(3):
+        last_feature = input_features[-1]
+        squeezed_feature = self.convs_squeeze(last_feature)
+
+        backgrd_motion = self.decode_background_motion(squeezed_feature)
+        backgrd_motion *= self.pose_scale
+        angles = backgrd_motion[...,:, :, :3]
+        trans = backgrd_motion[..., :, :, 3:]
+        assert angles.shape[1] == trans.shape[1] == 1 and trans.shape[-1] == 3
+
+        # ---- Expeirments below -------
+
+        res_trans = None
+        if self.include_res_trans:
+            squeezed_feature = tf.keras.layers.AveragePooling2D()(squeezed_feature)
+            res_trans = self.conv_res_motion(squeezed_feature)
+
+            lite_mode_idx = [len(input_features)-1]
+            for i in range(len(input_features)-1, -1, -1):  # decoding, last one excluded
+                # t1 = time.perf_counter()
+                use_lite_mode = i in lite_mode_idx
+                # print('idx=%d uses lite_mode? ' % i, use_lite_mode)
+                res_trans = self._refine_motion_field(res_trans, input_features[i],
+                                                      idx=i, lite_mode=use_lite_mode)
+                # print(res_trans.shape, input_features[i].shape, "%.2fms" % ((time.perf_counter() - t1) * 1000))
+
+            res_trans *= self.pose_scale
+            if self.do_automasking:
+                res_trans = self.apply_automask_to_res_trans(res_trans)
+
+        return {"angles": angles, "translations": trans, "res_translations": res_trans}
+
+    def padded_conv(self, conv, inp, padding='CONSTANT'):
+        inp = tf.pad(inp, [[0, 0], [1, 1], [1, 1], [0, 0]], mode='CONSTANT')
+        return conv(inp)
+
+    def _refine_motion_field(self, motion_field, conv, idx, lite_mode=False):
+        """Refine residual motion map"""
+        # print('motion filed', motion_field.shape)
+        # print('conv', conv.shape)
+        upsamp_motion_field = tf.cast(tf.image.resize(motion_field, conv.shape[1:3]), dtype=tf.float32)
+        # print('upsamp_motion_field shape', upsamp_motion_field.shape)
+        conv_inp = tf.concat([upsamp_motion_field, conv], axis=3)
+        i = len(self.conv_refine_motion) - 1 - idx  # backwards index in list
+        if not lite_mode:
+            output_1 = self.padded_conv(self.conv_refine_motion[i][0], conv_inp)
+            conv_inp = self.padded_conv(self.conv_refine_motion[i][1], conv_inp)
+            output_2 = self.padded_conv(self.conv_refine_motion[i][2], conv_inp)
+            conv_inp = tf.concat([output_1, output_2], axis=-1)
+        else:
+            # use lite mode to save computation
+            conv_inp = self.padded_conv(self.conv_refine_motion[i][0],conv_inp)
+
+        output = self.conv_refine_motion[i][3](conv_inp)
+        # print('upsamp_motion_field shape', upsamp_motion_field.shape)
+        # print('output shape', conv_inp.shape)
+        output = upsamp_motion_field + output
+        return output
+
+    def apply_automask_to_res_trans(self, residual_trans):
+        """Masking out the residual translations by thresholding on their mean values."""
+        sq_residual_trans = tf.sqrt(
+            tf.reduce_sum(residual_trans ** 2, axis=3, keepdims=True))
+        mean_sq_residual_trans = tf.reduce_mean(
+            sq_residual_trans, axis=[0, 1, 2])
+        # A mask of shape [B, h, w, 1]
+        mask_residual_translation = tf.cast(
+            sq_residual_trans > mean_sq_residual_trans, residual_trans.dtype
+        )
+        residual_trans *= mask_residual_translation
+        return residual_trans
+
+    def decode_background_motion(self, squeezed_feature, num_scales=3):
+        out = self.relu(squeezed_feature)
+        for i in range(num_scales):
             if i != 2:
                 out = tf.pad(out, [[0, 0], [1, 1], [1, 1], [0, 0]], mode='CONSTANT')
             out = self.convs_pose[i](out)
             if i != 2:
                 out = self.relu(out)
+
         out = tf.reduce_mean(out, [1, 2], keepdims=True)
-        out = tf.reshape(out, [-1, self.num_frames_to_predict_for, 1, 6])
-        out = out * tf.cast(self.pose_scale, dtype=tf.float32)
 
-        # todo: angles=out[... 3:] ??
-        angles = out[..., :3]
-        translations = out[..., 3:]
-        intrinsics_mat = tf.constant(0)
-        if self.include_intrinsics:
-            intrinsics_mat = self.add_intrinsics_head(last_features)
-        return {"angles": angles, "translations": translations, "K": intrinsics_mat}
+        backgrd_motion = tf.reshape(out, [-1, self.pose_num, 1, 6])
+        return backgrd_motion
 
-    def add_intrinsics_head(self, bottleneck, image_height=192, image_width=640):
-        # todo: Image height and width - Original/Scaled?
-        """Adds a head the preficts camera intrinsics.
-        Args:
-          bottleneck: A tf.Tensor of shape [B, 1, 1, C]
-          image_height: A scalar tf.Tensor or an python scalar, the image height in pixels.
-          image_width: the image width
-
-        image_height and image_width are used to provide the right scale for the focal
-        length and the offest parameters.
-
-        Returns:
-          a tf.Tensor of shape [B, 3, 3], and type float32, where the 3x3 part is the
-          intrinsic matrix: (fx, 0, x0), (0, fy, y0), (0, 0, 1).
-        """
-        image_size = tf.constant([[image_width, image_height]], dtype=tf.float32)
-        focal_lens = self.conv_intrinsics[0](bottleneck)
-        focal_lens = tf.squeeze(focal_lens, axis=(1, 2)) * image_size
-
-        offsets = self.conv_intrinsics[1](bottleneck)
-        offsets = (tf.squeeze(offsets, axis=(1, 2)) + 0.5) * image_size
-
-        foc_inv = tf.linalg.diag(focal_lens)
-        intrinsic_mat = tf.concat([foc_inv, tf.expand_dims(offsets, -1)], axis=2)
-        last_row = tf.cast(tf.tile([[[0.0, 0.0, 1.0]]], [bottleneck.shape[0], 1, 1]), dtype=tf.float32)
-        intrinsic_mat = tf.concat([intrinsic_mat, last_row], axis=1)
-        return intrinsic_mat
+    # def add_intrinsics_head(self, bottleneck, image_height=192, image_width=640):
+    #     """Adds a head the preficts camera intrinsics.
+    #     Args:
+    #       bottleneck: A tf.Tensor of shape [B, 1, 1, C]
+    #       image_height: A scalar tf.Tensor or an python scalar, the image height in pixels.
+    #       image_width: the image width
+    #
+    #     image_height and image_width are used to provide the right scale for the focal
+    #     length and the offest parameters.
+    #
+    #     Returns:
+    #       a tf.Tensor of shape [B, 3, 3], and type float32, where the 3x3 part is the
+    #       intrinsic matrix: (fx, 0, x0), (0, fy, y0), (0, 0, 1).
+    #     """
+    #     image_size = tf.constant([[image_width, image_height]], dtype=tf.float32)
+    #     focal_lens = self.conv_intrinsics[0](bottleneck)
+    #     focal_lens = tf.squeeze(focal_lens, axis=(1, 2)) * image_size
+    #
+    #     offsets = self.conv_intrinsics[1](bottleneck)
+    #     offsets = (tf.squeeze(offsets, axis=(1, 2)) + 0.5) * image_size
+    #
+    #     foc_inv = tf.linalg.diag(focal_lens)
+    #     intrinsic_mat = tf.concat([foc_inv, tf.expand_dims(offsets, -1)], axis=2)
+    #     last_row = tf.cast(tf.tile([[[0.0, 0.0, 1.0]]], [bottleneck.shape[0], 1, 1]), dtype=tf.float32)
+    #     intrinsic_mat = tf.concat([intrinsic_mat, last_row], axis=1)
+    #     return intrinsic_mat
 
 
-def build_posenet():
-    num_ch_enc = [64, 64, 128, 256, 512]
-    shapes = [(1, 64, 96, 320), (1, 48, 160, 64), (1, 24, 80, 128), (1, 12, 40, 256), (1, 6, 20, 512)]
-    dummy_inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
-    pose_decoder = PoseDecoder(num_ch_enc, num_input_features=1, num_frames_to_predict_for=1, stride=1)
-    outputs = pose_decoder.predict(dummy_inputs)
-    return pose_decoder, dummy_inputs, outputs
-
-
-def combine_pose_params(pred_pose_raw, curr2prev=False, curr2next=False):
-    """Combine pose angles and translations, from raw dictionary"""
-
-    if curr2prev and curr2next:
-        raise NotImplementedError
-    if not curr2prev and not curr2next:
-        print("concat poses for both frames")
-        return tf.concat([pred_pose_raw['angles'], pred_pose_raw['translations']], axis=3)
+def build_posenet(pose_dec, new_version=True):
+    # num_ch_enc = [64, 64, 128, 256, 512]
+    if new_version:
+        shapes = [(2,192,640,4), (2, 64, 96, 320), (2, 48, 160, 64), (2, 24, 80, 128), (2, 12, 40, 256), (2, 6, 20, 512)]
     else:
-        print("concat poses for one frame")
-        seq_choice = 0 if curr2prev else 1
-        return tf.concat([pred_pose_raw['angles'][:, seq_choice],
-                          pred_pose_raw['translations'][:, seq_choice]], axis=2)
+        shapes = [(2, 64, 96, 320), (2, 48, 160, 64), (2, 24, 80, 128), (2, 12, 40, 256),
+                  (2, 6, 20, 512)]
+    dummy_inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
+    # pose_dec = PoseDecoder(num_ch_enc, num_input_features=1, num_frames_to_predict_for=1, stride=1)
+    outputs = pose_dec(dummy_inputs)
+    return pose_dec, dummy_inputs, outputs
+
+
+def exp_res_trans():
+    pose_dec = PoseDecoder_exp(pose_num=1, has_depth=True)
+    pose_dec, dum_inp, outputs = build_posenet(pose_dec)
+    pose_dec1 = PoseDecoder(num_frames_to_predict_for=1)
+    pose_dec1, dum_inp1, outputs1 = build_posenet(pose_dec1, new_version=False)
+
+    # pose_dec.summary()
+    t0 = time.perf_counter()
+    for i in range(100):
+        t1 = time.perf_counter()
+        pose_dec(dum_inp)
+        print("{:.3f}".format(time.perf_counter()-t1))
+    print("average:", (time.perf_counter() - t0)/100)
+
+    t0 = time.perf_counter()
+    for i in range(100):
+        t1 = time.perf_counter()
+        pose_dec1(dum_inp1)
+        print("{:.3f}".format(time.perf_counter()-t1))
+    print("average:", (time.perf_counter() - t0)/100)
+
+    for k,v in outputs.items():
+        print(k, v.shape)
+
 
 if __name__ == '__main__':
     # pose_decoder, dummy_inputs, outputs = build_posenet()
     # for k,v in outputs.items():
     #     print(k,"\t", v.shape)
-    res = {}
-    res["angles"] = tf.random.uniform(shape=(1,2,1,3))
-    res["translations"] = tf.random.uniform(shape=(1,2,1,3))
-    out_ctp = combine_pose_params(res, curr2prev=True)
-    out_ctn = combine_pose_params(res, curr2next=True)
-    a = tf.concat([out_ctn, out_ctn], axis=1)
-    print(a.shape)
+    # print(a.shape)
+    exp_res_trans()
+
+
 
 
 # -------- Archived below ---------
