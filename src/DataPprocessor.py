@@ -8,7 +8,8 @@ from utils import hom_intrinsics_helper, assert_valid_hom_intrinsics
 
 
 class DataProcessor(object):
-    def __init__(self, frame_idx, intrinsics=None, num_scales=4):
+    def __init__(self, frame_idx, intrinsics=None, num_scales=4, disable_gt=True):
+        self.disable_gt = disable_gt
         self.num_scales = num_scales     # for evaluation, 1
         self.height = 192
         self.width = 640
@@ -18,6 +19,12 @@ class DataProcessor(object):
         self.brightness = 0.2
         self.sature_contrast = 0.2
         self.hue = 0.05
+
+    def get_intrinsics(self, K):
+        self.K = K
+
+    def disable_groundtruth(self):
+        self.disable_gt = True
 
     @tf.function
     def prepare_batch(self, batch, is_train):
@@ -55,7 +62,8 @@ class DataProcessor(object):
         inputs = {}
         if type(batch) == tuple:
             batch_imgs = batch[0]
-            inputs[('depth_gt', 0)] = tf.expand_dims(batch[1], 3)
+            if not self.disable_gt:
+                inputs[('depth_gt', 0)] = tf.expand_dims(batch[1], 3)
         else:
             batch_imgs = batch
         tgt_batch, src_batch = batch_imgs[..., :3], batch_imgs[..., 3:]
@@ -68,9 +76,9 @@ class DataProcessor(object):
             for i, f_i in enumerate(self.frame_idx[1:]):
                 inputs[('color', f_i, -1)] = src_batch[..., i*3: (i+1)*3]
 
-        inputs, input_Ks = self.preprocess(inputs, do_color_aug)
+        inputs = self.preprocess(inputs, do_color_aug)
         self.delete_raw_images(inputs)
-        return inputs, input_Ks
+        return inputs
 
     def generate_aug_params(self):
         brightness = np.random.uniform(0, self.brightness)
@@ -115,13 +123,11 @@ class DataProcessor(object):
                     inputs[(img_type + '_aug', f_i, scale)] = self.color_aug(resized_image, aug_params)
 
             if self.K is not None:
-                # K = tf.expand_dims(self.K, axis=0)
-                # inputs.update(self.make_K_pyramid(tf.identity(K)))
-                input_Ks = self.make_K_pyramid(tf.expand_dims(self.K, axis=0))
+                inputs.update(self.make_K_pyramid(tf.expand_dims(self.K, axis=0)))
 
-        return inputs, input_Ks
+        return inputs
 
-    def make_K_pyramid(self, orig_K):
+    def make_K_pyramid(self, K, scaling:tuple=None):
         """genearing intrinsics pyramid
         Args:
             K: partial intrinsics, shape best to be [B,3,3], but [B,4,4], [4,4] or [B,4,4] are also OK
@@ -129,25 +135,25 @@ class DataProcessor(object):
             input_Ks: dict
                 a pyramid of homogenous intrinsics and its inverse, each has shape [B,4,4]
         """
+        # print('K0 raw:', K)
         input_Ks = {}
-        print("orig K", orig_K)
+        if scaling is None:
+            scaling = (self.width, self.height)
         for scale in range(self.num_scales):
             # For KITTI. Must *normalize* when using on different scale
-            K = tf.identity(orig_K)
-            K0 = K[:, :1, :] * self.width // (2 ** scale)
-            K1 = K[:, 1:2, :] * self.height // (2 ** scale)
-            hom_K = hom_intrinsics_helper(tf.concat([K0, K1], axis=1), batch_num=self.batch_size)
+            Ks = [None] * 2
+            for i in range(2):
+                Ks[i] = K[:, i:i+1, :] * scaling[i] // (2**scale)
+            hom_K = hom_intrinsics_helper(tf.concat(Ks, axis=1), batch_num=self.batch_size)
             hom_K_inv = tf.linalg.pinv(hom_K)
             # assert_valid_hom_intrinsics(hom_K)
 
             input_Ks[("K", scale)] = hom_K
             input_Ks[("inv_K", scale)] = hom_K_inv
-
-        # print(input_Ks[("K", 0)])
+        # print("K scaled: ", input_Ks[('K', 0)], '\n')
         assert_valid_hom_intrinsics(input_Ks[("K", 0)])
         return input_Ks
 
     def delete_raw_images(self, inputs, scale_to_del=-1):
         for idx in self.frame_idx:
             del inputs[('color', self.frame_idx[idx], scale_to_del)]
-
