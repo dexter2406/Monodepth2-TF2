@@ -19,7 +19,7 @@ class DataProcessor(object):
         self.sature_contrast = 0.2
         self.hue = 0.05
 
-    # @tf.function
+    @tf.function
     def prepare_batch(self, batch, is_train):
         """Apply augmentation
         tgt_batch: ndarray
@@ -68,9 +68,9 @@ class DataProcessor(object):
             for i, f_i in enumerate(self.frame_idx[1:]):
                 inputs[('color', f_i, -1)] = src_batch[..., i*3: (i+1)*3]
 
-        inputs = self.preprocess(inputs, do_color_aug)
+        inputs, input_Ks = self.preprocess(inputs, do_color_aug)
         self.delete_raw_images(inputs)
-        return inputs
+        return inputs, input_Ks
 
     def generate_aug_params(self):
         brightness = np.random.uniform(0, self.brightness)
@@ -115,11 +115,13 @@ class DataProcessor(object):
                     inputs[(img_type + '_aug', f_i, scale)] = self.color_aug(resized_image, aug_params)
 
             if self.K is not None:
-                inputs.update(self.make_K_pyramid(tf.expand_dims(self.K, axis=0)))
+                # K = tf.expand_dims(self.K, axis=0)
+                # inputs.update(self.make_K_pyramid(tf.identity(K)))
+                input_Ks = self.make_K_pyramid(tf.expand_dims(self.K, axis=0))
 
-        return inputs
+        return inputs, input_Ks
 
-    def make_K_pyramid(self, K):
+    def make_K_pyramid(self, orig_K):
         """genearing intrinsics pyramid
         Args:
             K: partial intrinsics, shape best to be [B,3,3], but [B,4,4], [4,4] or [B,4,4] are also OK
@@ -128,8 +130,10 @@ class DataProcessor(object):
                 a pyramid of homogenous intrinsics and its inverse, each has shape [B,4,4]
         """
         input_Ks = {}
+        print("orig K", orig_K)
         for scale in range(self.num_scales):
             # For KITTI. Must *normalize* when using on different scale
+            K = tf.identity(orig_K)
             K0 = K[:, :1, :] * self.width // (2 ** scale)
             K1 = K[:, 1:2, :] * self.height // (2 ** scale)
             hom_K = hom_intrinsics_helper(tf.concat([K0, K1], axis=1), batch_num=self.batch_size)
@@ -139,6 +143,7 @@ class DataProcessor(object):
             input_Ks[("K", scale)] = hom_K
             input_Ks[("inv_K", scale)] = hom_K_inv
 
+        # print(input_Ks[("K", 0)])
         assert_valid_hom_intrinsics(input_Ks[("K", 0)])
         return input_Ks
 
