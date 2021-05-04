@@ -8,32 +8,35 @@ current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
 all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_dec']
 
 # Experimental
-flags.DEFINE_boolean('learn_intrinsics',False, 'learn intrinsics matrix')
-flags.DEFINE_bool('do_automasking',     False, 'apply auto masking')
+flags.DEFINE_boolean('learn_intrinsics',True, 'learn intrinsics matrix')
+flags.DEFINE_bool('do_automasking',     True, 'apply auto masking')
 flags.DEFINE_bool('train_depth',        False, 'whether to train depth decoder-encoder')
 flags.DEFINE_bool('train_pose',         False, 'whether to train pose decoder-encoder')
 flags.DEFINE_boolean('exp_mode',        True, 'experiment mode')
-flags.DEFINE_boolean('concat_depth_pred',       True, 'concat depth_pred to rgb images for pose net input')
+flags.DEFINE_boolean('concat_depth',    True, 'concat depth_pred to rgb images for pose net input')
 flags.DEFINE_boolean('use_cycle_consistency',   True, 'add depth_consistency to handle occlusion between two frames')
-flags.DEFINE_string('padding_mode',     'border', 'padding mode for bilinear sampler')
-flags.DEFINE_boolean('mask_border',     False,  'mask out the region padded by bilinear sampler '
-                                                'when computing losses (only for zero-padding)')
-flags.DEFINE_boolean('add_pose_loss',   True, 'add pose loss to training')
-flags.DEFINE_boolean('calc_reverse_transform',  True, 'calculate transformation in reversed temp order, this'
-                                                      'must be true when `add_pose_loss` is activated')
+flags.DEFINE_string('padding_mode',     'zeros', 'padding mode for bilinear sampler')
+flags.DEFINE_boolean('mask_border',     True,  'mask out the region padded by bilinear sampler '
+                                               'when computing losses (only for zero-padding)')
+flags.DEFINE_boolean('add_pose_loss',   False, 'add pose loss to training')
+flags.DEFINE_boolean('include_revers',  True, 'calculate transformation in reversed temp order, this'
+                                              'must be true when `add_pose_loss` is activated')
 flags.DEFINE_boolean('use_res_trans_loss',      False, 'residual translation error')
 # NIU: additional depth doesn't seem to help to improve
-flags.DEFINE_boolean('use_RGBD', False, 'use RGB-D instead RGB in reprojection error calculation')
-flags.DEFINE_boolean('use_minimal_projection_loss', False, 'use minimal projection loss, not suitable for intrinsics training')
-
+flags.DEFINE_boolean('use_RGBD',        False, 'use RGB-D instead RGB in reprojection error calculation')
+flags.DEFINE_boolean('use_min_proj',    False, 'use minimal projection loss, not suitable for intrinsics training')
+flags.DEFINE_boolean('disable_gt',      True, 'disable ground-truth depth')
+flags.DEFINE_boolean('add_mask_loss',   True, 'regularize mask from shrinking to zero')
 # todo: Hyper-parameters
 flags.DEFINE_integer('batch_size', 4, 'batch size')
 flags.DEFINE_float('smoothness_ratio', 1e-3, 'ratio to calculate smoothness loss')
 flags.DEFINE_float('ssim_ratio', 0.85, 'ratio to calculate SSIM loss')
 flags.DEFINE_float('reproj_loss_weight', 1., 'reprojection loss weight')
-flags.DEFINE_float('cycle_loss_weight', 1e-1, 'weight for cycle-consistency loss')
-flags.DEFINE_float('pose_loss_weight', 1e-1, 'weight for pose_loss')
+flags.DEFINE_float('cycle_loss_weight', 1., 'weight for cycle-consistency loss')
+flags.DEFINE_float('pose_loss_weight', 1e-2, 'weight for pose_loss')
 flags.DEFINE_float('learning_rate', 1e-4, 'initial learning rate')
+flags.DEFINE_float('mask_loss_w', 5., 'weight for sampler_mask to prevent from shrinking to 0')
+flags.DEFINE_float('mask_cover_min', 0.85, 'when using zero-padding, zero-region is usually below certain level')
 
 # Pre-settings
 flags.DEFINE_integer('pose_num', 1, 'number of poses produced by pose decoder')
@@ -86,7 +89,7 @@ FLAGS = flags.FLAGS
 
 flags.mark_flag_as_required('run_mode')
 flags.mark_flag_as_required('exp_mode')
-flags.mark_flag_as_required('use_minimal_projection_loss')
+flags.mark_flag_as_required('use_min_proj')
 
 def get_options():
     return FLAGS
