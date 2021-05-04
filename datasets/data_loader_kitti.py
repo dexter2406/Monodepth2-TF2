@@ -30,7 +30,8 @@ class DataLoader(object):
         self.has_depth = self.has_depth_file()
 
     def read_filenames(self):
-        split_path = os.path.join(self.dataset.split_folder, self.dataset.split_name)   # e.g. splits\\eigen_zhou\\train.txt
+        # e.g. splits\\eigen_zhou\\train.txt
+        split_path = os.path.join(self.dataset.split_folder, self.dataset.split_name)
         self.filenames = readlines(split_path)
         self.num_items = len(self.filenames)
         self.steps_per_epoch = self.num_items // self.batch_size
@@ -72,7 +73,7 @@ class DataLoader(object):
         dataset = dataset.batch(self.batch_size, drop_remainder=drop_last)
 
         dataset = dataset.repeat(num_repeat)
-        dataset = dataset.prefetch(1)
+        dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
         data_iter = iter(dataset)
         return data_iter
 
@@ -107,7 +108,7 @@ class DataLoader(object):
                 raise NotImplementedError
             image_path = os.path.join(file_root, image_name)
             if f_i == 0:
-                tgt_path = image_path
+                tgt_path = image_path.replace('\\', '/')
             # Get images
             image_string = tf.io.read_file(image_path)
             image = tf.image.decode_jpeg(image_string)
@@ -138,7 +139,9 @@ class DataLoader(object):
             folder, file_idx, side = line.split()
             folder = folder.replace('/', '\\')
             path = self.dataset.get_image_path(folder, int(file_idx), side)
-            path = '/' + os.path.join(*(path.replace('/', '\\').split('\\')))
+            path = os.path.join(*(path.replace('/', '\\').split('\\')))
+            if self.data_path.startswith('/'):
+                path = '/' + path
             file_path_all[i] = path
         if not os.path.isfile(file_path_all[0]):
             raise ValueError("file path wrong, e.g. {} doesn't exit".format(file_path_all[0]))
@@ -154,10 +157,12 @@ class DataLoader(object):
             velo_filename = os.path.join(
                 self.data_path,
                 folder,
-                "velodyne_points\\data\\{:010d}.bin".format(int(file_idx)),
+                os.path.join('velodyne_points', 'data', '{:010d}.bin'.format(int(file_idx))),
                 side
             )
-            velo_filename = '/' + os.path.join(*(velo_filename.replace('/', '\\').split('\\')))
+            velo_filename = os.path.join(*(velo_filename.replace('/', '\\').split('\\')))
+            if self.data_path.startswith('/'):
+                velo_filename = '/' + velo_filename
             file_path_all[i] = velo_filename
         return file_path_all
 
@@ -166,11 +171,11 @@ class DataLoader(object):
         E.g. F:\\Dataset\\kitti_raw\\2011_10_03\\2011_10_03_drive_0034_sync\\image_02\\data\0000003025.jpg
         ->  F:\\Dataset\\kitti_raw\\2011_10_03\\2011_10_03_drive_0034_sync\\velodyne_points\\data\\0000003025.bin
         """
-        img_str_split = img_str.split('\\')
+        img_str_split = img_str.split('/')
         file_idx = img_str_split[-1].split('.')[0]
         folder_path = os.path.join(*img_str_split[-5:-3])  # 2011_10_03\2011_10_03_drive_0034_sync
         side = self.dataset.side_map[img_str_split[-3][-1]]
-        file_path = "velodyne_points\\data\\{:010d}.bin".format(int(file_idx))
+        file_path = os.path.join('velodyne_points', 'data', '{:010d}.bin'.format(int(file_idx)))
         depth_full_path = os.path.join(self.data_path, folder_path, file_path)
         calib_path = os.path.join(self.data_path, img_str_split[-5])
         return calib_path, depth_full_path, side
@@ -178,13 +183,16 @@ class DataLoader(object):
     def has_depth_file(self):
         line = self.filenames[0].split()
         scene_name = line[0].replace('/', '\\')
-        frame_index = int(line[1])
+        file_idx = int(line[1])
 
         velo_filename = os.path.join(
             self.data_path,
             scene_name,
-            "velodyne_points\\data\\{:010d}.bin".format(int(frame_index)))
-        velo_filename = '/' + os.path.join(*(velo_filename.replace('/', '\\').split('\\')))
+            os.path.join('velodyne_points', 'data', '{:010d}.bin'.format(int(file_idx)))
+        )
+        velo_filename = os.path.join(*(velo_filename.replace('/', '\\').split('\\')))
+        if self.data_path.startswith('/'):
+            velo_filename = '/' + velo_filename
         return os.path.isfile(velo_filename)
 
     def print_info(self):
