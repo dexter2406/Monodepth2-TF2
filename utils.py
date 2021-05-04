@@ -276,8 +276,7 @@ def check_options(FLAGS):
                 print('\ttraining from scratch, NO WEIGHTS LOADED even if --models_to_load specifies them.')
             else:
                 if len(not_loaded) != 0:
-                    raise ValueError('if not from scratch, please use default setting for '
-                                     '--models_to_load to load all models')
+                    print('not loaded:', not_loaded)
                 else:
                     print("\twill be loaded %s, %s will be randomly initialized" % (FLAGS.models_to_load, not_loaded))
 
