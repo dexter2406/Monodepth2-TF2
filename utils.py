@@ -217,7 +217,7 @@ def del_files(root_dir):
 
 
 def check_options(FLAGS):
-    all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_dec']
+    all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_dec', 'intrinsics_head']
 
     print("-> Check options...")
     for m in FLAGS.models_to_load:
@@ -225,9 +225,12 @@ def check_options(FLAGS):
             raise ValueError("\t'%s' is not supported model, choose from: " % m, all_models)
     print('\t Using dataset:', FLAGS.split)
 
+    if not FLAGS.learn_intrinsics:
+        FLAGS.use_min_proj = False
+
     if FLAGS.add_pose_loss:
         print('calc_reverse_transform automatically set `True`, because `add_pose_loss` requires it')
-        FLAGS.calc_reverse_transform = True
+        FLAGS.include_revers = True
 
     if (FLAGS.padding_mode == 'zeros' and not FLAGS.mask_border) or \
         (FLAGS.padding_mode == 'border' and FLAGS.mask_border):
@@ -243,6 +246,10 @@ def check_options(FLAGS):
         print("\tTURN ON @tf.function for grad() and DataProcessor!")
         save_dir = FLAGS.save_model_path
         if FLAGS.save_model_path == '':
+            if FLAGS.save_root != '':
+                rootdir = FLAGS.save_root
+            else:
+                rootdir = os.path.dirname(__file__)
             save_dir = os.path.join(rootdir, 'logs/weights')
             print('\tno save_model_path specified, use %s instead' % FLAGS.save_model_path)
 
