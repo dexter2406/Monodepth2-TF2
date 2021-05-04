@@ -55,6 +55,7 @@ class Trainer:
         self.back_project_dict = {}
         self.project_3d_dict = {}
 
+        view_options(self.opt)
         self.init_app()
 
     def init_app(self):
@@ -137,6 +138,8 @@ class Trainer:
                 weights_name = m_name + '_concat'
             elif m_name == 'pose_dec' and self.opt.pose_num == 1:
                 weights_name = m_name + '_one_out'
+            if 'intrinsics_head' == m_name:
+                weights_name = m_name
             return weights_name
 
         if self.opt.from_scratch:
@@ -741,16 +744,21 @@ class Trainer:
 
     def start_validating(self, global_step, num_run=30):
         """run mini-set to see if should store current-best weights"""
-        losses_all = defaultdict(list)
+        # losses_all = defaultdict(list)
+        losses_all = {}
         for i in range(num_run):
             batch = self.mini_val_iter.get_next()
             inputs = self.batch_processor.prepare_batch(batch, is_train=False)
             outputs, losses = self.compute_batch_losses(inputs)
+
             # if ('depth_gt', 0) in inputs.keys():
             if not self.opt.disable_gt:
                 losses.update(
-                    self.compute_depth_losses(inputs, outputs))
+                    self.compute_depth_losses(inputs, outputs)
+                )
             for metric, loss in losses.items():
+                if metric not in losses_all.keys():
+                    losses_all[metric] = []
                 losses_all[metric].append(loss)
 
         # mean of mini val-set
@@ -922,7 +930,7 @@ class Trainer:
             if early_phase or late_phase or special_pass:
                 is_time = True
         elif event == events[1]:
-            special_pass = global_step == 5
+            special_pass = False
             is_time = global_step % (self.train_loader.steps_per_epoch // self.opt.val_num_per_epoch) == 0
             is_time = is_time or special_pass
 
