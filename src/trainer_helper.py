@@ -4,6 +4,28 @@ import matplotlib
 import matplotlib.pyplot as plt
 
 
+def view_options(opt):
+    print('----- Viewing Options -----')
+    print('exp_mode     ', opt.exp_mode)
+    print('train_pose   ', opt.train_pose)
+    print('train_depth  ', opt.train_depth)
+    print('add_pose_lose', opt.add_pose_loss)
+    print('padding_mode ', opt.padding_mode)
+    print('learn K      ', opt.learn_intrinsics)
+    print('mask_border, padding_mode:', opt.mask_border, opt.padding_mode)
+    print('automasking  ', opt.do_automasking)
+    print('use_cycle_ls ', opt.use_cycle_consistency)
+    print('cycle weight ', opt.cycle_loss_weight)
+    print('poss weight, calc_reverse_transform:', opt.pose_loss_weight, opt.calc_reverse_transform)
+    print('smoothness w ', opt.smoothness_ratio)
+    print('reproj w     ', opt.reproj_loss_weight)
+    print('use_RGBD     ', opt.use_RGBD)
+    print('use MinProj  ', opt.use_minimal_projection_loss)
+    print('concat_depth ', opt.concat_depth_pred)
+    print('out_pose_num ', opt.pose_num)
+    print('lr           ', opt.learning_rate)
+
+
 def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
     """save model when val loss hits new low"""
     # just update val_loss_min for the first time, do not save model
@@ -73,6 +95,9 @@ def build_models(models_dict, check_outputs=False, show_summary=False, rgb_cat_d
         elif "pose_dec" in k:
             shapes = [(2, 96, 320, 64), (2, 48, 160, 64), (2, 24, 80, 128), (2, 12, 40, 256), (2, 6, 20, 512)]
             inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
+            outputs = m(inputs)
+        elif"intrinsics_head" in k:
+            inputs = tf.random.uniform([2, 6, 20, 512])
             outputs = m(inputs)
         else:
             print('skipping %s'%k)
@@ -608,6 +633,7 @@ def get_multi_scale_intrinsics(intrinsics, num_scales):
     intrinsics_mscale = tf.stack(intrinsics_mscale, axis=1)
     return intrinsics_mscale
 
+
 def make_intrinsics_matrix(fx, fy, cx, cy):
     # Assumes batch input
     batch_size = fx.shape[0]
@@ -658,6 +684,5 @@ def show_images(batch_size, input_imgs, outputs, nrow=3, ncol=2):
 if __name__ == '__main__':
     import numpy as np
     intrinsics = np.random.rand(4,4).astype(np.float32)
-
     intrinsics_multiscale = get_multi_scale_intrinsics(intrinsics, 10)
     print(intrinsics_multiscale.shape)
