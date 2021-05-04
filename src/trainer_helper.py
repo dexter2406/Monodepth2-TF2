@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 def view_options(opt):
     print('----- Viewing Options -----')
     print('exp_mode     ', opt.exp_mode)
+    print('min coverage ', opt.mask_cover_min)
     print('train_pose   ', opt.train_pose)
     print('train_depth  ', opt.train_depth)
     print('add_pose_lose', opt.add_pose_loss)
@@ -16,17 +17,17 @@ def view_options(opt):
     print('automasking  ', opt.do_automasking)
     print('use_cycle_ls ', opt.use_cycle_consistency)
     print('cycle weight ', opt.cycle_loss_weight)
-    print('poss weight, calc_reverse_transform:', opt.pose_loss_weight, opt.calc_reverse_transform)
+    print('poss weight, calc_reverse_transform:', opt.pose_loss_weight, opt.include_revers)
     print('smoothness w ', opt.smoothness_ratio)
     print('reproj w     ', opt.reproj_loss_weight)
     print('use_RGBD     ', opt.use_RGBD)
-    print('use MinProj  ', opt.use_minimal_projection_loss)
-    print('concat_depth ', opt.concat_depth_pred)
+    print('use MinProj  ', opt.use_min_proj)
+    print('concat_depth ', opt.concat_depth)
     print('out_pose_num ', opt.pose_num)
     print('lr           ', opt.learning_rate)
 
 
-def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
+def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh, disable_gt=False):
     """save model when val loss hits new low"""
     # just update val_loss_min for the first time, do not save model
     if val_losses_min['loss/total'] == 10:
@@ -46,7 +47,7 @@ def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
         else:
             skip = False
             # If has depth_gt, do some additional checks
-            if len(min_errors_thresh) != 0:
+            if len(min_errors_thresh) != 0 and not disable_gt:
                 num_pass = 0
                 for metric in min_errors_thresh:
                     if metric == 'da/a1':
