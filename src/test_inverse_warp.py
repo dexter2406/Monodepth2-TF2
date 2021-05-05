@@ -268,6 +268,7 @@ class TransformationMap(object):
         self._pixel_y = pixel_y
         self._depth = depth
         self._mask = mask
+        self.batch_size = depth.shape[0]
         attrs = sorted(self.__dict__.keys())
         # Unlike equality, compatibility is not transitive, so we have to check all
         # pairs.
@@ -297,7 +298,9 @@ class TransformationMap(object):
 
     @property
     def mask(self):
-        return self._mask
+        mask = tf.expand_dims(tf.cast(self._mask, tf.float32), axis=3)
+        # mask = tf.concat([mask]*self.batch_size, axis=-1)
+        return mask
 
     @property
     def pixel_xy(self):
