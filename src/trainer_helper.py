@@ -10,10 +10,6 @@ def view_options(opt):
     print('min coverage     ', opt.mask_cover_min)
     print('train_pose       ', opt.train_pose)
     print('train_depth      ', opt.train_depth)
-    print('add_pose_loss    ', opt.add_pose_loss)
-    print('padding_mode     ', opt.padding_mode)
-    print('learn K          ', opt.learn_intrinsics)
-    print('use_RGBD         ', opt.use_RGBD)
     print('use MinProj      ', opt.use_min_proj)
     print('concat_depth     ', opt.concat_depth)
     print('out_pose_num     ', opt.pose_num)
@@ -21,8 +17,8 @@ def view_options(opt):
     print('use_res_trans    ', opt.use_res_trans_loss)
     print('mask_border, padding_mode:', opt.mask_border, opt.padding_mode)
     print('automasking      ', opt.do_automasking)
-    print('cycle Wt, use_cycle_ls   ', opt.cycle_loss_weight, opt.use_cycle_consistency)
-    print('poss Wt, add_pose_loss   ', opt.pose_loss_weight, opt.add_pose_loss)
+    print('image_cyc_w, depth_cyc_w, used?', opt.image_cycle_loss_w, opt.depth_cycle_loss_w, opt.depth_cycle_loss_w, opt.use_cycle_consistency)
+    print('poss Wt, add rot_loss, trans_loss', opt.pose_loss_weight, opt.add_rot_loss, opt.add_trans_loss)
     print('include reverse  ', opt.include_revers)
     print('mask_ls Wt, min_area, add', opt.mask_loss_w, opt.mask_cover_min, opt.add_mask_loss)
     print('smoothness Wt    ', opt.smoothness_ratio)
@@ -57,7 +53,7 @@ def transformation_from_parameters(axisangle, translation, invert=False):
     return M
 
 
-def motion_consistency_loss(axisangles, translations, invert=False, calc_reverse=False, include_res_trans_loss=False):
+def motion_consistency_loss(axisangles, translations, invert=False):
     # todo: add this loss to train Pose Decoder
     """Calculate Difference between two frames
     For poses of frame 1->2 and 2->1,
@@ -75,14 +71,10 @@ def motion_consistency_loss(axisangles, translations, invert=False, calc_reverse
     """
     # in case pose_loss is disabled, we only need M_1
     M_12 = transformation_from_parameters(axisangles[0][:, 0], translations[0][:, 0], invert)
-    M_21 = None
-    if not calc_reverse:
-        return None, M_12, M_21
-
     M_21 = transformation_from_parameters(axisangles[1][:, 0], translations[1][:, 0], not invert)
 
     # calculate pose loss (actually it's consistency loss.. in struct2depth)
-    pose_loss, _ = pose_losses_from_M(M_12, M_21, include_res_trans_loss)
+    pose_loss, trans_loss = Motion_losses_from_M(M_12, M_21, include_res_trans_loss)
 
     # average the error along batch dim, then sum
     # pose_loss = tf.reduce_sum(tf.reduce_mean(
@@ -91,14 +83,14 @@ def motion_consistency_loss(axisangles, translations, invert=False, calc_reverse
 
     # average as the final estimate
     # M_mean = (M_1 + M_2) * 0.5
-    return pose_loss, M_12, M_21
+    return pose_loss, trans_loss
 
 
 def consistency_losses(R_12, R_21, T_12, T_21, res_trans=None, include_trans_loss=False):
     """calculate pose losses
     Total transformation between two frames should be reverse to each other for pure egomtion
     But if there's moving objects, this fails. But not entirely:
-    
+
     -> Rotation: Tensor, [B,4,4] or [B,3,3]
     the objects' doesn't rotate significantly, so it's reasonable to constraint.
     reversed rotations.
@@ -371,8 +363,7 @@ class BackProjDepth:
         return cam_points
 
 
-
-def pose_losses_from_M(M_12, M_21, include_trans_loss=False):
+def Motion_losses_from_M(M_12, M_21):
     """calculate pose losses
     Total transformation between two frames should be reverse to each other for pure egomtion
     But if there's moving objects, this fails. But not entirely:
@@ -385,6 +376,10 @@ def pose_losses_from_M(M_12, M_21, include_trans_loss=False):
     [ R2,  t2 ]    [ R1,  t1 ]     [ R2R1,  R2t1 + t2 ]
     [         ]  . [         ]  =  [                  ]
     [ 000, 1  ]    [ 000,  1 ]     [ 000,       1     ]
+
+    Returns:
+        rot_consis_loss: rotation consistency loss, calculate by rotation matrix
+        rot_consis_loss: calculated by egomotion vector or (if avaliable) motion filed matrix
     """
     def norm(x):
         return tf.reduce_sum(tf.square(x), axis=-1)
@@ -392,8 +387,8 @@ def pose_losses_from_M(M_12, M_21, include_trans_loss=False):
     R_12, R_21 = M_12[:, :3, :3], M_21[:, :3, :3]
     T_12, T_21 = M_12[:, :3, -1], M_21[:, :3, -1]
     R_unit = tf.matmul(R_21, R_12)    # R2R1, shape (B,3,3)
-    R2T1 = tf.matmul(R_21, tf.expand_dims(T_12, axis=-1))      # (B,3,1)
-    T_zero = R2T1 + tf.expand_dims(T_21,axis=-1)             # (B,3,1)
+    R2T1 = tf.matmul(R_21, tf.expand_dims(T_12, axis=-1))   # (B,3,1)
+    T_zero = R2T1 + tf.expand_dims(T_21, axis=-1)           # (B,3,1)
 
     eye = tf.eye(3, batch_shape=R_12.shape[:1])
     rot_error = R_unit - eye
@@ -403,11 +398,13 @@ def pose_losses_from_M(M_12, M_21, include_trans_loss=False):
     rot_consis_loss = tf.reduce_mean(
         rot_error / (1e-24 + rot_scale_1 + rot_scale_2)
     )
-    trans_consis_loss = None
 
     # todo: translation loss with "residual_reanslation" map
-    if include_trans_loss:
-        pass
+    if T_zero.shape.ndims != 4:
+        # egomotion vector
+        trans_consis_loss = tf.reduce_mean(T_zero)
+    else:
+        raise NotImplementedError('translation loss with motion field matrix not yet implemented')
     return rot_consis_loss, trans_consis_loss
 
 
@@ -612,6 +609,17 @@ def rot_from_axisangle(vec):
 """ -------------- Not In Use ---------------"""
 
 
+def get_sampler_mask(data_resamp):
+    """use the first channel to 2-D produce mask
+    But before using it, it needs to be replicated to the correct channel.
+    Args:
+        data_resamp: Tensor, shape (B,H,W,C)
+    Returns:
+        sampler_mask: Tensor, shape (B,H,W, 1)
+    """
+    sampler_mask = tf.expand_dims(tf.cast(data_resamp[..., 0] * 255 > 1., tf.float32), axis=3)  # B,H,W
+    return sampler_mask
+
 
 def project_3d(points, K, T, shape, scale):
     """Layer which projects 3D points into a camera with intrinsics K and at position T
@@ -705,39 +713,35 @@ def make_intrinsics_matrix(fx, fy, cx, cy):
     return intrinsics
 
 
-def show_images(batch_size, input_imgs, outputs, nrow=3, ncol=2):
-    for i in range(batch_size):
+def show_images(inputs, outputs, frame_idx=(0,-1,1)):
+    src_data = inputs[('color', 0, 0)].numpy()[0]
+    warped_n = outputs[('warped_multi_s', 1, 0)][0].numpy()[0]
+    warped_p = outputs[('warped_multi_s', -1, 0)][0].numpy()[0]
+    samp_mask_n = outputs[('sampler_mask', 1, 0)][0][..., 0:1]
+    samp_mask_p = outputs[('sampler_mask', -1, 0)][0][..., 0:1]
+    # ---
+    disp_orig = outputs[('disp', frame_idx[0], 0)][0]
+    # disp_resamp1 = tf.expand_dims(outputs[('rgbd', self.opt.frame_idx[1], 0)][0, ..., -1], 2)
+    # disp_resamp2 = tf.expand_dims(outputs[('rgbd', self.opt.frame_idx[2], 0)][0, ..., -1], 2)
+    # ---
+    # mask1 = tf.cast(outputs[('occlu_aware_mask', -1, 0)], dtype=tf.float32)[0]
+    # mask2 = tf.cast(outputs[('occlu_aware_mask', 1, 0)], dtype=tf.float32)[0]
+    # print('mask perc', tf.reduce_mean(sampler_mask))
+    inps = [
+        warped_n,
+        samp_mask_n,
+        # inputs[('color', -1, 0)][0],
+        src_data,
+        samp_mask_p,
+        # inputs[('color', 1, 0)][0]
+    ]
+    num_inps = len(inps)
+    fig = plt.figure(figsize=(num_inps, 1))
+    for i in range(num_inps):
         print(i)
-        fig = plt.figure(figsize=(nrow, ncol))
-        fig.add_subplot(nrow, ncol, 1)
-        tgt = input_imgs[('color', 0, 0)][i].numpy()
-        # tgt = inputs_imp[('color', 0, 0)][i]
-        # tgt = np.transpose(tgt, [1,2,0])
-        plt.imshow(tgt)
-
-        fig.add_subplot(nrow, ncol, 3)
-        src0 = input_imgs[('color_aug', -1, 0)][i].numpy()
-        # src0 = inputs_imp[('color_aug', -1, 0)][i]
-        # src0 = np.transpose(src0, [1,2,0])
-        print(np.max(np.max(src0)), np.min(np.min(src0)))
-        plt.imshow(src0)
-
-        fig.add_subplot(nrow, ncol, 4)
-        src1 = input_imgs[('color_aug', 1, 0)][i].numpy()
-        # src1 = inputs_imp[('color_aug', 1, 0)][i]
-        # src1 = np.transpose(src1, [1, 2, 0])
-        print(np.max(np.max(src1)), np.min(np.min(src1)))
-        plt.imshow(src1)
-
-        fig.add_subplot(nrow, ncol, 5)
-        out0 = outputs[('color', -1, 0)][i].numpy()
-        print(np.max(np.max(out0)), np.min(np.min(out0)))
-        plt.imshow(out0)
-        fig.add_subplot(nrow, ncol, 6)
-        out1 = outputs[('color', 1, 0)][i].numpy()
-        print(np.max(np.max(out1)), np.min(np.min(out1)))
-        plt.imshow(out1)
-        plt.show()
+        fig.add_subplot(num_inps, 1, i + 1)
+        plt.imshow(inps[i])
+    plt.show()
 
 
 if __name__ == '__main__':
