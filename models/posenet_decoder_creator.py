@@ -40,20 +40,17 @@ class PoseDecoder(tf.keras.Model):
         out = tf.reshape(out, [-1, self.num_frames_to_predict_for, 1, 6])
         out = out * tf.cast(self.pose_scale, dtype=tf.float32)
 
-        # todo: angles=out[... 3:] ??
         angles = out[..., 3:]
         translations = out[..., :3]
-
         return {"angles": angles, "translations": translations}
 
 
 class PoseDecoder_exp(tf.keras.Model):
     """num_frames_to_predict=2, i.e. only frame 1->2, no 2->1"""
-    def __init__(self, has_depth, pose_num=1, num_ch_enc=(64, 64, 128, 256, 512),
+    def __init__(self, pose_num=1, num_ch_enc=(64, 64, 128, 256, 512),
                  stride=1):
         super(PoseDecoder_exp, self).__init__()
         self.num_ch_enc = num_ch_enc
-        self.out_ch = 8 if has_depth else 6
         # self.num_ch_dec = [input_ch, 16, 32, 64, 128, 256]
         self.num_ch_dec = [16, 32, 64, 128, 256]
         self.pose_scale = tf.cast(0.01, dtype=tf.float32)
@@ -64,8 +61,7 @@ class PoseDecoder_exp(tf.keras.Model):
 
         pose_0_nopad = Conv2D(256, kernel_size=3, strides=stride, padding="valid", name='Conv_pose_0')
         pose_1_nopad = Conv2D(256, kernel_size=3, strides=stride, padding='valid', name='Conv_pose_1')
-        filter_num_last = self.out_ch * self.pose_num
-        pose_2_nopad = Conv2D(filter_num_last, kernel_size=1, strides=1, name='Conv_pose_2')
+        pose_2_nopad = Conv2D(self.pose_num*6, kernel_size=1, strides=1, name='Conv_pose_2')
 
         self.convs_pose = [pose_0_nopad, pose_1_nopad, pose_2_nopad]
 
@@ -73,11 +69,12 @@ class PoseDecoder_exp(tf.keras.Model):
         """ pass encoder-features pairwise
         """
         last_feature = input_features[-1]
+        print(last_feature.shape)
         squeezed_feature = self.convs_squeeze(last_feature)
-
+        print(squeezed_feature.shape)
         backgrd_motion = self.decode_background_motion(squeezed_feature)
         backgrd_motion *= self.pose_scale
-        angles = backgrd_motion[...,:, :, :3]
+        angles = backgrd_motion[..., :, :, :3]
         trans = backgrd_motion[..., :, :, 3:]
         # assert angles.shape[1] == trans.shape[1] == 1 and trans.shape[-1] == 3
 
@@ -104,6 +101,7 @@ class PoseDecoder_exp(tf.keras.Model):
 class ResidualTranslationNet(PoseDecoder_exp):
     def __init__(self, has_depth, lite_mode_idx=(4,3,2,1), do_automasking=False):
         super(ResidualTranslationNet, self).__init__(has_depth)
+        self.out_ch = 8 if has_depth else 6
         conv_prop_1 = {'kernel_size': 1, 'strides': 1, 'use_bias': False, 'padding': 'valid'}
         self.conv_res_motion = Conv2D(self.out_ch, **conv_prop_1, name='unrefined_res_trans')
         self.num_ch_dec = [self.out_ch, 16, 32, 64, 128, 256]
