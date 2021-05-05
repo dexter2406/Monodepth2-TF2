@@ -15,14 +15,14 @@ flags.DEFINE_bool('do_automasking',     True, 'apply auto masking')
 flags.DEFINE_boolean('exp_mode',        True, 'experiment mode')
 flags.DEFINE_boolean('concat_depth',    True, 'concat depth_pred to rgb images for pose net input')
 flags.DEFINE_boolean('use_cycle_consistency',   True, 'add depth_consistency to handle occlusion between two frames')
-flags.DEFINE_string('padding_mode',     'zeros', 'padding mode for bilinear sampler')
 flags.DEFINE_boolean('mask_border',     True,  'mask out the region padded by bilinear sampler '
                                                'when computing losses (only for zero-padding)')
-flags.DEFINE_boolean('add_pose_loss',   True, 'add pose loss to training')
+flags.DEFINE_boolean('add_rot_loss',   True, 'add pose loss to training')
+flags.DEFINE_boolean('add_trans_loss',   True, 'add pose loss to training')
+
 flags.DEFINE_boolean('include_revers',  True, 'calculate transformation in reversed temp order, this'
                                               'must be true when `add_pose_loss` is activated')
 # NIU: additional depth doesn't seem to help to improve
-flags.DEFINE_boolean('use_RGBD',        False, 'use RGB-D instead RGB in reprojection error calculation')
 flags.DEFINE_boolean('use_min_proj',    True, 'use minimal projection loss, not suitable for intrinsics training')
 flags.DEFINE_boolean('disable_gt',      False, 'disable ground-truth depth')
 flags.DEFINE_boolean('learn_intrinsics',False, 'learn intrinsics matrix')
@@ -33,7 +33,8 @@ flags.DEFINE_integer('batch_size', 4, 'batch size')
 flags.DEFINE_float('smoothness_ratio', 1e-3, 'ratio to calculate smoothness loss')
 flags.DEFINE_float('ssim_ratio', 0.85, 'ratio to calculate SSIM loss')
 flags.DEFINE_float('reproj_loss_weight', 1., 'reprojection loss weight')
-flags.DEFINE_float('cycle_loss_weight', 1., 'weight for cycle-consistency loss')
+flags.DEFINE_float('image_cycle_loss_w', 1., 'weight for cycle-consistency loss')
+flags.DEFINE_float('depth_cycle_loss_w', 1., 'weight for cycle-consistency loss')
 flags.DEFINE_float('pose_loss_weight', 1e-2, 'weight for pose_loss')
 flags.DEFINE_float('learning_rate', 1e-4, 'initial learning rate')
 flags.DEFINE_float('mask_loss_w', 5., 'weight for sampler_mask to prevent from shrinking to 0')
@@ -91,6 +92,7 @@ FLAGS = flags.FLAGS
 flags.mark_flag_as_required('run_mode')
 flags.mark_flag_as_required('exp_mode')
 flags.mark_flag_as_required('use_min_proj')
+
 
 def get_options():
     return FLAGS
