@@ -5,7 +5,7 @@ import tensorflow as tf
 
 from models.depth_decoder_creater import DepthDecoder_full
 from models.encoder_creater import ResNet18_new
-from models.posenet_decoder_creator import PoseDecoder
+from models.posenet_decoder_creator import PoseDecoder_exp
 from src.trainer_helper import build_models
 
 rootdir = os.path.dirname(__file__)
@@ -73,9 +73,10 @@ def get_models(weights_dir, exp=True):
         'depth_enc': ResNet18_new(norm_inp=True),
         'depth_dec': DepthDecoder_full(),
         'pose_enc': ResNet18_new(norm_inp=True),
-        'pose_dec': PoseDecoder(num_frames_to_predict_for=1 if exp else 2)
+        'pose_dec': PoseDecoder_exp(pose_num=1)
     }
     build_models(models, rgb_cat_depth=True if exp else False)
+    print('-> Loading models')
 
     if weights_dir == '':
         weights_dir = 'logs/weights/pretrained_resnet18'
@@ -88,6 +89,7 @@ def get_models(weights_dir, exp=True):
             if m_name == 'pose_enc':
                 weights_name = m_name + '_concat'
         path = os.path.join(weights_dir, weights_name+'.h5')
+        print(path)
         if not os.path.isfile(path):
             print('%s not found, skipping' % path)
             continue
