@@ -135,7 +135,7 @@ def rot_consis_loss(M_12, M_21):
     R_unit = combine_rot_mats(R_12, R_21)  # rotation as 3x3 matrix, save computation
 
     # Rotation error
-    eye = tf.eye(3, batch_shape=R_12.shape[0])
+    eye = tf.eye(3, batch_shape=R_12.shape[:1])
     rot_error = R_unit - eye
     rot_error = tf.reduce_mean(tf.square(rot_error), axis=(1, 2))
     rot_scale_1 = tf.reduce_mean(tf.square(R_12 - eye), axis=(1, 2))
