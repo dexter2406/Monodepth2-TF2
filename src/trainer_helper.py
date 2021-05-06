@@ -3,26 +3,31 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 
-
 def view_options(opt):
-    print('----- Viewing Options -----')
+    print('\n----- Viewing Options -----')
     print('exp_mode         ', opt.exp_mode)
     print('min coverage     ', opt.mask_cover_min)
-    print('train_pose       ', opt.train_pose)
-    print('train_depth      ', opt.train_depth)
+    print('train pose,depth ', opt.train_pose, opt.train_depth)
     print('use MinProj      ', opt.use_min_proj)
     print('concat_depth     ', opt.concat_depth)
     print('out_pose_num     ', opt.pose_num)
-    print('lr               ', opt.learning_rate)
-    print('use_res_trans    ', opt.use_res_trans_loss)
-    print('mask_border, padding_mode:', opt.mask_border, opt.padding_mode)
-    print('automasking      ', opt.do_automasking)
-    print('image_cyc_w, depth_cyc_w, used?', opt.image_cycle_loss_w, opt.depth_cycle_loss_w, opt.depth_cycle_loss_w, opt.use_cycle_consistency)
-    print('poss Wt, add rot_loss, trans_loss', opt.pose_loss_weight, opt.add_rot_loss, opt.add_trans_loss)
     print('include reverse  ', opt.include_revers)
-    print('mask_ls Wt, min_area, add', opt.mask_loss_w, opt.mask_cover_min, opt.add_mask_loss)
+    print('lr               ', opt.learning_rate)
+    print('automasking      ', opt.do_automasking)
+    print('\n')
+    print('reproj Wt        ', opt.reproj_loss_w)
     print('smoothness Wt    ', opt.smoothness_ratio)
-    print('reproj Wt        ', opt.reproj_loss_weight)
+    print('depth loss, used?', opt.depth_loss_w, opt.add_depth_loss)
+    print('poss Wt, used?   ', opt.pose_loss_w, opt.add_rot_loss)
+    print('mask_ls Wt, min_area, add', opt.mask_loss_w, opt.mask_cover_min, opt.add_mask_loss)
+    print('--------------------------\n')
+
+
+def make_depth_pyramids(outputs, f_i, scales, label='depth_pyramid'):
+    data = outputs[(label, f_i, 0)]
+    for s in scales[1:]:
+        outputs[(label, f_i, s)] = tf.nn.avg_pool2d(data, [1, 2, 2, 1], [1, 2, 2, 1], padding='VALID')
+    return outputs
 
 
 def rot_mat_from_angles(axisangles, invert:bool):
@@ -53,7 +58,7 @@ def transformation_from_parameters(axisangle, translation, invert=False):
     return M
 
 
-def motion_consistency_loss(axisangles, translations, invert=False):
+def make_transform_mats(axisangles, translations, invert=False):
     # todo: add this loss to train Pose Decoder
     """Calculate Difference between two frames
     For poses of frame 1->2 and 2->1,
@@ -63,27 +68,14 @@ def motion_consistency_loss(axisangles, translations, invert=False):
          - if only one Tensor, then no loss will be computed (return None in #0)
          translations: same as axisangle
          invert: calculate cam2cam transform in inverse temporal order
-         calc_reverse: whether to calculate reverse transformation (and calculate loss)
      Returns:
          loss: scaler of None. if include_loss, the "inversed cam2cam transform between inverse-order image pair"
             will be compared, which they should be identical.
-         M: mean of forward-backward transformation
     """
     # in case pose_loss is disabled, we only need M_1
-    M_12 = transformation_from_parameters(axisangles[0][:, 0], translations[0][:, 0], invert)
-    M_21 = transformation_from_parameters(axisangles[1][:, 0], translations[1][:, 0], not invert)
-
-    # calculate pose loss (actually it's consistency loss.. in struct2depth)
-    pose_loss, trans_loss = Motion_losses_from_M(M_12, M_21, include_res_trans_loss)
-
-    # average the error along batch dim, then sum
-    # pose_loss = tf.reduce_sum(tf.reduce_mean(
-    #     tf.math.abs(M_12 - M_21), axis=0)
-    # )
-
-    # average as the final estimate
-    # M_mean = (M_1 + M_2) * 0.5
-    return pose_loss, trans_loss
+    M = transformation_from_parameters(axisangles[0][:, 0], translations[0][:, 0], invert)
+    M_inv = transformation_from_parameters(axisangles[1][:, 0], translations[1][:, 0], not invert)
+    return M, M_inv
 
 
 def consistency_losses(R_12, R_21, T_12, T_21, res_trans=None, include_trans_loss=False):
@@ -363,51 +355,6 @@ class BackProjDepth:
         return cam_points
 
 
-def Motion_losses_from_M(M_12, M_21):
-    """calculate pose losses
-    Total transformation between two frames should be reverse to each other for pure egomtion
-    But if there's moving objects, this fails. But not entirely:
-    -> Rotation: the objects' doesn't rotate significantly, so it's reasonable to constraint.
-    reversed rotations.
-    -> Translation: the main motion of objects, which deviates from background egomotion
-        if we put constraint on this part, we need to mask out the region with moving objects
-    Note: actually it's consistency loss.. in struct2depth
-
-    [ R2,  t2 ]    [ R1,  t1 ]     [ R2R1,  R2t1 + t2 ]
-    [         ]  . [         ]  =  [                  ]
-    [ 000, 1  ]    [ 000,  1 ]     [ 000,       1     ]
-
-    Returns:
-        rot_consis_loss: rotation consistency loss, calculate by rotation matrix
-        rot_consis_loss: calculated by egomotion vector or (if avaliable) motion filed matrix
-    """
-    def norm(x):
-        return tf.reduce_sum(tf.square(x), axis=-1)
-
-    R_12, R_21 = M_12[:, :3, :3], M_21[:, :3, :3]
-    T_12, T_21 = M_12[:, :3, -1], M_21[:, :3, -1]
-    R_unit = tf.matmul(R_21, R_12)    # R2R1, shape (B,3,3)
-    R2T1 = tf.matmul(R_21, tf.expand_dims(T_12, axis=-1))   # (B,3,1)
-    T_zero = R2T1 + tf.expand_dims(T_21, axis=-1)           # (B,3,1)
-
-    eye = tf.eye(3, batch_shape=R_12.shape[:1])
-    rot_error = R_unit - eye
-    rot_error = tf.reduce_mean(tf.square(rot_error), axis=(1, 2))
-    rot_scale_1 = tf.reduce_mean(tf.square(R_12 - eye), axis=(1, 2))
-    rot_scale_2 = tf.reduce_mean(tf.square(R_21 - eye), axis=(1, 2))
-    rot_consis_loss = tf.reduce_mean(
-        rot_error / (1e-24 + rot_scale_1 + rot_scale_2)
-    )
-
-    # todo: translation loss with "residual_reanslation" map
-    if T_zero.shape.ndims != 4:
-        # egomotion vector
-        trans_consis_loss = tf.reduce_mean(T_zero)
-    else:
-        raise NotImplementedError('translation loss with motion field matrix not yet implemented')
-    return rot_consis_loss, trans_consis_loss
-
-
 def bilinear_sampler(img, coords, padding='border'):
     """ TF-version Bilinear Sampler
     Performs bilinear sampling of the input images according to the
@@ -522,13 +469,12 @@ def get_translation_matrix(trans_vec):
     # np impl
     # T = np.zeros((trans_vec.shape[0], 4, 4)).astype(np.float32)
     # t = np.reshape(trans_vec.numpy(), (-1, 3, 1)).astype(np.float32)
-    #
     # T[:, 0, 0] = 1
     # T[:, 1, 1] = 1
     # T[:, 2, 2] = 1
     # T[:, 3, 3] = 1
     # T[:, :3, 3, None] = t
-    # T = tf.convert_to_tensor(T, dtype=tf.float32)
+    # T = tf.cast(T, tf.float32)
 
     batch_size = trans_vec.shape[0]
     one = tf.ones([batch_size, 1, 1], dtype=tf.float32)
@@ -538,7 +484,6 @@ def get_translation_matrix(trans_vec):
         zero, one, zero, trans_vec[:, :, 1:2],
         zero, zero, one, trans_vec[:, :, 2:3],
         zero, zero, zero, one
-
     ], axis=2)
     T = tf.reshape(T, [batch_size, 4, 4])
     return T
@@ -570,21 +515,6 @@ def rot_from_axisangle(vec):
     yzC = y * zC
     zxC = z * xC
 
-    # np impl
-    # rot = np.zeros((vec.shape[0], 4, 4))
-    # rot[:, 0, 0] = np.squeeze(x * xC + ca)
-    # rot[:, 0, 1] = np.squeeze(xyC - zs)
-    # rot[:, 0, 2] = np.squeeze(zxC + ys)
-    # rot[:, 1, 0] = np.squeeze(xyC + zs)
-    # rot[:, 1, 1] = np.squeeze(y * yC + ca)
-    # rot[:, 1, 2] = np.squeeze(yzC - xs)
-    # rot[:, 2, 0] = np.squeeze(zxC - ys)
-    # rot[:, 2, 1] = np.squeeze(yzC + xs)
-    # rot[:, 2, 2] = np.squeeze(z * zC + ca)
-    # rot[:, 3, 3] = 1
-    # rot = tf.convert_to_tensor(rot, dtype=tf.float32)
-
-    # TF impl
     one = tf.ones_like(zxC, dtype=tf.float32)
     zero = tf.zeros_like(zxC, dtype=tf.float32)
     rot = tf.concat([
@@ -715,24 +645,28 @@ def make_intrinsics_matrix(fx, fy, cx, cy):
 
 def show_images(inputs, outputs, frame_idx=(0,-1,1)):
     src_data = inputs[('color', 0, 0)].numpy()[0]
-    warped_n = outputs[('warped_multi_s', 1, 0)][0].numpy()[0]
-    warped_p = outputs[('warped_multi_s', -1, 0)][0].numpy()[0]
-    samp_mask_n = outputs[('sampler_mask', 1, 0)][0][..., 0:1]
-    samp_mask_p = outputs[('sampler_mask', -1, 0)][0][..., 0:1]
+    warped_n = outputs[('warped_multi_s', 1, 0)][0]
+    warped_p = outputs[('warped_multi_s', -1, 0)][0]
+    samp_mask_n = outputs[('sampler_mask', 1, 0)][0,..., :1]
+    samp_mask_p = outputs[('sampler_mask', -1, 0)][0,..., :1]
+    val_mask_n = outputs[('validity_mask', 1, 0)][0, ..., :1]
+    val_mask_p = outputs[('validity_mask', -1, 0)][0,..., :1]
+    transformed_dmap_n = outputs[('transformed_map', 1, 0)][0]
+    transformed_dmap_p = outputs[('transformed_map', -1, 0)][0]
     # ---
-    disp_orig = outputs[('disp', frame_idx[0], 0)][0]
-    # disp_resamp1 = tf.expand_dims(outputs[('rgbd', self.opt.frame_idx[1], 0)][0, ..., -1], 2)
-    # disp_resamp2 = tf.expand_dims(outputs[('rgbd', self.opt.frame_idx[2], 0)][0, ..., -1], 2)
+    disp_c = outputs[('disp', 0, 0)][0]
+    disp_n = disp_to_depth(outputs[('disp', 1, 0)][0])[1]
+    disp_p = disp_to_depth(outputs[('disp', -1, 0)][0])[1]
     # ---
     # mask1 = tf.cast(outputs[('occlu_aware_mask', -1, 0)], dtype=tf.float32)[0]
     # mask2 = tf.cast(outputs[('occlu_aware_mask', 1, 0)], dtype=tf.float32)[0]
     # print('mask perc', tf.reduce_mean(sampler_mask))
     inps = [
-        warped_n,
-        samp_mask_n,
-        # inputs[('color', -1, 0)][0],
-        src_data,
-        samp_mask_p,
+        disp_n,
+        transformed_dmap_n,
+        disp_p,
+        transformed_dmap_p,
+        # src_data,
         # inputs[('color', 1, 0)][0]
     ]
     num_inps = len(inps)
@@ -743,6 +677,17 @@ def show_images(inputs, outputs, frame_idx=(0,-1,1)):
         plt.imshow(inps[i])
     plt.show()
 
+
+def disp_to_depth(disp, min_depth=0.1, max_depth=100.):
+    """Convert network's sigmoid output into depth prediction
+    The formula for this conversion is given in the 'additional considerations'
+    section of the paper.
+    """
+    min_disp = 1 / max_depth
+    max_disp = 1 / min_depth
+    scaled_disp = min_disp + (max_disp - min_disp) * disp
+    depth = 1 / scaled_disp
+    return scaled_disp, depth
 
 if __name__ == '__main__':
     import numpy as np
