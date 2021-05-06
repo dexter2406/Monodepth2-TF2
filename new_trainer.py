@@ -31,7 +31,7 @@ class Trainer:
         self.train_loader: DataLoader = None
         self.mini_val_loader: DataLoader = None
         self.shape_scale0 = [self.opt.batch_size, self.opt.height, self.opt.width, 3]
-
+        self.num_scales = len(self.opt.scales)
         self.tgt_image = None
         self.tgt_image_net = None
         self.tgt_image_aug = None
@@ -104,9 +104,9 @@ class Trainer:
                                        "da/a1", "da/a2", "da/a3"]
 
         # Batch data preprocessor
-        self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx)
-        if not self.opt.learn_intrinsics:
-            self.batch_processor.get_intrinsics(train_dataset.K)
+        self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx, intrinsics=train_dataset.K)
+        # if not self.opt.learn_intrinsics:
+        #     self.batch_processor.get_intrinsics(train_dataset.K)
         if self.opt.disable_gt:
             self.batch_processor.disable_groundtruth()
 
@@ -200,9 +200,9 @@ class Trainer:
         # if self.opt.mask_loss_w != 0.0:
         mask_loss = 0.
         cover_perc = tf.reduce_mean(sampler_mask)
-        # print("coverage:", cover_perc)
+        print("coverage:", cover_perc)
         if cover_perc < self.opt.mask_cover_min:
-            mask_loss = (self.opt.mask_cover_min - cover_perc) * self.opt.mask_loss_w
+            mask_loss = self.opt.mask_cover_min - cover_perc
         return mask_loss
 
     def compute_losses(self, inputs, outputs):
@@ -214,22 +214,21 @@ class Trainer:
         pixel_loss = 0.
         smooth_loss = 0.
 
-        for scale in range(self.opt.num_scales):
-            scale_wt = 1. / 2**scale
+        # Scales are for smoothness (prevent texture-copy artifacts), and reprojection losses,
+        # other losses are not calculated in different scales
+        for scale in self.opt.scales:
+            scale_wt = 1. / 2 ** scale
             reproject_losses = []
 
             # -------------------
             # Loss-1: Reprojection / warping loss
             # -------------------
             for i, f_i in enumerate(self.opt.frame_idx[1:]):
-                validity_mask = outputs[('validity_mask', f_i, scale)]
-                image_src2tgt = outputs[('warped_multi_s', f_i, scale)][0]  # 0: src->tgt; 1(optional): tgt->src
+                validity_mask = outputs[('validity_mask', f_i, 0)]
+                image_src2tgt = outputs[('warped_multi_s', f_i, scale)]
                 reproject_losses.append(
                     self.compute_reproject_loss(image_src2tgt, image_tgt, validity_mask)
                 )
-                if self.opt.add_mask_loss:
-                    # regularize the mask to prevent shrinking in extreme case
-                    mask_loss += self.regularize_mask(outputs[('sampler_mask', f_i, scale)])
             reproj_loss = tf.concat(reproject_losses, axis=3)
             if self.avg_reprojection:
                 reproj_loss = tf.math.reduce_mean(reproject_losses, axis=3, keepdims=True)
@@ -241,7 +240,7 @@ class Trainer:
             if not self.opt.do_automasking:
                 combined = reproject_losses
             else:
-                identity_reproj_loss = self.apply_automasking_on_reproj_loss(inputs, outputs, scale)
+                identity_reproj_loss = self.apply_automasking_on_reproj_loss(inputs, outputs)
                 combined = tf.concat([identity_reproj_loss, reproj_loss], axis=3)
                 # outputs[('automask', 0)] = tf.expand_dims(
                 #     tf.cast(tf.math.argmin(combined, axis=3) > 1, tf.float32) * 255, -1)
@@ -268,8 +267,8 @@ class Trainer:
         # ----------------
         # pixel_loss and smooth_loss
         # ----------------
-        self.losses['pixel_loss'] = pixel_loss * self.opt.reproj_loss_weight
-        self.losses['smooth_loss'] = smooth_loss * self.opt.smoothness_ratio
+        self.losses['pixel_loss'] = pixel_loss * self.opt.reproj_loss_w / self.num_scales
+        self.losses['smooth_loss'] = smooth_loss * self.opt.smoothness_ratio / self.num_scales
         total_loss += self.losses['pixel_loss'] + self.losses['smooth_loss']
 
         # ---------------
@@ -284,7 +283,7 @@ class Trainer:
         # Loss-4: Pose Consistency Losses: rotation should be identical when in reverse order
         # ---------------
         if self.opt.add_rot_loss:
-            rot_loss = outputs[('rot_loss',)] * self.opt.pose_loss_weight
+            rot_loss = outputs[('rot_loss',)] * self.opt.pose_loss_w
             self.losses['rot_loss'] = rot_loss
             total_loss += rot_loss
             print("rot loss:", self.losses['rot_loss'])
@@ -293,7 +292,7 @@ class Trainer:
         # Loss-5: Mask regularizer on sampler_mask, prevent the mask to shrink to zero, should stay zero
         # ---------------
         if self.opt.add_mask_loss:
-            mask_loss = mask_loss * self.opt.mask_loss_w
+            mask_loss = self.regularize_mask(outputs[('sampler_mask', -1, 0)]) * self.opt.mask_loss_w
             total_loss += mask_loss
             self.losses['mask_loss'] = mask_loss
 
@@ -309,10 +308,10 @@ class Trainer:
 
         return self.losses
 
-    def apply_automasking_on_reproj_loss(self, inputs, outputs, scale):
+    def apply_automasking_on_reproj_loss(self, inputs, outputs):
         identity_reproj_losses = []
         for f_i in self.opt.frame_idx[1:]:
-            validity_mask = outputs[('validity_mask', f_i, scale)]
+            validity_mask = outputs[('validity_mask', f_i, 0)]
             image_src = inputs[('color', f_i, 0)]
             image_tgt = inputs[('color', 0, 0)]
             identity_reproj_losses.append(
@@ -333,21 +332,13 @@ class Trainer:
         - ['disp', <frame_id>, <scale>]: Tensor
             -> label and content just like `inputs`, it's default setting if not specified
             -> shape (B,H,W,C), channel `C` can be 3 for RGB or 4 for an additional depth map
-
-        - [('warped_multi_s', <frame_id>, <scale>)] : List
-            -> #0: warped from source to target, frame -1->0 or 1->0, regardless of temporal order
-            -> #1: warped from target to source
-            -> Examples
-                [('warped_multi_s', -1, 0)][0]: data at scale 0, warped from previous to current frame
-                [('warped_multi_s', -1, 1)][1]: data at scale 1, warped from current to previous frame
-                [('warped_multi_s', 1, 0)][1]:  data at scale 0, warped from current to next frame
-        - [('disp_warp', frame_id, 0)]: List
-            same as the above, but doesn't include multi-scale, it's a temp use only for occlusion-aware masks
+        - [('warped_multi_s', <frame_id>, <scale>)] : Tensor
+            source frame inverse warped to target frame, e.g. -1->0, 1->0
         """
         rot_losses = 0.
         depth_losses = 0.
-        for scale in range(self.opt.num_scales):
-            scale_wt = 1. / 2**scale
+        for scale in self.opt.scales:
+            scale_wt = 1. / 2 ** scale
             disp_tgt_s = tf.image.resize(outputs[('disp', 0, scale)], (self.opt.height, self.opt.width))
             # _, depth_tgt_s = disp_to_depth(disp_tgt_s, self.opt.min_depth, self.opt.max_depth)
             _, depth_tgt_s = self.disp_to_depth(disp_tgt_s)
@@ -360,31 +351,40 @@ class Trainer:
                 # Inverse warp source -> target view, namely prev->curr, next->curr
                 # ----------------
                 data_src = inputs[('color', f_i, scale)]
-                depth_src = self.disp_to_depth(outputs[('disp', f_i, scale)])[1]
-                if self.opt.depth_loss:
-                    data_src = tf.concat([data_src, depth_src])
-                data_src2tgt, transformation_map = self.inverse_warping(depth_tgt_s, data_src, outputs, f_i)
-                outputs[('warped_multi_s', f_i, scale)] = [data_src2tgt[...,:3]]
-                outputs[('sampler_mask', f_i, 0)] = transformation_map.mask
+                if scale in self.opt.scales[1:]:
+                    data_src2tgt, transformation_map = self.inverse_warping(depth_tgt_s, data_src, outputs, f_i)
+                    outputs[('warped_multi_s', f_i, scale)] = data_src2tgt[..., :3]
 
-                if self.opt.use_occlu_mask:
-                    occlu_mask = self.get_occlusion_aware_mask(outputs, f_i, transformation_map, scale)
-                    outputs[('validity_mask', f_i, scale)] = transformation_map.mask * occlu_mask
-                else:
-                    outputs[('validity_mask', f_i, scale)] = outputs[('sampler_mask', f_i, scale)]
+                elif scale == self.opt.scales[0]:
+                    # Many calculation only happens in source scale (scale==0)
+                    if self.opt.add_depth_loss:
+                        depth_src = self.disp_to_depth(outputs[('disp', f_i, 0)])[1]
+                        data_src = tf.concat([data_src, depth_src], axis=3)
+                    data_src2tgt, transformation_map = self.inverse_warping(depth_tgt_s, data_src, outputs, f_i)
+                    outputs[('warped_multi_s', f_i, 0)] = data_src2tgt[..., :3]
+                    outputs[('sampler_mask', f_i, 0)] = transformation_map.mask
+                    outputs['transformed_map', f_i, 0] = transformation_map.depth
+                    if scale == 0 and self.opt.use_occlu_mask:
+                        occlu_mask = self.get_occlusion_aware_mask(outputs, f_i, transformation_map, 0)
+                        outputs[('validity_mask', f_i, 0)] = transformation_map.mask * occlu_mask
+                    else:
+                        outputs[('validity_mask', f_i, 0)] = outputs[('sampler_mask', f_i, 0)]
 
-                if self.opt.add_depth_loss:
-                    depth_src2tgt = data_src2tgt[..., 3]
-                    depth_l1_diff = tf.abs(transformation_map.depth - depth_src2tgt)
-                    depth_losses += depth_l1_diff * outputs[('validity_mask', f_i, scale)] * scale_wt
-
-                # ----------------
-                # Rotation Consistency loss
-                # ----------------
-                if self.opt.add_rot_loss:
-                    # todo: rot_loss needs be normalized by 2**scale?
-                    rot_loss = self.motion_consistency_losses(outputs, f_i, scale)
-                    rot_losses += rot_loss * scale_wt
+                    if self.opt.add_depth_loss:
+                        depth_src2tgt = data_src2tgt[..., 3:4]
+                        depth_l1_diff = tf.abs(transformation_map.depth - depth_src2tgt)
+                        depth_scaling = tf.reduce_mean(transformation_map.depth, axis=[1, 2], keepdims=True) + \
+                                        tf.reduce_mean(depth_src2tgt, axis=[1, 2], keepdims=True)
+                        depth_losses += tf.reduce_mean(
+                            depth_l1_diff / depth_scaling * outputs[('validity_mask', f_i, 0)]
+                        ) * scale_wt
+                    # ----------------
+                    # Rotation Consistency loss
+                    # ----------------
+                    if self.opt.add_rot_loss:
+                        # todo: rot_loss needs be normalized by 2**scale?
+                        rot_loss = self.motion_consistency_losses(outputs, f_i)
+                        rot_losses += rot_loss * scale_wt
 
         if self.opt.add_rot_loss:
             # store 'rot_loss' in `outputs` instead of `self.loseses` maybe confusing
@@ -394,20 +394,20 @@ class Trainer:
             outputs[('depth_loss',)] = depth_losses
 
         if self.opt.debug_mode:
-            show_images(self.opt.batch_size, inputs, outputs)
+            show_images(inputs, outputs)
         return outputs
 
     def get_occlusion_aware_mask(self, outputs, f_i, transformed_map, scale):
         depth_src2tgt = self.disp_to_depth(outputs[('disp', f_i, scale)])[1]
         occlu_mask = tf.cast(
-            tf.less_equal(transformed_map.depth, depth_src2tgt),
+            tf.greater_equal(transformed_map.depth, depth_src2tgt),
             tf.float32)
         return occlu_mask
 
-    def motion_consistency_losses(self, outputs, f_i, scale):
+    def motion_consistency_losses(self, outputs, f_i):
         M, M_inv = make_transform_mats(
-            outputs[('axisangles', f_i, scale)],
-            outputs[('translations', f_i, scale)],
+            outputs[('axisangles', f_i, 0)],
+            outputs[('translations', f_i, 0)],
             invert=(f_i < 0)
         )
         # calculate pose loss (actually it's consistency loss.. in struct2depth)
@@ -440,9 +440,8 @@ class Trainer:
             reverse_order = invert  # Override
         idx = 1 if reverse_order else 0
         intrinsics = outputs[('K', 0)]
-        rot_angles = outputs[('rot_angles', f_i, 0)][idx]
+        rot_angles = outputs[('axisangles', f_i, 0)][idx]
         translations = outputs[('translations', f_i, 0)][idx]
-
         px, py, z = get_transformed_depth_coords(depth_goal, translations, rot_angles, intrinsics)
         pixel_x, pixel_y, mask = clamp_and_filter_result(px, py, z)
         transformation_map = TransformationMap(pixel_x, pixel_y, z, mask)
@@ -488,7 +487,7 @@ class Trainer:
                     pose_inputs, axisangles, translations
                 )
 
-            outputs[('rot_angles', f_i, 0)] = axisangles
+            outputs[('axisangles', f_i, 0)] = axisangles
             outputs[('translations', f_i, 0)] = translations
 
         return inputs, outputs
@@ -502,11 +501,10 @@ class Trainer:
         """
         # tgt_image_aug = inputs[('color_aug', 0, 0)]
         outputs = {}
-        if not self.opt.learn_intrinsics:
-            for k in inputs:
-                for scale in range(self.opt.num_scales):
-                    if ('K', scale) == k or ('K_inv', scale):
-                        outputs[k] = inputs[k]
+        for k in inputs:
+            for scale in self.opt.scales:
+                if ('K', scale) == k or ('K_inv', scale):
+                    outputs[k] = inputs[k]
 
         # ------ collecting disp and depth ------
         # - for f_i==0, collect disp in all scales, to calculate smooth loss
@@ -516,14 +514,15 @@ class Trainer:
             feature_raw = self.models['depth_enc'](inputs[('color_aug', f_i, 0)], self.opt.train_depth)
             pred_disp = self.models['depth_dec'](feature_raw, self.opt.train_depth)
             if f_i == 0:
-                for s in range(self.opt.num_scales):
+                for s in self.opt.scales:
                     disp_raw = pred_disp["output_%d" % s]
-                    outputs[('disp', 0, s)] = disp_raw
+                    outputs[('disp', f_i, s)] = disp_raw
                     # Collect depth at respective scale, but resized to source_scale
                     disp_src_size = tf.image.resize(disp_raw, (self.opt.height, self.opt.width))
-                    _, outputs[('depth', 0, s)] = disp_to_depth(disp_src_size, self.opt.min_depth, self.opt.max_depth)
+                    _, outputs[('depth', f_i, s)] = disp_to_depth(disp_src_size, self.opt.min_depth, self.opt.max_depth)
             else:
                 outputs[('disp', f_i, 0)] = pred_disp["output_0"]
+                # outputs.update(make_depth_pyramids(outputs, f_i, self.opt.pyramid_scales))
 
         # -------------
         # 2. Pose
@@ -738,7 +737,7 @@ class Trainer:
                 tf.summary.image('scale0_disp_color', colorize(outputs[('disp', f_i, 0)][:2], cmap='plasma'),
                                  step=global_step)
                 tf.summary.image('scale0_proj_{}'.format(f_i),
-                                 outputs[('warped_multi_s', f_i, 0)][0][:2, ..., :3], step=global_step)
+                                 outputs[('warped_multi_s', f_i, 0)][:2, ..., :3], step=global_step)
                 # tf.summary.image('scale0_proj_error_{}'.format(f_i),
                 #                  outputs[('proj_error', f_i, 0)][:2], step=global_step)
             if self.opt.learn_intrinsics:
