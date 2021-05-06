@@ -97,7 +97,7 @@ def get_models(weights_dir, exp=True):
     return models
 
 
-def disp_to_depth(disp, min_depth, max_depth):
+def disp_to_depth(disp, min_depth=0.1, max_depth=100.):
     """Convert network's sigmoid output into depth prediction
     The formula for this conversion is given in the 'additional considerations'
     section of the paper.
@@ -227,16 +227,9 @@ def check_options(FLAGS):
             raise ValueError("\t'%s' is not supported model, choose from: " % m, all_models)
     print('\t Using dataset:', FLAGS.split)
 
-    if not FLAGS.learn_intrinsics:
-        FLAGS.use_min_proj = False
-
-    if FLAGS.add_pose_loss:
+    if FLAGS.add_rot_loss:
         print('calc_reverse_transform automatically set `True`, because `add_pose_loss` requires it')
         FLAGS.include_revers = True
-
-    if (FLAGS.padding_mode == 'zeros' and not FLAGS.mask_border) or \
-        (FLAGS.padding_mode == 'border' and FLAGS.mask_border):
-        print('either `zero_padding - masking`, or `border_padding - no_masking` ')
 
     if FLAGS.debug_mode:
         print('\t[debug mode] Check intermediate results. '
