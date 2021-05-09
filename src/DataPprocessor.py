@@ -4,11 +4,11 @@ import time
 import math
 import numpy as np
 import sys
-from utils import hom_intrinsics_helper, assert_valid_hom_intrinsics
+from utils import assert_valid_hom_intrinsics
 
 
 class DataProcessor(object):
-    def __init__(self, frame_idx, intrinsics=None, num_scales=4, disable_gt=True):
+    def __init__(self, frame_idx, intrinsics, num_scales=4, disable_gt=True):
         self.disable_gt = disable_gt
         self.num_scales = num_scales     # for evaluation, 1
         self.height = 192
@@ -46,8 +46,8 @@ class DataProcessor(object):
         intrinsics_scale_0 = inputs[('K', 0)]
         """
         do_color_aug = is_train and np.random.random() > 0.5
-        inputs = self.process_batch_main(batch, do_color_aug)
-        return inputs
+        inputs, input_Ks = self.process_batch_main(batch, do_color_aug)
+        return inputs, input_Ks
 
     def prepare_batch_val(self, batch):
         """duplicate of prepare_batch(), no @tf.function decorator
@@ -55,15 +55,14 @@ class DataProcessor(object):
         """
         # tf.print('val shape')
         # tf.print(batch[0].shape, batch[1].shape, output_stream=sys.stdout)
-        inputs = self.process_batch_main(batch, do_color_aug=False)
-        return inputs
+        inputs, input_Ks = self.process_batch_main(batch, do_color_aug=False)
+        return inputs, input_Ks
 
     def process_batch_main(self, batch, do_color_aug=False):
         inputs = {}
         if type(batch) == tuple:
             batch_imgs = batch[0]
-            if not self.disable_gt:
-                inputs[('depth_gt', 0)] = tf.expand_dims(batch[1], 3)
+            inputs[('depth_gt', 0)] = tf.expand_dims(batch[1], 3)
         else:
             batch_imgs = batch
         tgt_batch, src_batch = batch_imgs[..., :3], batch_imgs[..., 3:]
@@ -76,9 +75,9 @@ class DataProcessor(object):
             for i, f_i in enumerate(self.frame_idx[1:]):
                 inputs[('color', f_i, -1)] = src_batch[..., i*3: (i+1)*3]
 
-        inputs = self.preprocess(inputs, do_color_aug)
+        inputs, input_Ks = self.preprocess(inputs, do_color_aug)
         self.delete_raw_images(inputs)
-        return inputs
+        return inputs, input_Ks
 
     def generate_aug_params(self):
         brightness = np.random.uniform(0, self.brightness)
@@ -122,12 +121,11 @@ class DataProcessor(object):
                     inputs[(img_type, f_i, scale)] = resized_image
                     inputs[(img_type + '_aug', f_i, scale)] = self.color_aug(resized_image, aug_params)
 
-            if self.K is not None:
-                inputs.update(self.make_K_pyramid(tf.expand_dims(self.K, axis=0)))
+            input_Ks = self.make_K_pyramid()
 
-        return inputs
+        return inputs, input_Ks
 
-    def make_K_pyramid(self, K, scaling:tuple=None):
+    def make_K_pyramid(self):
         """genearing intrinsics pyramid
         Args:
             K: partial intrinsics, shape best to be [B,3,3], but [B,4,4], [4,4] or [B,4,4] are also OK
@@ -135,22 +133,20 @@ class DataProcessor(object):
             input_Ks: dict
                 a pyramid of homogenous intrinsics and its inverse, each has shape [B,4,4]
         """
-        # print('K0 raw:', K)
         input_Ks = {}
-        if scaling is None:
-            scaling = (self.width, self.height)
         for scale in range(self.num_scales):
-            # For KITTI. Must *normalize* when using on different scale
-            Ks = [None] * 2
-            for i in range(2):
-                Ks[i] = K[:, i:i+1, :] * scaling[i] // (2**scale)
-            hom_K = hom_intrinsics_helper(tf.concat(Ks, axis=1), batch_num=self.batch_size)
-            hom_K_inv = tf.linalg.pinv(hom_K)
-            # assert_valid_hom_intrinsics(hom_K)
+            K_tmp = self.K.copy()
+            K_tmp[0, :] *= self.width // (2 ** scale)
+            K_tmp[1, :] *= self.height // (2 ** scale)
 
-            input_Ks[("K", scale)] = hom_K
-            input_Ks[("inv_K", scale)] = hom_K_inv
-        # print("K scaled: ", input_Ks[('K', 0)], '\n')
+            inv_K = np.linalg.pinv(K_tmp)
+
+            K_tmp = tf.reshape(tf.tile(K_tmp, [self.batch_size, 1]), (self.batch_size, 4, 4))
+            inv_K = tf.reshape(tf.tile(inv_K, [self.batch_size, 1]), (self.batch_size, 4, 4))
+            assert K_tmp.shape[-1] == 4
+
+            input_Ks[("K", scale)] = K_tmp
+            input_Ks[("inv_K", scale)] = inv_K
         assert_valid_hom_intrinsics(input_Ks[("K", 0)])
         return input_Ks
 
