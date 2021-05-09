@@ -42,7 +42,10 @@ def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
     else:
         # directly skip when loss is not low enough
         # if the loss is the new low, should at least 2 another metrics
-        if val_losses['loss/total'] > max(0.1, val_losses_min['loss/total']):
+        tolerance = 0.01
+        num_pass_min = 2
+        diff = val_losses['loss/total'] - val_losses_min['loss/total']
+        if diff < tolerance:
             skip = True
         else:
             skip = False
@@ -58,7 +61,7 @@ def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
                         # for other metric, argmin
                         if val_losses[metric] < val_losses_min[metric]:
                             num_pass += 1
-                skip = num_pass < 1  # if no metric exceeds, decision will be override
+                skip = num_pass < num_pass_min  # if no metric exceeds, decision will be override
 
             if not skip:
                 print('val loss hits new low!')
@@ -580,7 +583,7 @@ def show_images(inputs, outputs):
         # inputs[('color', 1, 0)][0]
     ]
     inps_col2 = [
-        
+
     ]
     num_rows = max(len(inps_col1), len(inps_col2))
     fig = plt.figure(figsize=(num_rows, 2, 1))
