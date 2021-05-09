@@ -3,11 +3,6 @@ import pickle
 import numpy as np
 import tensorflow as tf
 
-from models.depth_decoder_creater import DepthDecoder_full
-from models.encoder_creater import ResNet18_new
-from models.posenet_decoder_creator import PoseDecoder_exp
-from src.trainer_helper import build_models
-
 rootdir = os.path.dirname(__file__)
 
 
@@ -46,58 +41,7 @@ def hom_intrinsics_helper(intrinsics_mat, batch_num):
     return hom_intrinsics
 
 
-def make_hom_intrinsics(intrinsic_mat, same_video):
-    """ Make homogenous intrinsics
-    As input of
-    Args:
-        intrinsic_mat: Tensor, [B, 2, 3]
-            will be padded to be homogenous mat
-        same_video: if True, intrinsics_mat will be averaged as identical ones though batch dimension
-    Returns:
-        hom_intrinsics: Tensor, [B, 4, 4]
-    """
-    batch_size = intrinsic_mat.shape[0]
-    if same_video:
-        intrinsic_mat = tf.reduce_mean(intrinsic_mat, axis=0, keepdims=True)
-        hom_intrinsics = hom_intrinsics_helper(intrinsic_mat, 1)
-        hom_intrinsics = tf.concat([hom_intrinsics] * batch_size, axis=0)
-    else:
-        batch_size = intrinsic_mat.shape[0]
-        hom_intrinsics = hom_intrinsics_helper(intrinsic_mat, batch_size)
-
-    return hom_intrinsics
-
-
-def get_models(weights_dir, exp=True):
-    models = {
-        'depth_enc': ResNet18_new(norm_inp=True),
-        'depth_dec': DepthDecoder_full(),
-        'pose_enc': ResNet18_new(norm_inp=True),
-        'pose_dec': PoseDecoder_exp(pose_num=1)
-    }
-    build_models(models, rgb_cat_depth=True if exp else False)
-    print('-> Loading models')
-
-    if weights_dir == '':
-        weights_dir = 'logs/weights/pretrained_resnet18'
-
-    for m_name, model in models.items():
-        weights_name = m_name
-        if exp:
-            if m_name == 'pose_dec':
-                weights_name = m_name + '_one_out'
-            if m_name == 'pose_enc':
-                weights_name = m_name + '_concat'
-        path = os.path.join(weights_dir, weights_name+'.h5')
-        print(path)
-        if not os.path.isfile(path):
-            print('%s not found, skipping' % path)
-            continue
-        models[m_name].load_weights(path)
-    return models
-
-
-def disp_to_depth(disp, min_depth=0.1, max_depth=100.):
+def disp_to_depth(disp, min_depth, max_depth):
     """Convert network's sigmoid output into depth prediction
     The formula for this conversion is given in the 'additional considerations'
     section of the paper.
@@ -219,18 +163,13 @@ def del_files(root_dir):
 
 
 def check_options(FLAGS):
-    all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_dec', 'intrinsics_head']
+    all_models = ['depth_enc', 'depth_dec', 'pose_enc', 'pose_dec']
 
     print("-> Check options...")
     for m in FLAGS.models_to_load:
         if m not in all_models:
             raise ValueError("\t'%s' is not supported model, choose from: " % m, all_models)
     print('\t Using dataset:', FLAGS.split)
-
-    if FLAGS.add_rot_loss:
-        print('calc_reverse_transform automatically set `True`, because `add_pose_loss` requires it')
-        FLAGS.include_revers = True
-
     if FLAGS.debug_mode:
         print('\t[debug mode] Check intermediate results. '
               'Models will not be trained or saved even if options are given.')
@@ -261,6 +200,8 @@ def check_options(FLAGS):
         if weights_dir == '':
             if from_scratch:
                 print("\n\tall models are trained from scratch")
+                if FLAGS.opt.add_rot_loss:
+                    raise ValueError('rot_error should NOT be activated when from scratch')
             else:
                 print('\t No weights_dir specified: decoders from scratch, encoders with pretrained weights')
         else:
