@@ -6,6 +6,17 @@ import tensorflow as tf
 rootdir = os.path.dirname(__file__)
 
 
+def crop_to_aspect_ratio(image, feed_size):
+    h, w = image.shape[:2]
+    asp_ratio = feed_size[1] / feed_size[0]   # W/H, usually 640/192
+    tolerance = 0.05
+    if abs(w / h - asp_ratio) > tolerance:
+        h_goal = int(w // asp_ratio)
+        h_start = int((h - h_goal) * 0.5)
+        image = image[h_start: h_start + h_goal, :w, :]
+    return image
+
+
 def assert_valid_hom_intrinsics(intrinsics_mat):
     shapes = list(intrinsics_mat.shape)
     if len(shapes) != 3 or shapes[1] != shapes[2] or shapes[2] != 4:
