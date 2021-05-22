@@ -13,39 +13,40 @@ root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 class DataLoader(object):
-    def __init__(self, dataset,
-                 num_epoch, batch_size, frame_idx):
+    def __init__(self, dataset, num_epoch, batch_size, frame_idx, inp_size, sharpen_factor):
         self.dataset = dataset
         self.num_epoch = num_epoch
         self.batch_size = batch_size
         self.buffer_size = 1000  # todo: how to set good buffer size?
         self.frame_idx = frame_idx
         self.K = self.dataset.K
-        self.steps_per_epoch:int = None
+        self.steps_per_epoch: int = None
         self.filenames: list = None
         self.num_items: int = None
         self.read_filenames()
         self.data_path = self.dataset.data_path
         self.include_depth = None
         self.has_depth = self.has_depth_file()
+        self.inp_size = inp_size
+        self.sharpen_factor = sharpen_factor
 
     def read_filenames(self):
         # e.g. splits\\eigen_zhou\\train.txt
-        split_path = os.path.join(self.dataset.split_folder, self.dataset.split_name)
+        split_path = os.path.join(self.dataset.split_folder, self.dataset.split_name).replace('\\', '/')
         self.filenames = readlines(split_path)
         self.num_items = len(self.filenames)
         self.steps_per_epoch = self.num_items // self.batch_size
 
-    def build_train_dataset(self):
-        return self.build_combined_dataset(include_depth=False, num_repeat=self.num_epoch)
+    def build_train_dataset(self, buffer_size=None):
+        return self.build_combined_dataset(include_depth=False, num_repeat=self.num_epoch, buffer_size=buffer_size)
 
-    def build_val_dataset(self, include_depth, buffer_size):
+    def build_val_dataset(self, include_depth, buffer_size, shuffle):
         return self.build_combined_dataset(include_depth=include_depth, num_repeat=None,
-                                           buffer_size=buffer_size)
+                                           buffer_size=buffer_size, shuffle=shuffle)
 
     def build_eval_dataset(self):
         # todo: verify file numbers, num_repeat=??
-        return self.build_combined_dataset(include_depth=False, num_repeat=self.num_epoch,
+        return self.build_combined_dataset(include_depth=False, num_repeat=1,
                                            shuffle=False, drop_last=False)
 
     def build_combined_dataset(self, include_depth, num_repeat,
@@ -60,7 +61,7 @@ class DataLoader(object):
         self.include_depth = include_depth
         if include_depth and not self.has_depth:
             self.include_depth = False
-            warnings.warn('Will not use depth gt, because no available depth file found')
+            warnings.warn('Cannot use depth gt, because no available depth file found')
         # the outputs are implicitly handled by 'out_maps'
         out_maps = [tf.float32, tf.float32] if self.include_depth else tf.float32
         dataset = dataset.map(lambda x: tf.py_function(self.parse_func_combined, [x], Tout=out_maps),
@@ -87,15 +88,15 @@ class DataLoader(object):
         calib_path, depth_path, side = self.derive_depth_path_from_img(tgt_path)
         depth_gt = generate_depth_map(calib_path, depth_path, side)
         depth_gt = skimage.transform.resize(
-            depth_gt, self.dataset.full_res_shape[::-1], order=0, preserve_range=True, mode='constant')
+            depth_gt, self.dataset.full_res_shape, order=0, preserve_range=True, mode='constant')
         depth_gt = tf.constant(depth_gt, dtype=tf.float32)
         return depth_gt
 
-    def parse_helper_get_image(self, filepath, resized_to=(192, 640)):
+    def parse_helper_get_image(self, filepath):
         full_path = bytes.decode(filepath.numpy())
         file_root, file_name = os.path.split(full_path)
         image_idx, image_ext = file_name.split('.')
-        image_stack = [None] * len(self.frame_idx)    # 3 - training; 2 - evaluate pose; 1 - evaluate depth
+        image_stack = [None] * len(self.frame_idx)  # 3 - training; 2 - evaluate pose; 1 - evaluate depth
         tgt_path: str = None
         for i, f_i in enumerate(self.frame_idx):
             idx_num = int(image_idx) + f_i
@@ -104,25 +105,69 @@ class DataLoader(object):
                 image_name = ''.join(["{:010d}".format(idx_num), '.', image_ext])
             elif 'odom' in self.dataset.data_path:
                 image_name = ''.join(["{:06d}".format(idx_num), '.', image_ext])
+            elif 'custom' in self.dataset.data_path:
+                # Custom dataset
+                image_name = ''.join(["{:06d}".format(idx_num), '.', image_ext])
+            elif 'Challenge' in self.dataset.data_path:
+                image_name = ''.join(["{:03d}".format(idx_num), '.', image_ext])
             else:
                 raise NotImplementedError
             image_path = os.path.join(file_root, image_name)
             if f_i == 0:
                 tgt_path = image_path.replace('\\', '/')
+
             # Get images
             image_string = tf.io.read_file(image_path)
             image = tf.image.decode_jpeg(image_string)
             image = tf.image.convert_image_dtype(image, tf.float32)
-            image_stack[i] = tf.image.resize(image, resized_to)
+
+            # --------------------
+            # Extra modification for VelocityChallenge
+            # --------------------
+            if 'velocity' in self.dataset.name:
+                image = self.extra_mod_for_VelocityChallenge(image)
+
+            image_stack[i] = tf.image.resize(image, self.inp_size)
+
         output_imgs = tf.concat(image_stack, axis=2)
         return output_imgs, tgt_path
 
-    def parse_func_combined(self, filepath, resized_to=(192, 640)):
+    def extra_mod_for_VelocityChallenge(self, image):
+        """Extra preprocessing for Velocity Challenge dataset
+        The scene is too dim for detector, feature-extractor and depth net
+        -> crop_to_aspect_ratio: to fit (192, 640)
+        -> adjust gamma: to brighten scene
+        -> sharpen: to de-blur, strength of 3 or 5 are proper
+        """
+        image = self.crop_to_aspect_ratio(image)
+        image = tf.image.adjust_gamma(image, 0.6)
+        image = self.sharpen(image, strength=self.sharpen_factor)
+        return image
+
+    def sharpen(self, image, strength):
+        if self.sharpen_factor is not None:
+            scales = {3: -0.25, 5: -0.5, 9: -1}
+            kernel = np.ones(shape=(3, 3)) * scales[strength]
+            kernel[1, 1] = strength
+            image = cv.filter2D(image.numpy(), -1, kernel)
+        return image
+
+    def crop_to_aspect_ratio(self, image):
+        h, w = image.shape[:2]
+        asp_ratio = self.inp_size[1] / self.inp_size[0]   # W/H, usually 640/192
+        tolerance = 0.05
+        if abs(w / h - asp_ratio) > tolerance:
+            h_goal = int(w // asp_ratio)
+            h_start = int((h - h_goal) * 0.5)
+            image = image[h_start: h_start + h_goal, :w, :]
+        return image
+
+    def parse_func_combined(self, filepath):
         """Decode filenames to images
-        Givn one file, find the neighbors and concat to shape [192,640,9]
+        Givn one file, find the neighbors and concat to shape [H,W,3*3]
         """
         # parse images
-        output_imgs, tgt_path = self.parse_helper_get_image(filepath, resized_to)
+        output_imgs, tgt_path = self.parse_helper_get_image(filepath)
 
         # parse depth_gt
         depth_gt = None
@@ -139,8 +184,8 @@ class DataLoader(object):
             folder, file_idx, side = line.split()
             folder = folder.replace('/', '\\')
             path = self.dataset.get_image_path(folder, int(file_idx), side)
-            path = os.path.join(*(path.replace('/', '\\').split('\\')))
             if self.data_path.startswith('/'):
+                path = os.path.join(*(path.replace('/', '\\').split('\\')))
                 path = '/' + path
             file_path_all[i] = path
         if not os.path.isfile(file_path_all[0]):
@@ -182,9 +227,11 @@ class DataLoader(object):
 
     def has_depth_file(self):
         line = self.filenames[0].split()
-        scene_name = line[0].replace('/', '\\')
-        file_idx = int(line[1])
-
+        if len(line) > 1:
+            scene_name = line[0].replace('/', '\\')
+            file_idx = int(line[1])
+        else:
+            return False
         velo_filename = os.path.join(
             self.data_path,
             scene_name,
@@ -202,7 +249,7 @@ class DataLoader(object):
             print('\tLoading KITTI-Raw dataset, depth gt should be available')
 
     """ For experiments
-    
+
     def build_test_sequence(self):
         # check if the sequence is correct
         return self.build_combined_dataset(is_train=True, include_depth=False, drop_last=False, shuffle=False)
