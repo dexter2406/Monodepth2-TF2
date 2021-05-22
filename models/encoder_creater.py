@@ -1,12 +1,12 @@
 import tensorflow as tf
 from tensorflow.keras.layers import Conv2D, BatchNormalization, Activation, MaxPool2D, Dropout, Flatten, Dense
-
+from src.trainer_helper import unfreeze_models
 
 class BasicBlock_pad(tf.keras.layers.Layer):
 
     def __init__(self, filter_num, stride=1, padding_mode='reflect', block_id=-1, layer_id=-1):
         super(BasicBlock_pad, self).__init__()
-        padding_options = {'reflect': {'mode': 'CONSTANT', 'paddings': [[0, 0], [1, 1], [1, 1], [0, 0]]},
+        padding_options = {'reflect': {'mode': 'REFLECT', 'paddings': [[0, 0], [1, 1], [1, 1], [0, 0]]},
                            'constant': {'mode': 'CONSTANT', 'paddings': [[0, 0], [1, 1], [1, 1], [0, 0]]}}
         self.pad_1 = padding_options[padding_mode]
         padding = 'valid' if padding_mode != 'same' else 'same'
@@ -210,7 +210,7 @@ class ResNet18_new(tf.keras.Model):
         super(ResNet18_new, self).__init__()
         self.norm_inp = norm_inp
         padding = 'valid' if padding_mode != 'same' else 'same'
-        padding_options = {'reflect': {'mode': 'CONSTANT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]},
+        padding_options = {'reflect': {'mode': 'REFLECT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]},
                            'constant': {'mode': 'CONSTANT', 'paddings': [[0, 0], [3, 3], [3, 3], [0, 0]]}}
         self.pad_3 = padding_options[padding_mode]
 
@@ -239,7 +239,13 @@ class ResNet18_new(tf.keras.Model):
 
         return res_block
 
-    def call(self, inputs, training=None, mask=None):
+    def is_train(self, block_id, unfreeze_num, training):
+        if unfreeze_num is None:
+            return training
+        num_blocks = 5
+        return (num_blocks-block_id) <= unfreeze_num
+
+    def call(self, inputs, training=None, mask=None, unfreeze_num=None):
         if self.norm_inp:
             inputs = (inputs - 0.5) * 2
         outputs = []
@@ -247,28 +253,41 @@ class ResNet18_new(tf.keras.Model):
         x = tf.pad(inputs, **self.pad_3)
         # ----- PADDING -----
         x = self.conv1(x)
-        x = self.bn1(x, training=training)
+        x = self.bn1(x, training=self.is_train(0, unfreeze_num, training))
         x = self.a1(x)
         outputs.append(x)
         x = self.pool1(x)
-        x = self.layer1(x, training=training)
+        x = self.layer1(x, training=self.is_train(1, unfreeze_num, training))
 
         outputs.append(x)
-        x = self.layer2(x, training=training)
+        x = self.layer2(x, training=self.is_train(2, unfreeze_num, training))
         outputs.append(x)
-        x = self.layer3(x, training=training)
+        x = self.layer3(x, training=self.is_train(3, unfreeze_num, training))
         outputs.append(x)
-        x = self.layer4(x, training=training)
+        x = self.layer4(x, training=self.is_train(4, unfreeze_num, training))
         outputs.append(x)
-
         return outputs
+
+def unfreeze_all_to_save_model(model):
+    model.trainable = True
 
 
 if __name__ == '__main__':
     # set_weights_enc()
     # check_model("models/pose_encoder_one_input", keras=True, pb=False)
-    pose_encoder = build_pose_encoder_pair_input(verbose=False)
-    pose_encoder.summary()
-    tf.keras.models.save_model(pose_encoder, "models/pose_encoder")
+    # pose_encoder = build_pose_encoder_pair_input(verbose=False)
+    pose_encoder = ResNet18_new(norm_inp=True)
+    pose_encoder(tf.random.uniform(shape=(2,192,640,3)), training=True, unfreeze_num=1)
+    unfreeze_models(pose_encoder, 'pose_enc', num_unfrozen=1)
+    # pose_encoder.summary()
+    # unfreeze_models(pose_encoder, 'pose_enc', num_unfrozen=0)
+    unfreeze_all_to_save_model(pose_encoder)
+    pose_encoder.save_weights('test_.h5')
+
+    pose_encoder(tf.random.uniform(shape=(2, 192, 640, 3)))
+    # unfreeze_models(pose_encoder, 'pose_enc', num_unfrozen=1)
+    pose_encoder.load_weights('test_.h5')
+    a = 0
+    # tf.keras.models.save_model(pose_encoder, "models/pose_encoder")
 
 
