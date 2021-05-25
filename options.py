@@ -10,6 +10,12 @@ FLAGS = flags.FLAGS
 
 # For other datasets instead of kitti, settings below might need to be changed:
 # --feed_size --split velocity_challenge --dataset velocity --data_path F:/Dataset/VelocityChallenge
+flags.DEFINE_float('size_loss_w',       1e-5, 'use real-world object size as constraint to encourage '
+                                              'depth net not to ignore far-object, also to stabilize the global scale')
+flags.DEFINE_float('void_loss_w',       0, 'penalize the void patch when object speed similar to the camera')
+flags.DEFINE_float('global_scale',      30, 'global median scale for depth, according to KITTI eval')
+flags.DEFINE_boolean('enable_val_mask', False, ' (Not In Use) Use validity mask to mask out moving object')
+flags.DEFINE_boolean('enable_bbox',     False, 'Use bbox to add constraint on depthmap')
 flags.DEFINE_integer('sharpen_factor', None, 'sharpen the image in preprocessing')
 flags.DEFINE_integer('num_unf_de', None, 'how many layers of depth-encoder to frozen')
 flags.DEFINE_integer('num_unf_dd', None, 'how many layers of depth-decoder to frozen')
@@ -36,7 +42,7 @@ flags.DEFINE_string('weights_dir',      '',     'the folder that stores weights 
 flags.DEFINE_string('save_model_path',  '',     'path where weights are saved')
 flags.DEFINE_string('save_root',        '',     'another root path to store logs')
 flags.DEFINE_list('models_to_load',     all_models, 'load weights for specified models, by default all of them')
-flags.DEFINE_string('data_path',        r'F:\Dataset\kitti_raw', 'path that stores corresponding dataset')
+flags.DEFINE_string('data_path',        None, 'path that stores corresponding dataset')
 flags.DEFINE_string('dataset',          'kitti_raw', 'specify a dataset, choices from [\'kitti_raw\', \'kitti_odom\']')
 flags.DEFINE_bool('disable_gt',         False, 'disable ground truth')
 flags.DEFINE_string('model_name',       current_time, 'specify a dirname to collect weights')
