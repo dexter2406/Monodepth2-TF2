@@ -7,9 +7,19 @@ import matplotlib.pyplot as plt
 def view_options(opt):
     print('\n----- Viewing Options -----')
     # print('include reverse  ', opt.include_revers)
-    # print('exp_mode         ', opt.exp_mode)
+    print('exp_mode         ', opt.exp_mode)
+    print('feed size        ', opt.feed_size)
+    print('sharpen_factor   ', opt.sharpen_factor)
+    print("enable_val_mask (if any)", opt.enable_val_mask)
+    print("enable_bbox (if any)", opt.enable_bbox)
+    print("global_scale     ", opt.global_scale)
     print('depth inp normed ', opt.depth_norm_inp)
+    print('split            ', opt.split)
+    print('unfreeze de,dd,pe,pd', opt.num_unf_de, opt.num_unf_dd, opt.num_unf_pe, opt.num_unf_pd)
+    # print('ln_norm          ', opt.use_ln_norm)
+    # print('random crop?     ', opt.random_crop)
     print('learning rate    ', opt.learning_rate)
+    print('lr_step %d, lr_decay%d' % (opt.lr_step_size, opt.lr_decay))
     print('batch size       ', opt.batch_size)
     print('use_sampler_mask?', opt.use_sampler_mask)
     # print('padding_mode?    ', opt.padding_mode)
@@ -21,6 +31,8 @@ def view_options(opt):
     # print('out_pose_num     ', opt.pose_num)
     print('automasking      ', opt.do_automasking)
     print('\n')
+    print("size_loss_w (may not use)", opt.size_loss_w)
+    print("void_loss_w (may not use)", opt.void_loss_w)
     print('rot Wt, used?       ', opt.rot_loss_w, opt.add_rot_loss)
     print('reproj Wt            ', opt.reproj_loss_w)
     # print('depth loss, used?    ', opt.depth_loss_w, opt.add_depth_loss)
@@ -30,66 +42,133 @@ def view_options(opt):
     print('--------------------------\n')
 
 
-def is_val_loss_lowest(val_losses, val_losses_min, min_errors_thresh):
+def unfreeze_models(model, model_name:str, num_unfrozen):
+    if model_name == 'depth_dec':
+        model = unfreeze_depth_dec(model, num_unfrozen)
+    elif model_name == 'pose_dec':
+        total_num = 4
+        model = unfreeze_in_order(model, num_unfrozen, total_num)
+    elif 'enc' in model_name:
+        total_num = 8
+        model = unfreeze_in_order(model, num_unfrozen, total_num)
+    else:
+        raise ValueError('Can only choose from [depth_enc, depth_dec, depth_enc, pose_enc]'
+                         ', got {}'.format(model_name))
+    return model
+
+
+def unfreeze_in_order(model, num_unfrozen, total_num):
+    num_unfrozen = min(max(0, num_unfrozen), total_num)
+    for layer in model.layers[: -num_unfrozen]:
+        layer.trainable = False
+    for layer in model.layers[-num_unfrozen:]:
+        layer.trainable = True
+    return model
+
+
+def unfreeze_depth_dec(dep_dec, num_unfrozen):
+    """Freeze part of the depth-decoder from head
+    Args:
+        dep_dec: DepthDecoder Model, weights_loaded
+        num_unfrozen: number of unfrozen layers, from 0 to 5
+    Returns:
+        dep_dec with some layers frozen
+    """
+    if num_unfrozen <= 0:
+        return dep_dec
+
+    if num_unfrozen > 5:
+        print('depth decoder only has 5 layers to freeze, got {}'.format(num_unfrozen))
+        num_frozen = 5
+
+    idx = num_unfrozen - 1
+    for layer in dep_dec.layers:
+        unfrozen_layers = ['conv_0_%d' % idx, 'conv_1_%d' % idx, 'disp_%d' % idx]
+        if layer.name in unfrozen_layers:
+            print('frozen depth-dec layers:', layer.name)
+            layer.trainable = True
+        else:
+            layer.trainable = False
+    return dep_dec
+
+
+def is_val_loss_lowest(val_losses, val_losses_min, metric_names, has_depth=None):
     """save model when val loss hits new low"""
     # just update val_loss_min for the first time, do not save model
+    if has_depth is None:
+        has_depth = len(metric_names) != 0
+
+    # ------------------------
+    # Initialization, not save models, only record metrics
+    # ------------------------
     if val_losses_min['loss/total'] == 10:
         print('initialize self.val_loss_min, doesn\'t count')
         skip = True
         val_losses_min['loss/total'] = val_losses['loss/total']
-        for metric in min_errors_thresh:
+        for metric in metric_names:
             val_losses_min[metric] = val_losses[metric]
     else:
-        # directly skip when loss is not low enough
-        # if the loss is the new low, should at least 2 another metrics
-        tolerance = 0.01
-        num_pass_min = 2
+        # ------------------------
+        # - When no depth available, the condition is simple: loss must be lower than previous min
+        # - If depth is provided, give a soft tolerance
+        # ------------------------
         diff = val_losses['loss/total'] - val_losses_min['loss/total']
-        if diff < tolerance:
-            skip = True
-        else:
-            skip = False
-            # If has depth_gt, do some additional checks
-            if len(min_errors_thresh) != 0:
-                num_pass = 0
-                for metric in min_errors_thresh:
-                    if metric == 'da/a1':
-                        # for 'da/a1', argmax
-                        if val_losses[metric] > val_losses_min[metric]:
-                            num_pass += 1
-                    else:
-                        # for other metric, argmin
-                        if val_losses[metric] < val_losses_min[metric]:
-                            num_pass += 1
-                skip = num_pass < num_pass_min  # if no metric exceeds, decision will be override
+        tolerance = 0.005 if has_depth else 0
+        skip = diff > tolerance
 
-            if not skip:
-                print('val loss hits new low!')
-                val_losses_min['loss/total'] = val_losses['loss/total']
-                for metric in min_errors_thresh:
-                    val_losses_min[metric] = val_losses[metric]
+        # -------------------
+        # If depth is provided, at least 3 out of following metrics exceed new best
+        # - 'da/a1': argmax
+        # - 'da/a2' and 'da/a3': ignored
+        # - others: argmin
+        # ------------------
+        if has_depth:
+            num_pass_min = 3
+            num_pass = 0
+            for metric in metric_names:
+                if metric == 'da/a1':
+                    if val_losses[metric] > val_losses_min[metric]:
+                        num_pass += 1
+                if metric in ['da/a2', 'da/a3']:
+                    continue
+                else:
+                    # for other metric, argmin
+                    if val_losses[metric] < val_losses_min[metric]:
+                        num_pass += 1
+            skip = num_pass < num_pass_min  # if metrics not good enough, override the decision
+        # ------------------------------
+        # Update losses and metrics if save model
+        # ------------------------------
+        if not skip:
+            print('val loss hits new low!')
+            val_losses_min['loss/total'] = val_losses['loss/total']
+            for metric in metric_names:
+                val_losses_min[metric] = val_losses[metric]
 
     return not skip, val_losses_min
 
 
-def build_models(models_dict, check_outputs=False, show_summary=False):
+def build_models(models_dict, inp_shape, check_outputs=False, show_summary=False):
     print("->Building models")
+    h, w = inp_shape
+    shapes = [[2, 96, 320, 64], [2, 48, 160, 64], [2, 24, 80, 128], [2, 12, 40, 256], [2, 6, 20, 512]]
+    for i, sh in enumerate(shapes):
+        sh[1], sh[2] = h // 2**(i+1), w // 2**(i+1)
+
     for k, m in models_dict.items():
         print("\t%s" % k)
         if "depth_enc" == k:
-            inputs = tf.random.uniform(shape=(1, 192, 640, 3))
+            inputs = tf.random.uniform(shape=(2, h, w, 3))
             outputs = m(inputs)
         elif "depth_dec" == k:
-            shapes = [(1, 96, 320, 64), (1, 48, 160, 64), (1, 24, 80, 128), (1, 12, 40, 256), (1, 6, 20, 512)]
             inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
             outputs = m(inputs)
         elif "pose_enc" == k:
-            shape = (1, 192, 640, 3)
+            shape = (2, h, w, 3)
             inputs = tf.concat([tf.random.uniform(shape=shape),
                                 tf.random.uniform(shape=shape)], axis=3)
             outputs = m(inputs)
         elif "pose_dec" == k:
-            shapes = [(1, 96, 320, 64), (1, 48, 160, 64), (1, 24, 80, 128), (1, 12, 40, 256), (1, 6, 20, 512)]
             inputs = [tf.random.uniform(shape=(shapes[i])) for i in range(len(shapes))]
             outputs = m(inputs)
         else:
@@ -134,40 +213,36 @@ def SSIM(x, y):
 
 def compute_depth_errors(gt, pred):
     """Computation of error metrics between predicted and ground truth depths
-    Not in use for now
+    "de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms",
+    "da/a1", "da/a2", "da/a3"
     """
+    losses = {}
     # 1 - percentile
-    thresh = tf.math.maximum((gt / pred), (pred / gt))
-    a = [None] * 3
-    for i in range(len(a)):
-        a[i] = tf.reduce_mean(tf.cast(
-            thresh < 1.25**(i+1), dtype=tf.float32)
-        )
     # a1 = (thresh < 1.25     ).float().mean()
     # a2 = (thresh < 1.25 ** 2).float().mean()
     # a3 = (thresh < 1.25 ** 3).float().mean()
-
+    thresh = tf.math.maximum((gt / pred), (pred / gt))
+    for i in range(1, 4):
+        losses['da/a%d' % i] = tf.reduce_mean(tf.cast(
+            thresh < 1.25**(i+1), dtype=tf.float32)
+        )
     # 2 - rooted mean squared error
-    rmse = tf.math.sqrt(tf.reduce_mean(
-        (gt - pred) ** 2
-    ))
-
+    losses['de/rms'] = tf.math.sqrt(
+        tf.reduce_mean((gt - pred) ** 2)
+    )
     # 3 - log rmse
-    # rmse_log = (tf.math.log(gt) - tf.math.log(pred)) ** 2
-    # rmse_log = tf.math.sqrt(rmse_log.mean())
-    rmse_log = tf.math.sqrt(tf.reduce_mean(
+    losses['de/log_rms'] = tf.math.sqrt(tf.reduce_mean(
         (tf.math.log(gt) - tf.math.log(pred)) ** 2
     ))
-
     # 4 - absolute relative error
-    abs_rel = tf.reduce_mean(tf.abs(gt - pred) / gt)
+    losses['de/abs_rel'] = tf.reduce_mean(tf.abs(gt - pred) / gt)
     # 5 - squared relative error
-    sq_rel = tf.reduce_mean((gt - pred) ** 2 / gt)
+    losses['de/sq_rel'] = tf.reduce_mean((gt - pred) ** 2 / gt)
 
-    return abs_rel, sq_rel, rmse, rmse_log, a[0], a[1], a[2]
+    return losses
 
 
-def colorize(value, vmin=None, vmax=None, cmap=None):
+def colorize(value, vmin=None, vmax=None, cmap=None, expand_dim=False):
     # normalize
     vmin = tf.reduce_min(value) if vmin is None else vmin
     vmax = tf.reduce_max(value) if vmax is None else vmax
@@ -180,6 +255,8 @@ def colorize(value, vmin=None, vmax=None, cmap=None):
     cm = matplotlib.cm.get_cmap(cmap if cmap is not None else 'gray')
     colors = tf.constant(cm.colors, dtype=tf.float32)
     value = tf.gather(colors, indices)
+    if expand_dim and len(value.shape) == 3:
+        value = tf.expand_dims(value, 0)
     return value
 
 
@@ -206,7 +283,7 @@ class Project3D:
         pix_coords = cam_points[:, :2, :] / (tf.expand_dims(cam_points[:, 2, :], axis=1) + self.eps)
         pix_coords = tf.reshape(pix_coords, (points.shape[0], 2, self.height, self.width))
         pix_coords = tf.transpose(pix_coords, [0, 2, 3, 1])
-
+        # print("pix_coords_Project3d", pix_coords.shape)
         pix_coords_0 = pix_coords[..., 0]
         pix_coords_1 = pix_coords[..., 1]
         tensor_w = tf.ones_like(pix_coords_0) * (self.width - 1)
@@ -248,11 +325,74 @@ class BackProjDepth:
         if batch_size != self.pix_coords.shape[0]:
             pix_coords = tf.slice(pix_coords, [0, 0, 0], [batch_size, -1, -1])
             ones = tf.slice(ones, [0, 0, 0], [batch_size, -1, -1])
+        # print("depth", depth.shape)
+        # print("pix_coords", pix_coords.shape)
         cam_points = tf.matmul(inv_K[:, :3, :3], pix_coords)
+        # print("cam_points", cam_points.shape)
         cam_points = tf.reshape(depth, (batch_size, 1, -1)) * cam_points
         cam_points = tf.concat([cam_points, ones], 1)
         return cam_points
 
+
+def back_proj_depth(depth, inv_K, shape, scale):
+    """Layer to transform a depth image into a point cloud
+    shape_s: scaled shapes, corresponds to scales = [0,1,2,3]
+    """
+
+    batch_size, height, width, _ = shape
+    height, width = height // (2**scale), width // (2**scale)
+
+    meshgrid = tf.meshgrid(range(width), range(height), indexing='xy')
+    id_coords = tf.stack(meshgrid, axis=0)
+    ones = tf.ones((batch_size, 1, height * width), dtype=tf.int32)
+
+    pix_coords = tf.expand_dims(
+        tf.stack([tf.reshape(id_coords[0], [-1]),
+                  tf.reshape(id_coords[1], [-1])], 0), 0)
+    # - tile/repeat
+    multiples = tf.constant([batch_size, 1, 1])
+    pix_coords = tf.tile(pix_coords, multiples)
+
+    pix_coords = tf.concat([pix_coords, ones], 1)
+    pix_coords = tf.cast(pix_coords, tf.float32)
+
+    ones = tf.cast(ones, tf.float32)
+    cam_points = tf.matmul(inv_K[:, :3, :3], pix_coords)
+    cam_points = tf.reshape(depth, (batch_size, 1, -1)) * cam_points
+    cam_points = tf.concat([cam_points, ones], 1)
+    return cam_points
+
+
+def project_3d(points, K, T, shape, scale):
+    """Layer which projects 3D points into a camera with intrinsics K and at position T
+    """
+    # K = tf.cast(K, tf.float32)
+
+    batch_size, height, width, _ = shape
+    height, width = height // (2 ** scale), width // (2 ** scale)
+    eps = 1e-7
+
+    P = tf.matmul(K, T)[:, :3, :]
+
+    cam_points = tf.matmul(P, points)
+
+    pix_coords = cam_points[:, :2, :] / (tf.expand_dims(cam_points[:, 2, :], axis=1) + eps)
+    pix_coords = tf.reshape(pix_coords, (batch_size, 2, height, width))
+    pix_coords = tf.transpose(pix_coords, [0, 2, 3, 1])
+
+    pix_coords_0 = pix_coords[..., 0]
+    pix_coords_1 = pix_coords[..., 1]
+    tensor_w = tf.ones_like(pix_coords_0) * (width - 1)
+    tensor_h = tf.ones_like(tensor_w) * (height - 1)
+    pix_coords_0 = tf.expand_dims(pix_coords_0 / tensor_w, axis=-1)
+    pix_coords_1 = tf.expand_dims(pix_coords_1 / tensor_h, axis=-1)
+
+    pix_coords = tf.concat([pix_coords_0, pix_coords_1], axis=-1)
+    # pix_coords[..., 0] /= width - 1
+    # pix_coords[..., 1] /= height - 1
+    # pix_coords = tf.convert_to_tensor(pix_coords, dtype=tf.float32)
+    pix_coords = (pix_coords - 0.5) * 2
+    return pix_coords
 
 def make_transform_mats(axisangles, translations, invert=False):
     # todo: add this loss to train Pose Decoder
@@ -313,7 +453,7 @@ def rotation_consistency_loss(transform_mats):
     def mean_square(x):
         return tf.reduce_sum(tf.square(x), axis=(1, 2))
     M, M_inv = transform_mats
-    R_12, R_21 = M[:,:3,:3], M_inv[:,:3,:3]
+    R_12, R_21 = M[:, :3, :3], M_inv[:, :3, :3]
     R_unit = tf.matmul(R_21, R_12)    # R2R1, shape (B,3,3)
     eye = tf.eye(3, batch_shape=R_12.shape[:1])
 
@@ -572,29 +712,47 @@ def make_intrinsics_matrix(fx, fy, cx, cy):
     return intrinsics
 
 
-def show_images(inputs, outputs):
-    tgt = inputs[('color', 0, 0)][i].numpy()
+def show_images(input_imgs, outputs):
+    f_i = 1
+    img_c = input_imgs[('color', 0, 0)][0].numpy()
+    img_n2c = outputs[('color', f_i, 0)][0]
+    # depth_gt = input_imgs[('depth_gt', 0, 0)][0]
+    # sampler_mask_nc = outputs[('sampler_mask', f_i, 0)][0]
+
+    masked_c = input_imgs[('val_mask', 0, 0)][0] * img_c
     inps_col1 = [
-        # disp_n,
-        # transformed_dmap_n,
-        # disp_p,
-        # transformed_dmap_p,
-        # src_data,
-        # inputs[('color', 1, 0)][0]
+        img_c,
+        masked_c,
+        img_n2c,
     ]
     inps_col2 = [
-
     ]
+    arrange_display_images(inps_col1, inps_col2)
+
+
+def arrange_display_images(inps_col1, inps_col2=()):
     num_rows = max(len(inps_col1), len(inps_col2))
-    fig = plt.figure(figsize=(num_rows, 2, 1))
-    for i in range(num_rows):
+    for i in range(len(inps_col1)):
+        if inps_col1[i].shape == 4:
+            inps_col1[i] = inps_col1[i][0]
+    for j in range(len(inps_col2)):
+        if inps_col2[j].shape == 4:
+            inps_col2[j] = inps_col2[j][0]
+    fig = plt.figure(figsize=(num_rows, 2))
+    for i in range(len(inps_col1)):
         print(i)
         fig.add_subplot(num_rows, 2, 2*i + 1)
-        plt.imshow(inps_col1[i])
-    for i in range(num_rows):
+        data = inps_col1[i]
+        if len(data.shape) == 4:
+            data = data[0]
+        plt.imshow(data)
+    for i in range(len(inps_col2)):
         print(i)
         fig.add_subplot(num_rows, 2, 2*i + 2)
-        plt.imshow(inps_col2[i])
+        data = inps_col2[i]
+        if len(data.shape) == 4:
+            data = data[0]
+        plt.imshow(data)
     plt.show()
 
 
