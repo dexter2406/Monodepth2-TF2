@@ -19,7 +19,7 @@ class DataLoader(object):
         self.batch_size = batch_size
         self.buffer_size = 1000  # todo: how to set good buffer size?
         self.frame_idx = frame_idx
-        self.K = self.dataset.K
+        self.K = self.dataset.K     # 4,4
         self.steps_per_epoch: int = None
         self.filenames: list = None
         self.num_items: int = None
@@ -27,8 +27,11 @@ class DataLoader(object):
         self.data_path = self.dataset.data_path
         self.include_depth = None
         self.has_depth = self.has_depth_file()
+        self.include_bbox = False
+        self.has_bbox = self.has_bbox_file()
         self.inp_size = inp_size
         self.sharpen_factor = sharpen_factor
+        self.h_range_crop = self.get_valid_h_range()
 
     def read_filenames(self):
         # e.g. splits\\eigen_zhou\\train.txt
@@ -37,19 +40,20 @@ class DataLoader(object):
         self.num_items = len(self.filenames)
         self.steps_per_epoch = self.num_items // self.batch_size
 
-    def build_train_dataset(self, buffer_size=None):
-        return self.build_combined_dataset(include_depth=False, num_repeat=self.num_epoch, buffer_size=buffer_size)
+    def build_train_dataset(self, buffer_size=None, include_bbox=True):
+        return self.build_combined_dataset(include_depth=False, num_repeat=self.num_epoch,
+                                           buffer_size=buffer_size, include_bbox=include_bbox)
 
-    def build_val_dataset(self, include_depth, buffer_size, shuffle):
+    def build_val_dataset(self, include_depth, buffer_size, shuffle, include_bbox=True):
         return self.build_combined_dataset(include_depth=include_depth, num_repeat=None,
-                                           buffer_size=buffer_size, shuffle=shuffle)
+                                           buffer_size=buffer_size, shuffle=shuffle, include_bbox=include_bbox)
 
     def build_eval_dataset(self):
         # todo: verify file numbers, num_repeat=??
         return self.build_combined_dataset(include_depth=False, num_repeat=1,
-                                           shuffle=False, drop_last=False)
+                                           shuffle=False, drop_last=False, include_bbox=True)
 
-    def build_combined_dataset(self, include_depth, num_repeat,
+    def build_combined_dataset(self, include_depth, num_repeat, include_bbox=False,
                                drop_last=True, shuffle=True, buffer_size=None):
         # Data path
         data = self.collect_image_files()
@@ -63,7 +67,10 @@ class DataLoader(object):
             self.include_depth = False
             warnings.warn('Cannot use depth gt, because no available depth file found')
         # the outputs are implicitly handled by 'out_maps'
-        out_maps = [tf.float32, tf.float32] if self.include_depth else tf.float32
+        out_maps = [tf.float32, tf.float32] if self.include_depth else [tf.float32]
+        if include_bbox and self.has_bbox:
+            self.include_bbox = True
+            out_maps.append(tf.int32)
         dataset = dataset.map(lambda x: tf.py_function(self.parse_func_combined, [x], Tout=out_maps),
                               num_parallel_calls=tf.data.experimental.AUTOTUNE)
         # ----------
@@ -97,7 +104,9 @@ class DataLoader(object):
         file_root, file_name = os.path.split(full_path)
         image_idx, image_ext = file_name.split('.')
         image_stack = [None] * len(self.frame_idx)  # 3 - training; 2 - evaluate pose; 1 - evaluate depth
+        ext_bboxes = []
         tgt_path: str = None
+
         for i, f_i in enumerate(self.frame_idx):
             idx_num = int(image_idx) + f_i
             idx_num = max(0, idx_num)
@@ -108,7 +117,7 @@ class DataLoader(object):
             elif 'custom' in self.dataset.data_path:
                 # Custom dataset
                 image_name = ''.join(["{:06d}".format(idx_num), '.', image_ext])
-            elif 'Challenge' in self.dataset.data_path:
+            elif 'Velocity' in self.dataset.data_path:
                 image_name = ''.join(["{:03d}".format(idx_num), '.', image_ext])
             else:
                 raise NotImplementedError
@@ -121,6 +130,13 @@ class DataLoader(object):
             image = tf.image.decode_jpeg(image_string)
             image = tf.image.convert_image_dtype(image, tf.float32)
 
+            # ---------------------------
+            # get bboxes, one for val_mask, one for far_object
+            # ---------------------------
+            if self.include_bbox:
+                ext_bboxes.append(
+                    self.derive_bbox_path_from_img(image_path))
+
             # --------------------
             # Extra modification for VelocityChallenge
             # --------------------
@@ -129,8 +145,8 @@ class DataLoader(object):
 
             image_stack[i] = tf.image.resize(image, self.inp_size)
 
-        output_imgs = tf.concat(image_stack, axis=2)
-        return output_imgs, tgt_path
+        output_imgs = tf.concat(image_stack, axis=2)    # B,H,W,9
+        return output_imgs, tgt_path, ext_bboxes
 
     def extra_mod_for_VelocityChallenge(self, image):
         """Extra preprocessing for Velocity Challenge dataset
@@ -139,7 +155,7 @@ class DataLoader(object):
         -> adjust gamma: to brighten scene
         -> sharpen: to de-blur, strength of 3 or 5 are proper
         """
-        image = self.crop_to_aspect_ratio(image)
+        image = self.center_crop_image_to_asp_r(image)
         image = tf.image.adjust_gamma(image, 0.6)
         image = self.sharpen(image, strength=self.sharpen_factor)
         return image
@@ -152,29 +168,93 @@ class DataLoader(object):
             image = cv.filter2D(image.numpy(), -1, kernel)
         return image
 
-    def crop_to_aspect_ratio(self, image):
-        h, w = image.shape[:2]
+    def get_valid_h_range(self):
+        """Get starting and ending points in height axis, in case there is center cropping
+        -> if aspect ratio not aligned with self.inp_size, do center crop
+        -> if not, return original range [0, h+1)
+        """
+        h, w = self.dataset.full_res_shape
         asp_ratio = self.inp_size[1] / self.inp_size[0]   # W/H, usually 640/192
         tolerance = 0.05
         if abs(w / h - asp_ratio) > tolerance:
             h_goal = int(w // asp_ratio)
-            h_start = int((h - h_goal) * 0.5)
-            image = image[h_start: h_start + h_goal, :w, :]
+            offset = int((h - h_goal) / 2)
+            h_end = offset + h_goal + 1
+        else:
+            offset = 0
+            h_end = h + 1
+        return [offset, h_end]
+
+    def center_crop_image_to_asp_r(self, image):
+        offset, h_end = self.h_range_crop
+        image = image[offset: h_end, :, :]
         return image
+
+    def adapt_bbox_for_center_crop(self, bboxes):
+        """Crop bbox so that is doesn't exceed boundary in center-cropped image
+        Args:
+            bboxes: list, (B, 4)
+                l, t, r, b
+                max and min box, for validity_mask and depth_constraint respectively
+        Returns:
+            modified bbox, adapted to the image boundary after ceter-crop
+        """
+        offset, h_end = self.h_range_crop
+        bboxes = np.asarray(bboxes)
+        # bboxes[:, 1] = np.maximum((bboxes[:, 1]), offset)
+        # bboxes[:, 3] = np.minimum((bboxes[:, 3]), h_end)
+        # bboxes[:, 3] = np.maximum(bboxes[:, 3], 0)
+        # print("boxes before", bboxes)
+        for i in range(len(bboxes)):
+            if np.sum(bboxes[i]) != 0:
+                bboxes[i, 1] = np.maximum((bboxes[i, 1]), offset)
+                bboxes[i, 3] = np.minimum((bboxes[i, 3]), h_end)
+        # print("boxes after", bboxes)
+        return bboxes
 
     def parse_func_combined(self, filepath):
         """Decode filenames to images
         Givn one file, find the neighbors and concat to shape [H,W,3*3]
         """
         # parse images
-        output_imgs, tgt_path = self.parse_helper_get_image(filepath)
+        output_imgs, tgt_path, ext_bboxes = self.parse_helper_get_image(filepath)
+        outs = [output_imgs]
 
-        # parse depth_gt
-        depth_gt = None
+        # include bbox
+        if len(ext_bboxes) > 0:
+            outs.append(tf.concat(ext_bboxes, axis=0))  # B,2,4
+
+        # parse and generate depth_gt
         if self.include_depth:
             depth_gt = self.parse_helper_get_depth(tgt_path)
+            outs.append(depth_gt)
+        # for o in outs:
+        #     print(o.shape)
+        return outs
 
-        return output_imgs, depth_gt
+    def derive_bbox_path_from_img(self, img_str):
+        """Derive the path of depth values acoording to the image path. Just replace the extension to 'txt
+        E.g. F:\\Dataset\\kitti_raw\\2011_10_03\\2011_10_03_drive_0034_sync\\image_02\\data\0000003025.jpg
+        ->  ~.txt
+        """
+        bbox_path = img_str.replace('jpg', 'txt')
+        bboxes = []
+        with open(bbox_path, 'r') as df:
+            for i in range(2):
+                bboxes.append(list(map(int, df.readline().split())))
+        assert len(bboxes) == 2 and len(bboxes[0]) == 4, \
+            "Bbox list should have size of (2, 4), got ({}, {})".format(len(bboxes), len(bboxes[0]))
+        # print("bboxes before", bboxes)
+        bboxes = self.adapt_bbox_for_center_crop(bboxes)    # np
+        bboxes = self.scale_box_to_feed_size(bboxes)
+        return bboxes
+
+    def scale_box_to_feed_size(self, bboxes):
+        """Scale the cropped bboxes to fit feed_size of network"""
+        scaling = [self.dataset.full_res_shape[i] / self.inp_size[i] for i in range(2)]
+        bboxes[..., [1, 3]] = bboxes[..., [1, 3]] // scaling[0]   # height
+        bboxes[..., [0, 2]] = bboxes[..., [0, 2]] // scaling[1]   # width
+        return bboxes
 
     def collect_image_files(self):
         """extract info from split, converted to file path"""
@@ -224,6 +304,11 @@ class DataLoader(object):
         depth_full_path = os.path.join(self.data_path, folder_path, file_path)
         calib_path = os.path.join(self.data_path, img_str_split[-5])
         return calib_path, depth_full_path, side
+
+    def has_bbox_file(self):
+        scene_name, file_idx, _ = self.filenames[0].replace('\\', '/').split()
+        bbox_filname = os.path.join(self.data_path, scene_name, file_idx + '.txt').replace('\\', '/')
+        return os.path.isfile(bbox_filname)
 
     def has_depth_file(self):
         line = self.filenames[0].split()
