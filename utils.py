@@ -6,6 +6,49 @@ import tensorflow as tf
 rootdir = os.path.dirname(__file__)
 
 
+def dilate_box(box):
+    """dilate one single box to ensure coverage
+    """
+    offset_ratio = [-1, 0.5]     # up/down. left/right direction
+    dilate_factor = [0.4, -0.2]     # in H, W direction, respectively
+    box = tf.cast(box, tf.float32)
+
+    h_new = (box[3] - box[1]) * dilate_factor[0]
+    box_t = box[1] - h_new * offset_ratio[0]
+    box_b = box[3] + h_new * (1-offset_ratio[0])
+
+    w_new = (box[2] - box[0]) * dilate_factor[1]
+    box_l = box[0] - w_new * offset_ratio[1]
+    box_r = box[2] + w_new * (1-offset_ratio[1])
+    out = list(map(int, [box_l, box_t, box_r, box_b]))
+    return out
+
+def merge_boxes(boxes1, boxes2):
+    """merge boxes1 and boxes2
+    Args:
+        boxes1: Tensor, shape (B, 4) or (4, ), box batch
+        boxes2: same as boxes1
+    Returns:
+        a box with merged area
+    """
+    def make_batch_dim(x):
+        if isinstance(x, (tuple, list)):
+            x = tf.constant(x)
+        if len(x.shape) == 1:
+            x = tf.expand_dims(x, 0)
+        return x
+    boxes1 = make_batch_dim(boxes1)
+    boxes2 = make_batch_dim(boxes2)
+
+    boxes = tf.stack([boxes1, boxes2], axis=-2)  # (.,2,4)
+    box_min = tf.transpose(
+        tf.reduce_min(tf.transpose(boxes), axis=-2, keepdims=True)[:2])  # (.,1,4)
+    box_max = tf.transpose(
+        tf.reduce_max(tf.transpose(boxes), axis=-2, keepdims=True)[2:])
+    box_merged = tf.concat([box_min, box_max], axis=-1)  # (.,4)
+    return tf.squeeze(box_merged)
+
+
 def crop_to_aspect_ratio(image, feed_size):
     h, w = image.shape[:2]
     asp_ratio = feed_size[1] / feed_size[0]   # W/H, usually 640/192
