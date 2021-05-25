@@ -1,23 +1,27 @@
 import tensorflow as tf
 import numpy as np
 import tensorflow_addons as tfa
+from utils import *
+
 
 class DataProcessor(object):
-    def __init__(self, frame_idx, inp_size, intrinsics=None, num_scales=4, disable_gt=False, dataset_name=None):
-        self.dataset_name = dataset_name
+    def __init__(self, frame_idx, feed_size, intrinsics=None, num_scales=4,
+                 disable_gt=False, dataset=None):
+        self.dataset_name = dataset.name
         self.disable_gt = disable_gt
         self.num_scales = num_scales     # for evaluation, 1
-        self.height, self.width = inp_size
+        self.height, self.width = feed_size
         self.frame_idx = frame_idx
         self.batch_size = -1
         self.K = intrinsics
-        self.brightness = 0.25
+        self.brightness = 0.3
         self.sature_contrast = 0.2
-        self.hue = 0.1
+        self.hue = 0.15
         self.asp_ratio = self.width / self.height
         self.usual_asp_ratios : tuple = None
         self.asp_ratio_probs = None
         self.init_asp_ratio_probs()
+        self.raw_size = dataset.full_res_shape
 
     def init_asp_ratio_probs(self):
         # https://en.wikipedia.org/wiki/Aspect_ratio_(image)
@@ -38,45 +42,205 @@ class DataProcessor(object):
         self.disable_gt = True
 
     def prepare_batch(self, batch, is_train, random_crop=False):
-        """Apply augmentation
-        tgt_batch: ndarray
-            - [<Batch>, height, width, 3], for original monodepth2 (192, 640)
-        src_batch: ndarray:
-            - [<Batch>, height, width, 6]
+        """Prepare batch data
 
         Outputs: raw and augmented data, stored in dictionary
         Dictionary keys:
         ("color", <frame_id>, <scale>)          for raw colour images,
         ("color_aug", <frame_id>, <scale>)      for augmented colour images,
         ("K", scale) or ("inv_K", scale)        for camera intrinsics,
+        ('val_mask', 0, 0)                      to mask out moving object for pose input and reprojection loss
+        ('far_bbox', 0, 0)                      to put constraint on disp/depth map for small object
         ------- Examples -------
         tgt_image = inputs['color', 0, 0]
         src_image_stack_aug = inputs['color_aug', 1:, :]
         tgt_image_pyramid = inputs['color, 0, :]
         intrinsics_scale_0 = inputs[('K', 0)]
         """
-        batch_imgs, depth_gt, ext_K = self.decompose_inputs(batch)
+        batch_imgs, depth_gt, ext_bbox = self.decompose_inputs(batch)
         do_color_aug = is_train and np.random.random() > 0.5
         # due to tf.function, better explicitly pass the parameter
         inputs = self.process_imgs(batch_imgs, random_crop, do_color_aug, depth_gt=depth_gt)
-
-        # todo: how to deal with tf.function
-        if ext_K is None:
-            input_Ks = self.make_K_pyramid_fast(batch_imgs.shape[0])
-        else:
-            input_Ks = self.make_K_pyramid_normal(ext_K)
+        input_Ks = self.make_K_pyramid(batch_imgs.shape[0])
+        inputs.update(self.process_ext_bboxes(ext_bbox))
         return inputs, input_Ks
+
+    def process_ext_bboxes(self, ext_bbox):
+        """Handle the external bboxes
+        -> if not available, store as None
+        -> if available but the box doesn't exit, make sure it's [0, 0, 0, 0]*6
+        """
+        inputs = {}
+        if ext_bbox is not None:
+            inputs[('val_mask', 0, 0)] = self.create_validity_mask(ext_bbox)
+            inputs.update(self.collect_min_box(ext_bbox))
+        else:
+            inputs[('val_mask', 0, 0)] = None
+            for f_i in self.frame_idx:
+                inputs[('far_bbox', f_i, 0)] = None
+        return inputs
+
+    def collect_min_box(self, ext_bbox):
+        """collect box wiht minimum size to put constrain on far object
+        The identities of the boxes are not necessarily be the same, unlike validity_mask
+        Args:
+            ext_bbox: Tensor, (B,6,4)
+                box convention: left, top, right, bottom
+                [B,:3,:], [B,3:] are max and min bboxes respectively, only the [B,3:] used here,
+                representing boxes in prev, curr and next frame, respectively.
+        """
+
+        inputs = {('far_bbox', 0, 0):   tf.expand_dims(ext_bbox[:, :2], 1),
+                  ('far_bbox', -1, 0):  tf.expand_dims(ext_bbox[:, 2:4], 1),
+                  ('far_bbox', 1, 0):   tf.expand_dims(ext_bbox[:, 4:], 1)}
+        return inputs
+
+    def create_validity_mask(self, ext_bbox):
+        """Create validity mask using bboxes in the triplet
+        -> Rough judge if they are the same identity by IoU
+        -> Select bbox(es), merge and create mask in the background with size of self.inp_size
+        Note: the boxes doesn't necessarily represent the same identity, thus we have to do post processing
+            to see how to make use of them
+        Args:
+            ext_bbox: Tensor, (B,6,4)
+                box convention: left, top, right, bottom
+                [B,:3,:], [B,3:] are max and min bboxes respectively, only the [B,:3] used here,
+                representing boxes in prev, curr and next frame, respectively.
+        Returns:
+            inputs: dict with key ('val_mask',0,0)
+                 shape (B, *inp_size)
+        """
+        boxes = ext_bbox[:, :3].numpy()
+        boxes = self.dilate_boxes(boxes)
+        box_merged = self.get_merged_box(boxes)
+        val_mask = self.place_box_on_background(box_merged)
+        if len(val_mask.shape) == 3 and val_mask.shape[-1] != 1:
+            val_mask = tf.expand_dims(val_mask, -1)
+        return val_mask
+
+    def dilate_boxes(self, boxes):
+        """dilate boxes to ensure coverage
+        """
+        offset_ratio = [0.15, 0.4]     # up/down. left/right direction
+        dilate_factor = [1.1, 0.7]     # in H, W direction, respectively
+        boxes = boxes.astype(np.float32)
+
+        heights = (boxes[..., 3] - boxes[..., 1]) * dilate_factor[0]
+        boxes[..., 1] -= heights * offset_ratio[0]
+        boxes[..., 3] += heights * (1-offset_ratio[0])
+
+        widths = (boxes[..., 2] - boxes[..., 0]) * dilate_factor[1]
+        boxes[..., 0] -= widths * offset_ratio[1]
+        boxes[..., 2] += widths * (1-offset_ratio[1])
+        return boxes.astype(np.int32)
+
+    def place_box_on_background(self, box):
+        batch_size = box.shape[0]
+        val_mask = np.ones(shape=(batch_size, self.height, self.width), dtype=np.float32)
+        for b in range(batch_size):
+            val_mask[b, box[b, 1]: box[b, 3], box[b, 0]: box[b, 2]] = 0.
+        return val_mask
+
+    def get_merged_box(self, box_batch):
+        """Merge intersected boxes, if no intersection, choose the largest one
+        Args:
+            box_batch: Tensor, shape (B,3,4)
+        """
+        batch_size, frame_num = box_batch.shape[:2]
+        # ------------------------
+        # Batch IoU, pair-wise comparison
+        # each (B,1) for prev-curr, curr-next or next-prev
+        # ------------------------
+        IOUs = []
+        for f_i in range(frame_num):
+            boxes1, boxes2 = box_batch[:, f_i], box_batch[:, (f_i+1) % 3]   # compare 01, 12, 20
+            iou_pair = self.batch_iou(boxes1, boxes2)                   # (B,1)
+            IOUs.append(iou_pair)                                       # [(B,1), (B,1), (B,1)]
+        # ------------------------
+        # One batch has 3 boxes, thus shape (B,3,4)
+        # Merge 3 boxes in to one, then stack back to batch_size, namely (B,4)
+        # We have to see run over each triplets, so this cannot be batch-processed
+        # ------------------------
+        merged_boxes = []
+        for b in range(batch_size):
+            boxes = box_batch[b]
+            box_merged = None
+            # -------------------------
+            # list of (B,3*1), meaning each box for prev, curr and next frame
+            # -------------------------
+            box_areas = []
+            for f_i in range(frame_num):
+                box1, box2 = boxes[f_i], boxes[(f_i + 1) % 3]
+                iou = IOUs[f_i][b]
+                box_w = boxes[f_i, 2] - boxes[f_i, 0]
+                box_h = boxes[f_i, 3] - boxes[f_i, 1]
+                box_areas.append(box_w*box_h)
+                if iou > 0.2:
+                    box_merged_tmp = merge_boxes(box1, box2)
+                    if box_merged is None:
+                        box_merged = box_merged_tmp
+                    else:
+                        box_merged = merge_boxes(box_merged, box_merged_tmp)    # (4,)
+            if box_merged is None:
+                box_merged = boxes[tf.argmax(box_areas)]
+                box_merged = tf.squeeze(tf.constant(box_merged))
+            merged_boxes.append(box_merged)
+
+        merged_boxes = np.stack(merged_boxes)  # (B,4)
+        return merged_boxes
+
+    def batch_iou(self, a, b, epsilon=1e-5):
+        """ Given two arrays `a` and `b` where each row contains a bounding
+            box defined as a list of four numbers:
+                [x1,y1,x2,y2]
+            where:
+                x1,y1 represent the upper left corner
+                x2,y2 represent the lower right corner
+            It returns the Intersect of Union scores for each corresponding
+            pair of boxes.
+
+        Args:
+            a:          (numpy array) each row containing [x1,y1,x2,y2] coordinates
+            b:          (numpy array) each row containing [x1,y1,x2,y2] coordinates
+            epsilon:    (float) Small value to prevent division by zero
+
+        Returns:
+            (numpy array) The Intersect of Union scores for each pair of bounding
+            boxes.
+        """
+        # COORDINATES OF THE INTERSECTION BOXES
+        x1 = np.array([a[:, 0], b[:, 0]]).max(axis=0)
+        y1 = np.array([a[:, 1], b[:, 1]]).max(axis=0)
+        x2 = np.array([a[:, 2], b[:, 2]]).min(axis=0)
+        y2 = np.array([a[:, 3], b[:, 3]]).min(axis=0)
+
+        # AREAS OF OVERLAP - Area where the boxes intersect
+        width = (x2 - x1)
+        height = (y2 - y1)
+
+        # handle case where there is NO overlap
+        width[width < 0] = 0
+        height[height < 0] = 0
+
+        area_overlap = width * height
+
+        # COMBINED AREAS
+        area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+        area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+        area_combined = area_a + area_b - area_overlap
+
+        # RATIO OF AREA OF OVERLAP OVER COMBINED AREA
+        iou = area_overlap / (area_combined + epsilon)
+        return iou
 
     def decompose_inputs(self, batch):
         depth_gt = None
-        ext_K = None
+        ext_bbox = None
         if isinstance(batch, tuple):
             batch_imgs = batch[0]
             for item in batch[1:]:
                 if item.shape[-1] == 4:
-                    ext_K = item    # external intrinsics NOT IN USE for now
-                    assert ext_K.shape[1] == ext_K.shape[2], \
-                        "intrinsics must have dimension (B,4,4), got{}".format(self.K.shape)
+                    ext_bbox = item  # shape of (B,3*2,4)
                 else:
                     depth_gt = tf.expand_dims(item, 3)
         else:
@@ -84,19 +248,24 @@ class DataProcessor(object):
         if depth_gt is not None:
             assert 1.3 < depth_gt.shape[2] / depth_gt.shape[1] < 3.5, \
                 "judge from aspect ratio, deoth_gt shape might be wrong: {}".format(depth_gt.shape)
-        return batch_imgs, depth_gt, ext_K
+        return batch_imgs, depth_gt, ext_bbox
 
     def prepare_batch_val(self, batch, random_crop=False):
         """duplicate of prepare_batch(), no @tf.function decorator
         For validation OR evaluation
         """
-        batch_imgs, depth_gt, ext_K = self.decompose_inputs(batch)
+        batch_imgs, depth_gt, ext_bbox = self.decompose_inputs(batch)
         inputs = self.process_imgs(batch_imgs, random_crop=random_crop, do_color_aug=False, depth_gt=depth_gt)
-        input_Ks = self.make_K_pyramid_fast(batch_imgs.shape[0])
+        input_Ks = self.make_K_pyramid(batch_imgs.shape[0])
         return inputs, input_Ks
 
     @tf.function
     def process_imgs(self, batch_imgs, random_crop=False, do_color_aug=False, depth_gt=None):
+        """Preprocess images
+        Args:
+            batch_imgs, Tensor, shape of (B,H,W,9)
+                -> tgt_batch has 3, src_batch has 2*3
+        """
         inputs = {}
         if depth_gt is not None:
             inputs[('depth_gt', 0, 0)] = depth_gt
@@ -133,7 +302,7 @@ class DataProcessor(object):
                 for k in aug_params:
                     aug_params[k] /= 2
             return aug_params
-        
+
         else:
             return None
 
@@ -186,7 +355,7 @@ class DataProcessor(object):
         return inputs
 
     @tf.function
-    def make_K_pyramid_fast(self, batch_size):
+    def make_K_pyramid(self, batch_size):
         """genearing intrinsics pyramid
         Args:
             batch_size: for exp purpose, validation set has smaller batch_size, which needs to be
@@ -195,12 +364,24 @@ class DataProcessor(object):
             input_Ks: dict
                 a pyramid of homogenous intrinsics and its inverse, each has shape [B,4,4]
         """
+        def get_K_scaling():
+            # For VelocityChallenge, aspect ratio 1280/720 is center-cropped to fit 640/192
+            # Therefore the scaling_fx is directly self.width,
+            # but scaling_fy is obtained by width ratio, instead of directly using self.height
+            raw_aspr = self.raw_size[1] / self.raw_size[0]
+            feed_aspr = self.width / self.height
+            scalings = [self.width, self.height]
+            if abs(raw_aspr - feed_aspr) > 0.02:
+                scalings[1] = self.raw_size[0] / (self.raw_size[1] / self.width)
+            return scalings
+
         input_Ks = {}
+        scalings = get_K_scaling()
         # Same intrinsics for all data
         for scale in range(self.num_scales):
             K_tmp = self.K.copy()
-            K_tmp[0, :] *= self.width // (2 ** scale)
-            K_tmp[1, :] *= self.height // (2 ** scale)
+            K_tmp[0, :] *= scalings[0] // (2 ** scale)
+            K_tmp[1, :] *= scalings[1] // (2 ** scale)
 
             inv_K = np.linalg.pinv(K_tmp)
 
@@ -209,7 +390,7 @@ class DataProcessor(object):
 
             input_Ks[("K", scale)] = K_tmp
             input_Ks[("inv_K", scale)] = inv_K
-        # assert_valid_hom_intrinsics(input_Ks[("K", 0)])
+        # print(input_Ks[("K", 0)][0])
         return input_Ks
 
     def make_K_pyramid_normal(self, external_K):
