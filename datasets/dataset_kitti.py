@@ -71,7 +71,7 @@ class KITTIRaw(KITTIDataset):
 
 class KITTIOdom(KITTIDataset):
     """KITTi Odometry dataset"""
-    def __init__(self, split_folder, split_name, data_path="F:\\Dataset\\kitti_odom", *args, **kwargs):
+    def __init__(self, split_folder, split_name, data_path="F:/Dataset/kitti_odom", *args, **kwargs):
         super(KITTIOdom, self).__init__(*args, **kwargs)
         self.name = 'kitti_odom'
         self.data_path = data_path
