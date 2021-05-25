@@ -3,15 +3,15 @@ from models.depth_decoder_creater import DepthDecoder_full
 from models.encoder_creater import ResNet18_new
 from models.posenet_decoder_creator import PoseDecoder
 
-from utils import del_files
+from utils import del_files, dilate_box
 from src.trainer_helper import *
 from datasets.data_loader_kitti import DataLoader as DataLoaderKITTI
-from datasets.data_loader_custom import DataLoader as DataLoaderCustom
+# from datasets.data_loader_custom import DataLoader as DataLoaderCustom
 from datasets.dataset_kitti import KITTIRaw, KITTIOdom, VeloChallenge
-from src.DataPreprocessor_exp import DataProcessor as Preprocessor_exp
-from src.DataPprocessor import DataProcessor as Preprocessor
-
+from src.DataPreprocessor import DataProcessor
+# import tensorflow_probability as tfp
 import numpy as np
+import cv2 as cv
 from collections import defaultdict
 import datetime
 import matplotlib.pyplot as plt
@@ -78,32 +78,37 @@ class Trainer:
         val_file = 'val_files.txt'
 
         # Train dataset & loader
-        train_dataset = dataset_choices[self.opt.dataset](
-            split_folder, train_file, data_path=self.opt.data_path)
+        data_path = self.opt.data_path
+        train_dataset = dataset_choices[self.opt.dataset](split_folder, train_file)
+        mini_val_dataset = dataset_choices[self.opt.dataset](split_folder, val_file)
+        val_dataset = dataset_choices[self.opt.dataset](split_folder, val_file)
+
+        if data_path is not None:
+            train_dataset.data_path = data_path
+            mini_val_dataset.data_path = data_path
+            val_dataset.data_path = data_path
+
         # if 'custom' in self.opt.dataset:
         #     DataLoader = DataLoaderCustom
         # else:
         DataLoader = DataLoaderKITTI
         self.train_loader = DataLoader(train_dataset, self.opt.num_epochs, self.opt.batch_size, self.opt.frame_idx,
                                        inp_size=self.feed_size, sharpen_factor=self.opt.sharpen_factor)
-        buffer_size = 1000 if self.opt.feed_size[1] == 192 else 500
+        buffer_size = 1000 if self.opt.feed_size[0] == 192 else 500
         self.train_iter = self.train_loader.build_train_dataset(buffer_size=buffer_size)
 
         # Validation dataset & loader
-        # - mini-val during the epoch
-        mini_val_dataset = dataset_choices[self.opt.dataset](
-            split_folder, val_file, data_path=self.opt.data_path)
-        self.mini_val_loader = DataLoader(mini_val_dataset, self.opt.num_epochs, batch_size=4,
-                                          frame_idx=self.opt.frame_idx, inp_size=self.feed_size, sharpen_factor=None)
-        self.mini_val_iter = self.mini_val_loader.build_val_dataset(include_depth=self.train_loader.has_depth,
-                                                                    buffer_size=100, shuffle=True)
         # - Val after one epoch
-        val_dataset = dataset_choices[self.opt.dataset](
-            split_folder, val_file, data_path=self.opt.data_path)
         self.val_loader = DataLoader(val_dataset, num_epoch=self.opt.num_epochs, batch_size=2,
                                      frame_idx=self.opt.frame_idx, inp_size=self.feed_size, sharpen_factor=None)
         self.val_iter = self.val_loader.build_val_dataset(include_depth=self.train_loader.has_depth,
-                                                          buffer_size=100, shuffle=True)
+                                                          buffer_size=int(buffer_size/2), shuffle=True)
+        # - mini-val during the epoch
+        self.mini_val_loader = DataLoader(mini_val_dataset, self.opt.num_epochs, batch_size=4,
+                                          frame_idx=self.opt.frame_idx, inp_size=self.feed_size, sharpen_factor=None)
+        self.mini_val_iter = self.mini_val_loader.build_val_dataset(include_depth=self.train_loader.has_depth,
+                                                                    buffer_size=int(buffer_size/4), shuffle=True)
+
         if self.train_loader.has_depth:
             # Val metrics only when depth_gt available
             self.has_depth_gt = self.train_loader.has_depth
@@ -114,9 +119,8 @@ class Trainer:
         # if self.opt.random_crop:
         #     DataProcessor = Preprocessor_exp
         # else:
-        DataProcessor = Preprocessor_exp
         self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx, intrinsics=train_dataset.K,
-                                             inp_size=self.feed_size, dataset_name=train_dataset.name)
+                                             feed_size=self.feed_size, dataset=train_dataset)
 
         # Init models
         self.models['depth_enc'] = ResNet18_new(norm_inp=self.opt.depth_norm_inp)
@@ -132,7 +136,7 @@ class Trainer:
         # Originally: [15], [1e-4, 1e-5], decay 10
         # exp: [3,6], [1e-4, /5, /25], decay 5
         boundaries = [self.opt.lr_step_size, self.opt.lr_step_size*2]
-        values = [self.opt.learning_rate / scale for scale in [1, self.opt.lr_decay, self.opt.lr_decay**2]]# [1e-4, 5e-5, 1e-5]
+        values = [self.opt.learning_rate / scale for scale in [1, self.opt.lr_decay, self.opt.lr_decay**2]]
         self.lr_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(boundaries, values)
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.lr_fn(1))
 
@@ -197,11 +201,21 @@ class Trainer:
     def reset_losses(self):
         self.losses = {'pixel_loss': 0, 'smooth_loss': 0}
 
-    def compute_losses(self, input_imgs, outputs):
-        source_scale = 0
-        tgt_image = input_imgs[('color', 0, source_scale)]
+    def compute_losses(self, input_imgs, outputs, input_Ks):
+        base_scale = 0
+        tgt_image = input_imgs[('color', 0, base_scale)]
+        val_mask = input_imgs[('val_mask', 0, 0)]
+        if self.use_val_mask(val_mask):
+            tgt_image *= val_mask
         self.reset_losses()
         total_loss = 0.
+
+        bboxes = input_imgs[('far_bbox', 0, 0)]
+        if self.use_bbox(bboxes):
+            bboxes = input_imgs[('far_bbox', 0, 0)]
+            dispmaps = outputs[('disp', 0, 0)]
+            fy = input_Ks[('K', 0)][0, 1, 1]
+            outputs.update(self.apply_size_constraints(dispmaps, bboxes, fy))
 
         for scale in range(self.opt.num_scales):
             # -------------------
@@ -230,8 +244,11 @@ class Trainer:
             else:
                 identity_reprojection_losses = []
                 for f_i in self.opt.frame_idx[1:]:
-                    proj_image = input_imgs[('color', f_i, source_scale)]
-                    identity_reprojection_losses.append(self.compute_reproject_loss(proj_image, tgt_image))
+                    src_image = input_imgs[('color', f_i, base_scale)]
+                    # img_curr = input_imgs[('color', 0, base_scale)]
+                    if self.use_val_mask(val_mask):
+                        src_image *= val_mask
+                    identity_reprojection_losses.append(self.compute_reproject_loss(src_image, tgt_image))
 
                 identity_reprojection_losses = tf.concat(identity_reprojection_losses, axis=3)  # B,H,W,2
 
@@ -282,16 +299,123 @@ class Trainer:
             self.losses['rot_loss'] = rot_loss
             total_loss += self.losses['rot_loss']
 
+        if self.opt.size_loss_w > 0 and ('size_loss',) in outputs.keys():
+            size_loss = outputs[('size_loss',)] * self.opt.size_loss_w
+            self.losses['size_loss'] = size_loss
+            total_loss += self.losses['size_loss']
+
+        if self.opt.void_loss_w > 0 and ('void_loss',) in outputs.keys():
+            void_loss = outputs[('void_loss',)] * self.opt.void_loss_w
+            self.losses['void_loss'] = void_loss
+            total_loss += self.losses['void_loss']
+
         self.losses['loss/total'] = total_loss
 
         for k, v in self.losses.items():
             print(k, v, ' | ')
 
         if self.opt.debug_mode and self.opt.show_image_debug:
-            colormapped_normal = colorize(outputs[('disp', 0, 0)], cmap='plasma', expand_dim=True)
-            arrange_display_images([colormapped_normal[0]])
+            dispmap = outputs[('disp', 0, 0)][0].numpy()
+            # with open('dispmap.pkl', 'wb') as df:
+            #     pickle.dump(dispmap, df)
+            # quit()
+            color_map = colorize(dispmap, cmap='plasma', expand_dim=True)[0].numpy()
+            dispmap_scaled, depth_map = self.disp_to_depth(dispmap)
+            boxes_c = input_imgs[('far_bbox', 0, 0)]
+            if self.use_bbox(boxes_c):
+                boxes_list = [dilate_box(boxes_c[0][i]) for i in range(boxes_c.shape[1])]
+                for box in boxes_list:
+                    if tf.reduce_sum(box) == 0:
+                        continue
+                    l, t, r, b = box
+                    cv.rectangle(color_map, (l, t), (r, b), (255, 255, 255), 1)
+                    depth_box = dispmap_scaled[t:b, l:r, :].flatten()
 
+            img_c = input_imgs[('color', 0, 0)][0]
+            masked_c = input_imgs[('val_mask', 0, 0)][0] * img_c
+            p2c = outputs[('color', -1, 0)][0]
+            n2c = outputs[('color', 1, 0)][0]
+
+            arrange_display_images([img_c, color_map], [p2c, masked_c, n2c])
         return self.losses
+
+    def apply_size_constraints(self, dispmaps, bboxes_batch, fy):
+        """Calculate depth losses for each frame
+        Note: each element in batch is handled separately.
+        Args:
+            dispmaps: Tensor, shape (B,H,W,1),
+                outputs[('disp', f_i, 0)]
+            bboxes_batch: Tensor, shape (B,1,4),
+                input_imgs[('far_bbox', f_i, 0)]
+        Returns:
+            List of two depth error scalers,
+            for object-size constraint and void-patch suppressor, respectively
+        """
+        # dispmaps = outputs[('disp', f_i, 0)]
+        outputs = {}
+        if len(bboxes_batch.shape) == 4:
+            bboxes_batch = tf.squeeze(bboxes_batch, 1)
+        batch_sz, box_num = bboxes_batch.shape[:2]
+        ref_h = 1.  # approx vehicle height, shrunken because bbox is shrunken to avoid boundary issue
+
+        # since some frames don't have valid bbox, we have to handle each element separately
+        # todo: avoid error in @tf.function when using list to contain losses
+        size_loss = 0.
+        void_loss = 0.
+        cnt = 0.
+        for b in range(batch_sz):
+            boxes = bboxes_batch[b]
+            # print(b, bboxes_batch.shape)
+            # quit()
+            for i in range(box_num):
+                box = boxes[i]
+                # print(box.shape)
+                if tf.reduce_sum(box) == 0:   # box is set to (0,0,0,0) when not exists
+                    continue
+                cnt += 1
+                # xl, yl, xr, yr = int(box[0]), int(box[1]), int(box[2]), int(box[3])  # (B,4)
+                dispmap = dispmaps[b]   # (B,H,W,1)
+                disp_box = dispmap[box[1]: box[3], box[0]: box[2], :]
+                disp_scaled, depth_scaled = self.disp_to_depth(disp_box, flatten=True)
+                # tfp.stats.percentile(depth_scaled, list(range(10, 100)))              # filter out small values
+                pred_depth = tf.reduce_mean(depth_scaled) * self.opt.global_scale
+                disp_mean = tf.reduce_mean(disp_scaled)
+                # Object size constraint and Void suppressor
+                patch_height = tf.cast((box[3]-box[1]), tf.float32)
+                approx_depth = fy / patch_height * ref_h
+                size_loss += tf.reduce_mean(tf.abs(approx_depth - pred_depth))
+                void_loss += 1. / (disp_mean + 1e-5)
+                # print("\nbox ltrb\t", xl, yl, xr, yr)
+                # print("fy, patch_h\t", fy, (yr-yl))
+                # print("pred vs approx depth\t", pred_depth, approx_depth)
+                # print("disp_mean\t", disp_mean)
+        size_loss = 0. if tf.math.is_nan(size_loss) else tf.reduce_mean(size_loss)
+        void_loss = 0. if tf.math.is_nan(void_loss) else tf.reduce_mean(void_loss)
+
+        outputs[('size_loss',)] = size_loss / cnt
+        outputs[('void_loss',)] = void_loss / cnt
+        # outputs[('size_loss',)] = size_loss
+        # outputs[('void_loss',)] = void_loss
+        # print("depth_void_errors", depth_void_errors)
+        # print("obj_constraint_errors", obj_constraint_errors)
+        return outputs
+
+    def use_val_mask(self, val_mask, is_train=True):
+        # todo: should we also use val_mask in validation?
+        decision = is_train and \
+                   self.train_loader.include_bbox and \
+                   self.opt.enable_val_mask
+        if self.train_loader.include_bbox:
+            assert val_mask is not None
+        return decision
+
+    def use_bbox(self, far_bbox, is_train=True):
+        decision = is_train and \
+                   self.train_loader.include_bbox and \
+                   self.opt.enable_bbox
+        if self.train_loader.include_bbox:
+            assert far_bbox is not None
+        return decision
 
     def generate_images_pred(self, input_imgs, input_Ks, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
@@ -301,6 +425,7 @@ class Trainer:
         K = input_Ks[('K', self.opt.src_scale)]
         K_inv = input_Ks[('inv_K', self.opt.src_scale)]
         sampler_padding = 'zeros' if self.opt.use_sampler_mask else 'border'
+        val_mask = input_imgs[('val_mask', 0, 0)]
         for scale in range(self.opt.num_scales):
             disp = outputs[('disp', 0, scale)]
             # disp = tf.image.resize(disp_tf, self.image_size)
@@ -317,25 +442,37 @@ class Trainer:
                 pix_coords = project_3d(cam_points, K, T, image_shape, 0)
 
                 outputs[('sample', f_i, scale)] = pix_coords
-                input_tf = input_imgs[('color', f_i, self.opt.src_scale)]
-                res = bilinear_sampler(input_tf, pix_coords, padding=sampler_padding)
-                outputs[('color', f_i, scale)] = res
+                input_src = input_imgs[('color', f_i, self.opt.src_scale)]
+                if self.use_val_mask(val_mask):
+                    input_src *= val_mask
+                image_src2tgt = bilinear_sampler(input_src, pix_coords, padding=sampler_padding)
+                outputs[('color', f_i, scale)] = image_src2tgt
+
                 if self.opt.use_sampler_mask:
-                    sampler_mask = tf.cast(res * 255 > 1e-3, tf.float32)
+                    sampler_mask = tf.cast(image_src2tgt * 255 > 1e-3, tf.float32)
                 else:
                     sampler_mask = None
                 outputs[('sampler_mask', f_i, scale)] = sampler_mask
-        if self.opt.debug_mode and self.opt.show_image_debug:
-            show_images(input_imgs, outputs)
+        # if self.opt.debug_mode and self.opt.show_image_debug:
+        #     show_images(input_imgs, outputs)
 
     def predict_poses(self, input_imgs, outputs):
         """Use pose enc-dec to calculate camera's angles and translations"""
-        frames_for_pose = {f_i: input_imgs[('color_aug', f_i, 0)] for f_i in self.opt.frame_idx}
 
+        # -------------------
+        # Prepare frame inputs
+        # -------------------
+        frames_for_pose = {f_i: input_imgs[('color_aug', f_i, 0)] for f_i in self.opt.frame_idx}
         if self.opt.random_crop:
             frames_for_pose = {f_i: tf.image.resize(frame, (self.opt.height, self.opt.width))
                                for f_i, frame in frames_for_pose.items()}
-
+        if self.use_val_mask(input_imgs):
+            val_mask = input_imgs[('val_mask', 0, 0)]
+            frames_for_pose = {f_i: input_imgs[('color_aug', f_i, 0)] * val_mask
+                               for f_i in frames_for_pose}
+        # -----------------
+        # Generate poses
+        # -----------------
         rot_loss = 0.
         for f_i in self.opt.frame_idx[1:]:
             # To maintain ordering we always pass frames in temporal order
@@ -354,6 +491,9 @@ class Trainer:
             M = transformation_from_parameters(axisangle[:, 0], translation[:, 0], invert=invert)
             outputs[('cam_T_cam', f_i, 0)] = [M]
 
+            # ----------------------
+            # Optional, calculate rotation consistency loss
+            # ----------------------
             if self.opt.add_rot_loss:
                 # same procedure, but
                 # - swap the frames,
@@ -469,7 +609,7 @@ class Trainer:
     def grad(self, input_imgs, input_Ks, trainables, global_step):
         with tf.GradientTape() as tape:
             outputs = self.process_batch(input_imgs, input_Ks)
-            losses = self.compute_losses(input_imgs, outputs)
+            losses = self.compute_losses(input_imgs, outputs, input_Ks)
             total_loss = losses['loss/total']
             grads = tape.gradient(total_loss, trainables)
             if self.is_time_to('log', global_step):
@@ -511,7 +651,7 @@ class Trainer:
         """@tf.function enables graph computation, allowing larger batch size
         """
         outputs = self.process_batch(input_imgs, input_Ks)
-        losses = self.compute_losses(input_imgs, outputs)
+        losses = self.compute_losses(input_imgs, outputs, input_Ks)
         return outputs, losses
 
     def start_validating(self, global_step, val_iterator, num_run=100, random_crop=None):
@@ -676,9 +816,9 @@ class Trainer:
         )
         assert depth_pred.shape[1] == 375, \
             'shape: {}, should be {}'.format(depth_pred.shape, depth_gt.shape)
-        if self.opt.show_image_debug:
-            arrange_display_images(inps_col1=(input_imgs[('color',0,0)],
-                                              depth_pred[0], depth_gt[0]))
+        # if self.opt.show_image_debug:
+        #     arrange_display_images(inps_col1=(input_imgs[('color',0,0)],
+        #                                       depth_pred[0], depth_gt[0]))
         # -------------------------
         # garg/eigen crop
         # -> if random cropped, it will be further cropped
@@ -707,7 +847,7 @@ class Trainer:
 
         return losses
 
-    def disp_to_depth(self, disp):
+    def disp_to_depth(self, disp, flatten=False):
         """Convert network's sigmoid output into depth prediction
         The formula for this conversion is given in the 'additional considerations'
         section of the paper.
@@ -716,6 +856,9 @@ class Trainer:
         max_disp = 1 / self.opt.min_depth
         scaled_disp = min_disp + (max_disp - min_disp) * disp
         depth = 1 / scaled_disp
+        if flatten:
+            scaled_disp = tf.reshape(scaled_disp, [-1])
+            depth = tf.reshape(depth, [-1])
         return scaled_disp, depth
 
     def is_time_to(self, event, global_step):
