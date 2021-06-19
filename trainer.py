@@ -33,7 +33,7 @@ class Trainer:
         self.num_frames_per_batch = len(self.opt.frame_idx)
         self.train_loader = None
         self.val_loader = None
-        self.mini_val_loader= None
+        self.mini_val_loader = None
         self.tgt_image = None
         self.tgt_image_net = None
         self.tgt_image_aug = None
@@ -99,10 +99,10 @@ class Trainer:
 
         # Validation dataset & loader
         # - Val after one epoch
-        self.val_loader = DataLoader(val_dataset, num_epoch=self.opt.num_epochs, batch_size=2,
+        self.val_loader = DataLoader(val_dataset, num_epoch=self.opt.num_epochs, batch_size=4,
                                      frame_idx=self.opt.frame_idx, inp_size=self.feed_size, sharpen_factor=None)
         self.val_iter = self.val_loader.build_val_dataset(include_depth=self.train_loader.has_depth,
-                                                          buffer_size=int(buffer_size/2), shuffle=True)
+                                                          buffer_size=int(buffer_size/2), shuffle=False)
         # - mini-val during the epoch
         self.mini_val_loader = DataLoader(mini_val_dataset, self.opt.num_epochs, batch_size=4,
                                           frame_idx=self.opt.frame_idx, inp_size=self.feed_size, sharpen_factor=None)
@@ -119,18 +119,19 @@ class Trainer:
         # if self.opt.random_crop:
         #     DataProcessor = Preprocessor_exp
         # else:
-        self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx, intrinsics=train_dataset.K,
-                                             feed_size=self.feed_size, dataset=train_dataset)
+        self.batch_processor = DataProcessor(frame_idx=self.opt.frame_idx, feed_size=self.feed_size,
+                                             dataset=train_dataset)
 
         # Init models
-        self.models['depth_enc'] = ResNet18_new(norm_inp=self.opt.depth_norm_inp)
+        self.models['depth_enc'] = ResNet18_new(norm_inp=self.opt.norm_inp)
         self.models['depth_dec'] = DepthDecoder_full()
-        self.models['pose_enc'] = ResNet18_new()
+        self.models['pose_enc'] = ResNet18_new(norm_inp=self.opt.norm_inp)   # todo: also norm pose input?
         self.models['pose_dec'] = PoseDecoder(num_ch_enc=[64, 64, 128, 256, 512])
 
         build_models(self.models, inp_shape=self.feed_size)
         self.load_models()
-        self.unfreeze_partial_models()
+        if self.opt.num_unfreeze is not None:
+            self.unfreeze_partial_models(verbose=True)
 
         # Set optimizer
         # Originally: [15], [1e-4, 1e-5], decay 10
@@ -160,19 +161,26 @@ class Trainer:
                         self.models[m_name].load_weights(os.path.join(weights_dir, m_name + '.h5'))
             print('weights loaded from ', weights_dir)
 
-    def unfreeze_partial_models(self):
+    def unfreeze_partial_models(self, verbose=False):
         """Only unfreeze part of the model layers"""
+        for num in self.opt.num_unfreeze:
+            assert isinstance(eval(num), int), 'num_unfreeze must be integer, got {}'.format(type(num))
+
         unfrz_layers = {
-            'depth_enc': self.opt.num_unf_de,
-            'depth_dec': self.opt.num_unf_dd,
-            'pose_enc': self.opt.num_unf_pe,
-            'pose_dec': self.opt.num_unf_pd
+            'depth_enc': int(self.opt.num_unfreeze[0]),
+            'depth_dec': int(self.opt.num_unfreeze[1]),
+            'pose_enc': int(self.opt.num_unfreeze[2]),
+            'pose_dec': int(self.opt.num_unfreeze[3])
         }
+        print(unfrz_layers)
         for m_name, model in self.models.items():
             num_unfrozen = unfrz_layers[m_name]
+            print(m_name)
             if num_unfrozen is not None:
                 unfreeze_models(model, model_name=m_name, num_unfrozen=num_unfrozen)
-            # model.summary()
+            if verbose:
+                model.summary()
+
 
     # ----- For process_batch() -----
     def get_smooth_loss(self, disp, img):
@@ -244,11 +252,11 @@ class Trainer:
             else:
                 identity_reprojection_losses = []
                 for f_i in self.opt.frame_idx[1:]:
-                    src_image = input_imgs[('color', f_i, base_scale)]
-                    # img_curr = input_imgs[('color', 0, base_scale)]
+                    image_s = input_imgs[('color', f_i, base_scale)]
+                    # image_c = input_imgs[('color', 0, base_scale)]
                     if self.use_val_mask(val_mask):
-                        src_image *= val_mask
-                    identity_reprojection_losses.append(self.compute_reproject_loss(src_image, tgt_image))
+                        image_s *= val_mask
+                    identity_reprojection_losses.append(self.compute_reproject_loss(image_s, tgt_image))
 
                 identity_reprojection_losses = tf.concat(identity_reprojection_losses, axis=3)  # B,H,W,2
 
@@ -321,22 +329,28 @@ class Trainer:
             # quit()
             color_map = colorize(dispmap, cmap='plasma', expand_dim=True)[0].numpy()
             dispmap_scaled, depth_map = self.disp_to_depth(dispmap)
+
             boxes_c = input_imgs[('far_bbox', 0, 0)]
-            if self.use_bbox(boxes_c):
-                boxes_list = [dilate_box(boxes_c[0][i]) for i in range(boxes_c.shape[1])]
-                for box in boxes_list:
-                    if tf.reduce_sum(box) == 0:
-                        continue
-                    l, t, r, b = box
-                    cv.rectangle(color_map, (l, t), (r, b), (255, 255, 255), 1)
-                    depth_box = dispmap_scaled[t:b, l:r, :].flatten()
+            if boxes_c is not None:
+                print("boxes_c shape", boxes_c.shape)
+                if self.use_bbox(boxes_c):
+                    if len(boxes_c) == 4:
+                        boxes_c = tf.squeeze(boxes_c, 1)
+                    for i in range(boxes_c.shape[0]):
+                        box = boxes_c[i][0][0]
+                        box = dilate_box(box)
+                        if tf.reduce_sum(box) == 0:
+                            continue
+                        l, t, r, b = box
+                        cv.rectangle(color_map, (l, t), (r, b), (255, 255, 255), 1)
+                        depth_box = dispmap_scaled[t:b, l:r, :].flatten()
 
             img_c = input_imgs[('color', 0, 0)][0]
-            masked_c = input_imgs[('val_mask', 0, 0)][0] * img_c
+            # masked_c = input_imgs[('val_mask', 0, 0)][0] * img_c
             p2c = outputs[('color', -1, 0)][0]
             n2c = outputs[('color', 1, 0)][0]
 
-            arrange_display_images([img_c, color_map], [p2c, masked_c, n2c])
+            arrange_display_images([img_c], [p2c, n2c])
         return self.losses
 
     def apply_size_constraints(self, dispmaps, bboxes_batch, fy):
@@ -356,7 +370,7 @@ class Trainer:
         if len(bboxes_batch.shape) == 4:
             bboxes_batch = tf.squeeze(bboxes_batch, 1)
         batch_sz, box_num = bboxes_batch.shape[:2]
-        ref_h = 1.  # approx vehicle height, shrunken because bbox is shrunken to avoid boundary issue
+        ref_h = 2.  # approx vehicle height
 
         # since some frames don't have valid bbox, we have to handle each element separately
         # todo: avoid error in @tf.function when using list to contain losses
@@ -481,8 +495,7 @@ class Trainer:
             else:
                 pose_inputs = [frames_for_pose[0], frames_for_pose[f_i]]
 
-            pose_features = self.models["pose_enc"](tf.concat(pose_inputs, axis=3), training=True,
-                                                    unfreeze_num=self.opt.num_unf_pe)
+            pose_features = self.models["pose_enc"](tf.concat(pose_inputs, axis=3), training=True)
             pred_pose_raw = self.models["pose_dec"](pose_features, training=True)
             axisangle = pred_pose_raw['angles']
             translation = pred_pose_raw['translations']
@@ -525,8 +538,7 @@ class Trainer:
             tgt_image_aug = tf.image.resize(input_imgs[('color_aug', 0, 0)],
                                             (self.opt.height, self.opt.width))
         # Depth Encoder
-        feature_raw = self.models['depth_enc'](tgt_image_aug, self.opt.train_depth,
-                                               unfreeze_num=self.opt.num_unf_de)
+        feature_raw = self.models['depth_enc'](tgt_image_aug, self.opt.train_depth)
         # Depth Decoder
         pred_disp = self.models['depth_dec'](feature_raw, self.opt.train_depth)
         outputs = {}
@@ -569,12 +581,12 @@ class Trainer:
                 self.train_loss_tmp = []
                 print("loss: ", mean_loss)
 
-            if self.is_time_to('validate', self.global_step):
-                print("validate miniset... random_crop?", self.opt.random_crop)
-                self.validate_miniset(save_models=True)
-                if self.opt.random_crop:
-                    print("validate miniset... WITHOUT random_crop")
-                    self.validate_miniset(save_models=False)
+            # if self.is_time_to('validate', self.global_step):
+            #     print("validate miniset... random_crop?", self.opt.random_crop)
+            #     self.validate_miniset(save_models=True)
+            #     if self.opt.random_crop:
+            #         print("validate miniset... WITHOUT random_crop")
+            #         self.validate_miniset(save_models=False)
 
             self.global_step += 1
             # if self.is_time_to('special_pass', self.global_step):
@@ -724,8 +736,7 @@ class Trainer:
         # ----------------------
         def unfreeze_all_to_save_models():
             for m_name, model in self.models.items():
-                if 'enc' in m_name:
-                    model.trainable = True
+                model.trainable = True
 
         unfreeze_all_to_save_models()
         # - delete previous weights
@@ -755,7 +766,8 @@ class Trainer:
         # -------------------
         # Restore unfreeze options for training
         # -------------------
-        self.unfreeze_partial_models()
+        if self.opt.num_unfreeze is not None:
+            self.unfreeze_partial_models()
 
     def collect_summary(self, mode, losses, input_imgs, outputs, global_step):
         """collect summary for train / validation"""
@@ -767,7 +779,7 @@ class Trainer:
                 tf.summary.scalar(loss_name, loss_val, step=global_step)
 
             # images
-            tf.summary.image('tgt_image', input_imgs[('color', 0, 0)][:num], step=global_step)
+            tf.summary.image('tgt_image', input_imgs[('color_aug', 0, 0)][:num], step=global_step)
             tf.summary.image('scale0_disp_color',
                              colorize(outputs[('disp', 0, 0)][:num], cmap='plasma', expand_dim=True), step=global_step)
 
