@@ -2,8 +2,34 @@ import os, shutil
 import pickle
 import numpy as np
 import tensorflow as tf
+import cv2 as cv
 
 rootdir = os.path.dirname(__file__)
+
+
+def video_to_numpy(vid_path, num_frames=None, reverse_order=False):
+    """Reverse the video and store it in a numpy array
+    Args:
+        vid_path: str
+        num_frames: int or None
+            How many frames involved (count from the end to start).
+    """
+    cap = cv.VideoCapture(vid_path)
+    frames_all = []
+    while cap.isOpened():
+        ok, image = cap.read()
+        if not ok or image is None:
+            break
+        frames_all.append(image)
+    if num_frames is not None:
+        total_num = cv.CAP_PROP_FRAME_COUNT
+        assert num_frames > 0, "num_frames must be (0, {}], got {}".format(total_num, num_frames)
+        num_frames = min(total_num, num_frames)
+        frames_all = frames_all[:num_frames]  # e.g. 40->0; 40->20
+    if reverse_order:
+        frames_all = frames_all[::-1]
+    frames_all = np.stack(frames_all)   # e.g. 0->40; 20->40
+    return frames_all
 
 
 def dilate_box(box):
@@ -12,7 +38,7 @@ def dilate_box(box):
     offset_ratio = [-1, 0.5]     # up/down. left/right direction
     dilate_factor = [0.4, -0.2]     # in H, W direction, respectively
     box = tf.cast(box, tf.float32)
-
+    print(box.shape)
     h_new = (box[3] - box[1]) * dilate_factor[0]
     box_t = box[1] - h_new * offset_ratio[0]
     box_b = box[3] + h_new * (1-offset_ratio[0])
@@ -55,9 +81,12 @@ def crop_to_aspect_ratio(image, feed_size):
     tolerance = 0.05
     if abs(w / h - asp_ratio) > tolerance:
         h_goal = int(w // asp_ratio)
-        h_start = int((h - h_goal) * 0.5)
-        image = image[h_start: h_start + h_goal, :w, :]
-    return image
+        offset = int((h - h_goal) * 0.5)
+        image_cropped = image[offset: offset + h_goal, :w, :]
+    else:
+        image_cropped = image
+        offset = 0
+    return image_cropped, offset
 
 
 def assert_valid_hom_intrinsics(intrinsics_mat):
