@@ -6,7 +6,7 @@ from src.detection import Detection
 import numpy as np
 from tensorflow.keras.layers import MaxPool2D
 from models.velocity_mlp import VelocityMLP
-from utils import crop_to_aspect_ratio
+from utils import crop_to_aspect_ratio, arrange_display_images
 from tqdm import tqdm
 
 
@@ -108,12 +108,22 @@ class TrainerVelo:
 
     def compute_loss(self, batch):
         image_stack, bboxes_pairs, gt_motions, valid_nums = batch
-        image_cropped, offset_y = self.prepare_image_for_depth_estimation(image_stack)
-        depth_map_stack = self.calc_depth_map(image_cropped)
+        depth_input, offset_y = self.prepare_image_for_depth_estimation(image_stack)
+        depth_map_stack = self.calc_depth_map(depth_input)
 
         depth_map_pairs = tf.stack(tf.split(depth_map_stack, 2, axis=0), axis=1)    # B,2,H,W,3
-        image_pairs = tf.stack(tf.split(image_stack, 2, axis=0), axis=1)            # B,2,H,W,3
-
+        # image_pairs = tf.stack(tf.split(image_stack, 2, axis=0), axis=1)            # B,2,H,W,3
+        # print(depth_map_pairs.shape)
+        #
+        # inp_col1 = [
+        #     depth_input[0],
+        #     depth_input[6]
+        # ]
+        # inp_col2 = [
+        #     depth_map_pairs[0, 0],
+        #     depth_map_pairs[0, 1]
+        # ]
+        # arrange_display_images(inp_col1, inp_col2)
         batch_size = depth_map_pairs.shape[0]
         loss_per_obj = []
         for i in range(batch_size):
@@ -181,7 +191,7 @@ class TrainerVelo:
         pred_disp = decoder(**features)
         for k, v in pred_disp.items():
             disp_map_stack = v
-        depth_map_stack = self.disp_to_depth(disp_map_stack)
+        disp_map_stack, depth_map_stack = self.disp_to_depth(disp_map_stack)
         return depth_map_stack
 
     def get_aggreated_features(self, depth_map_pair, bboxes_pair):
@@ -191,16 +201,10 @@ class TrainerVelo:
         This is for VelocityChallenge dataset, where tracked bboxes are pre-computed
 
         Args:
-            depth_map_pair: list
-                pair of depth / disp map, in temporal order
-            bboxes_pair: list of list
-                pair of Detection, in temporal order. Empty list means nothing detected
-            cam_params: dict
-                camera parameters like principle point, focal length
-            cam_params: int
-                More interval can tolerate the scale-shift perturbation in depth estimation
-            fps: float or int
-                frame-per-second.
+            depth_map_pair: Tensor
+                pair of depth / disp map, in temporal order, shape (2, H, W, 1)
+            bboxes_pair: Tensor
+                pair of Detection, in temporal order. Shape (2, N, 4)
         """
         dets_pair = []
         for bboxes in bboxes_pair:
@@ -358,7 +362,8 @@ class TrainerVelo:
     def batch_processor_velo(self, batch):
         image_pairs, bboxes_pairs, gt_motions, valid_nums = batch
         image_pairs = tf.concat(tf.split(image_pairs, 2, axis=-1), axis=0)   # 2*B,H,W,3
-        return image_pairs, bboxes_pairs, gt_motions[0], valid_nums
+        gt_motions = gt_motions[:, 0, ...]
+        return image_pairs, bboxes_pairs, gt_motions, valid_nums
 
     def disp_to_depth(self, disp, flatten=False):
         """Convert network's sigmoid output into depth prediction
@@ -418,14 +423,15 @@ class TrainerVelo:
 
     def prepare_image_for_depth_estimation(self, images):
         """Preprocess image for depth network"""
-        images_cropped = []
+        depth_input = []
         offset_y = 0
         for i in range(images.shape[0]):
             image = images[i]
             image_cropped, offset_y = crop_to_aspect_ratio(image, self.feed_size)
-            images_cropped.append(image_cropped)
-        images_cropped = tf.stack(images_cropped)
-        return images_cropped, offset_y
+            depth_input.append(image_cropped)
+        depth_input = tf.stack(depth_input)
+        depth_input = tf.image.resize(depth_input, self.feed_size)
+        return depth_input, offset_y
 
 
 def main(_):
