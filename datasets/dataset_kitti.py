@@ -13,6 +13,7 @@ class VeloChallenge:
         self.split_folder = split_folder    # os.path.join(root_dir, 'splits', split_name
         self.split_name = split_name        # '{}_files.txt'.format(dataset_for)
         self.img_ext = '.jpg'
+        self.fps = 20
 
         self.full_res_shape = (720, 1280)   # H, W
         orig_K = np.array([[714, 0, 675, 0],
