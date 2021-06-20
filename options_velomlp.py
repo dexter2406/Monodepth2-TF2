@@ -19,7 +19,7 @@ flags.DEFINE_float('velo_loss_w', 1, "weight for distance loss")
 # Pre-settings
 flags.DEFINE_string('depth_estimator_path', r'D:\MA\motion_ds_experiment\model_data',
                     'the folder that stores weights files for depth encoder-decoder.')
-flags.DEFINE_string('save_model_path',  '',     'path where weights are saved')
+flags.DEFINE_string('save_model_path',  'models/velocity_mlp',     'path where weights are saved')
 flags.DEFINE_string('save_root',        '',     'another root path to store logs')
 flags.DEFINE_string('data_path',        None, 'path that stores corresponding dataset')
 flags.DEFINE_string('model_name',       current_time, 'specify a dirname to collect weights')
