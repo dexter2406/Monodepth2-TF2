@@ -8,6 +8,7 @@ from tensorflow.keras.layers import MaxPool2D
 from models.velocity_mlp import VelocityMLP
 from utils import crop_to_aspect_ratio, arrange_display_images
 from tqdm import tqdm
+import sys
 
 
 class TrainerVelo:
@@ -21,6 +22,8 @@ class TrainerVelo:
         self.global_step = tf.constant(0, dtype=tf.int64)
         self.depth_models = {}
         self.summary_writer = {}
+        self.val_loss_min = tf.constant(1e5, dtype=tf.float32)  # random large value
+        self.train_loss_min = tf.constant(1e5, dtype=tf.float32)  # random large value
 
         boundaries = [self.opt.lr_step_size, self.opt.lr_step_size*2]
         values = [self.opt.learning_rate / scale for scale in [1, self.opt.lr_decay, self.opt.lr_decay**2]]
@@ -28,9 +31,10 @@ class TrainerVelo:
         self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.lr_fn(1))
 
         self.velocity_mlp = VelocityMLP()
+        # pp_x = 675.6 originally
         self.cam_params = {
             'focal_x': 714.2, 'focal_y': 710.4,
-            'pp_x': 675.6, 'pp_y': 376.3,
+            'pp_x': 713.9, 'pp_y': 376.3,
             'height': 1.8}
         self.actual_fps = None
 
@@ -84,27 +88,33 @@ class TrainerVelo:
 
             self.run_epoch(epoch)
             print('validating after epoch %d' % (epoch+1))
-            self.validate(epoch)
+            val_loss = self.validate(epoch)
+            self.save_model(val_loss)
 
     def run_epoch(self, epoch):
+        train_loss = []
         for _ in tqdm(range(self.train_loader.steps_per_epoch),
                       desc='Epoch%d/%d' % (epoch + 1, self.opt.num_epochs)):
             batch = self.train_iter.get_next()
 
             trainable_weights = self.velocity_mlp.trainable_weights
-            grads = self.grad(batch, trainable_weights, self.global_step)
+            grads, loss = self.grad(batch, trainable_weights)
+
+            train_loss.append(loss)
+            if self.is_time_to('log', self.global_step):
+                train_loss_mean = tf.reduce_mean(train_loss)
+                self.collect_summary('train', batch[0], train_loss_mean, self.global_step)
+
             self.optimizer.apply_gradients(zip(grads, trainable_weights))
             self.global_step += 1
 
     # @tf.function    # turn off to debug, e.g. with plt
-    def grad(self, batch, trainables, global_step):
+    def grad(self, batch, trainables):
         with tf.GradientTape() as tape:
             batch = self.batch_processor_velo(batch)
             total_loss = self.compute_loss(batch)
             grads = tape.gradient(total_loss, trainables)
-            if self.is_time_to('log', global_step):
-                self.collect_summary('train', batch[0], total_loss, global_step=global_step)
-        return grads
+        return grads, total_loss
 
     def compute_loss(self, batch):
         image_stack, bboxes_pairs, gt_motions, valid_nums = batch
@@ -174,7 +184,21 @@ class TrainerVelo:
 
             loss_mean.append(total_loss)
             collect_imgs = batch[0]
-        self.collect_summary('val', collect_imgs, tf.reduce_mean(loss_mean), global_step=self.global_step)
+        val_loss = tf.reduce_mean(loss_mean)
+        self.collect_summary('val', collect_imgs, val_loss, global_step=self.global_step)
+        return val_loss
+
+    def save_model(self, val_loss):
+        if self.val_loss_min > val_loss:
+            self.val_loss_min = val_loss
+            weights_name = "velocity_mlp_{:.2f}.h5".format(val_loss)
+            weights_path = os.path.join(self.opt.save_model_path, weights_name)
+            if not os.path.isdir(self.opt.save_model_path):
+                os.makedirs(self.opt.save_model_path)
+            self.velocity_mlp.save_weights(weights_path)
+            print("saving weights with lowest val_loss {:.2f} to:".format(val_loss), weights_path)
+        else:
+            print("current loss doesn't improve ({:.2f} Vs. {:.2f}), skip saving model".format(self.val_loss_min, val_loss))
 
     def calc_depth_map(self, image_stack):
         """Compute depth maps for all images
@@ -212,7 +236,7 @@ class TrainerVelo:
 
         dets_pair = self.associate_IDs(dets_pair)
         dets_pair = self.calc_geometry_clues(dets_pair, self.cam_params)
-        dets_pair = self.resize_depth_map_pair(depth_map_pair, dets_pair)
+        dets_pair = self.extract_depth_feature_pair(depth_map_pair, dets_pair)
         feature_vec = self.aggregate_geo_clues_and_depth_feature(dets_pair, self.actual_fps)
         return feature_vec
 
@@ -311,12 +335,12 @@ class TrainerVelo:
 
         return dets_neighbor_frames
 
-    def resize_depth_map_pair(self, depth_maps, dets_neighbor_frames):
+    def extract_depth_feature_pair(self, depth_maps, dets_neighbor_frames):
         """From depth map patches get feature vector
         Args:
-            depth_maps: list
-                two depth maps, each in shape (1, 192, 640, 1)
-            dets_neighbor_frames: list
+            depth_maps: Tensor
+                (2, 192, 640, 1), two depth maps
+            dets_neighbor_frames: list of Detection
                 Detections for two neighbor frames, must make sure:
                 - the IDs between boxes of two frames are one-to-one associated
                 - the list is ordered by ID, therefore it's ok to directly unpack
@@ -324,22 +348,36 @@ class TrainerVelo:
             list of feature vectors
         """
 
-        def resize_map2vec_per_bbox(depth_map, bbox_ltrb):
+        def extract_vec_per_bbox(depth_map, bbox_ltrb, pool_out_size=13):
             assert len(depth_map.shape) in (3, 4) and depth_map.shape[-1] == 1, \
                 "depth_map should have shape (1,192,640,1) or (192, 640, 1), got {}".format(depth_map.shape)
             if len(depth_map.shape) == 3:
                 depth_map = np.expand_dims(depth_map, 0)
+            stride, kernel_size = 2, 3
             l, t, r, b = bbox_ltrb
+            resize_to = pool_out_size * stride + int(kernel_size // 2)
+
             feature_map = depth_map[:, t:b, l:r, :]
-            feature_map = tf.image.resize(feature_map, (27, 27))
-            feature_map = MaxPool2D((3, 3), strides=2)(feature_map)
+            feature_map = tf.image.resize(feature_map, (resize_to, resize_to))
+            feature_map = MaxPool2D((kernel_size, kernel_size), strides=stride)(feature_map)
             feature_vec = tf.reshape(feature_map, (-1))
             return feature_vec
 
-        def offset_and_rescale_bbox(det, offset_y=168, image_scaling=2):
+        def offset_and_rescale_bbox(det, offset_y=168, image_scaling=2.):
+            """offset and resize bbox
+            The depthnet's output shape is (192, 640), the bbox is generated in original resolution (720, 1280)
+            we need to center-crop and offset the bbox, as we did to depthnet's input
+            Args:
+                det: Detection object
+                offset_y: int
+                image_scaling: float ot int
+                    original width / feed width of monodepth2 = 1280/640
+            Returns:
+                ltrb: list of int
+            """
             skip, bbox = Detection.offset_bbox(det.get_ltwh(),
                                                offset_y=offset_y, boundaries=(0, 192 * image_scaling))
-            bbox = np.array(bbox) / 2
+            bbox = np.array(bbox) / image_scaling
             bbox[2:] += bbox[:2]
             ltrb = bbox.astype(np.int32).tolist()
             return ltrb
@@ -348,7 +386,7 @@ class TrainerVelo:
             for det in dets:
                 bbox_ltrb = offset_and_rescale_bbox(det)
                 det.receive_depth_feature(
-                    resize_map2vec_per_bbox(depth_map, bbox_ltrb)
+                    extract_vec_per_bbox(depth_map, bbox_ltrb)
                 )
             return dets
 
@@ -434,8 +472,28 @@ class TrainerVelo:
         return depth_input, offset_y
 
 
+def verbose_flags(opt):
+    print("==================================")
+    print("learning_rate\t", opt.learning_rate)
+    print("frame_interval\t", opt.frame_interval)
+    print("dist_loss_w\t", opt.dist_loss_w)
+    print("velo_loss_w\t", opt.velo_loss_w)
+    print("save_model_path\t", opt.save_model_path)
+    print("save_root\t", opt.save_root)
+    print("data_path\t", opt.data_path)
+    print("bbox_folder\t", opt.bbox_folder)
+    print("recording\t", opt.recording)
+    print("record_path\t", opt.record_summary_path)
+    print("batch_size\t", opt.batch_size)
+    print("num_epochs\t", opt.num_epochs)
+    print("lr_step_size\t", opt.lr_step_size)
+    print("lr_decay\t", opt.lr_decay)
+    print("==================================")
+
+
 def main(_):
     opt = get_options()
+    verbose_flags(opt)
     trainer_velo = TrainerVelo(opt)
     trainer_velo.train()
 
